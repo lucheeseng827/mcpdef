@@ -73,9 +73,14 @@ jobs:
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] \
             || { echo "::error::TAG '$TAG' is not a v<semver> release tag"; exit 1; }
           ver="$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
-          [ "v$ver" = "$TAG" ] \
-            || { echo "::error::tag '$TAG' != workspace version 'v$ver' (Cargo.toml)"; exit 1; }
-          echo "validated: $TAG == workspace v$ver"
+          # Compare the tag's BASE version (strip any -prerelease/+build suffix) to the crate
+          # version, so an rc tag (v0.1.0-rc.1) can exercise the pipeline against the same
+          # version. The crates.io + brew jobs still skip any tag containing '-', so only a
+          # clean vX.Y.Z ever publishes — the "irreversible publish" guard is unchanged.
+          base="${TAG#v}"; base="${base%%[-+]*}"
+          [ "$base" = "$ver" ] \
+            || { echo "::error::tag '$TAG' base version '$base' != workspace version '$ver' (Cargo.toml)"; exit 1; }
+          echo "validated: $TAG (release version $ver)"
 
   build:
     name: build ${{ matrix.target }}
