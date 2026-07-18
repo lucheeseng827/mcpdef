@@ -1,0 +1,10 @@
+[package]
+name = "mcpdef-ratelimit"
+description = "MCPdef — token-bucket rate limiting for the gateway hot path (per-tool + global), OSS engine."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# pure std — no external deps; an injectable clock keeps it deterministically testable.

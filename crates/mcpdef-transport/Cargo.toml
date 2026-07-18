@@ -1,0 +1,22 @@
+[package]
+name = "mcpdef-transport"
+description = "MCPdef — the Transport trait + stdio child and in-memory duplex transports (OSS engine, Phase 1)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mcpdef-core.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+reqwest.workspace = true
+futures-util.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "net"] }
+serde_json.workspace = true
+axum.workspace = true
+tokio-stream.workspace = true

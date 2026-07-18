@@ -1,0 +1,203 @@
+# mcpdef.example.toml — an MCPdef config (Phase 1 + Phase 1.5).
+#
+# Implemented upstream transports:
+#   stdio            child-process MCP server (Phase 1)
+#   streamable-http  current Streamable HTTP, with automatic fallback to the
+#                    legacy HTTP+SSE bridge on a 400/404/405 (Phase 1 / 1.5)
+#   sse              forced legacy 2024-11-05 HTTP+SSE bridge (Phase 1.5)
+#   wasm             an untrusted .wasm core module run in-path under the Wasmtime
+#                    sandbox — fuel + memory capped, zero ambient capability (Phase 4)
+#   wasm-component   an untrusted wasm32-wasip2 component (the mcpdef:server WIT world)
+#                    run under capability-scoped WASI with a per-destination egress
+#                    allowlist — same caps, plus opt-in outbound TCP (Phase 4)
+#
+#   mcpdef validate --config mcpdef.example.toml
+#   mcpdef run        --config mcpdef.example.toml    # serve the client over stdio
+#   mcpdef run --http --config mcpdef.example.toml    # serve clients over Streamable HTTP
+#   mcpdef up         --config mcpdef.example.toml    # shorthand for `run --http`
+#   mcpdef call list_issues --args '{}' --config mcpdef.example.toml   # one-shot governed tool call
+
+[gateway]
+listen = "127.0.0.1:7878"          # bind addr for `mcpdef run --http` (loopback by default)
+audit  = "./mcpdef-audit/audit.log"  # append-only, hash-linked ledger
+# profile = "readonly"             # active gateway profile (defined below): layers over EVERY
+                                   #   server so an agent sees only that slice. `mcpdef run --profile
+                                   #   <name>` overrides this. Must live HERE, under [gateway].
+# allowed_origins = ["https://app.example.com"]  # extra Origins beyond loopback (DNS-rebind defense)
+# max_inflight = 512               # cap concurrent HTTP requests; excess → 503 + Retry-After
+# pins = "./mcpdef-pins.toml"        # enable tool-def pinning + rug-pull detection:
+                                   #   on connect MCPdef pins each tool's definition (TOFU); if a
+                                   #   server later changes a tool, the call is denied + audited
+                                   #   as `rug-pull`. Manage with `mcpdef pin` / `mcpdef diff-tools`.
+# upstream_timeout_ms = 30000      # fail a tools/call whose upstream doesn't reply in time
+                                   #   (audited as `upstream-timeout`) instead of hanging the gateway.
+
+# Availability: token-bucket rate limits on tools/call (ARCHITECTURE §5b). Over-limit
+# calls get a tool-error result + a `rate-limited` audit event (the stdio analog of a 429).
+# A scope is active only if its *_per_sec is set; *_burst defaults to the per-sec rate.
+[gateway.rate_limit]
+per_tool_per_sec = 5               # each tool refills 5 tokens/sec…
+per_tool_burst   = 10              # …with a 10-call burst
+global_per_sec   = 100             # gateway-wide cap so one agent can't starve others
+global_burst     = 200
+
+# Egress / SSRF guard for HTTP upstreams. Cloud-metadata (169.254.169.254),
+# link-local (fe80::/10), and the unspecified address are ALWAYS blocked — there
+# is no knob to allow them. Resolved IPs are DNS-pinned to defeat rebinding.
+# Inspect the effective policy with `mcpdef egress show`.
+[gateway.egress]
+allow_private = true               # default: MCPdef commonly fronts internal/localhost MCP servers
+require_https = true               # default: public destinations must use HTTPS (private/loopback may be http)
+
+# Inline injection / secret-exfil scanning of untrusted content. Tool DESCRIPTIONS
+# are scanned at connect (a "line-jumping" / tool-poisoning attempt hides the tool)
+# and tool-call RESULTS are scanned per call (a leaked credential or injected
+# instruction is refused before it reaches the model). A curated, high-precision
+# starter rule pack (prompt-injection phrases + secret patterns: AWS/Slack/GitHub/
+# Stripe keys, PEM private keys). Opt-in — start with `warn` (log only) before
+# `enforce` (block).
+[gateway.inspect]
+mode = "off"                       # off (default) · warn (log findings) · enforce (hide/deny)
+# Extend the built-in rule pack with your own patterns (both default empty):
+injection_phrases = []             # extra injection phrases, matched case-INsensitively (e.g. "exfiltrate the")
+secret_substrings = []             # extra secret substrings, matched case-sensitively (e.g. an internal token prefix "acme_sk_")
+
+# OAuth 2.1 termination (HTTP listener only). When enabled, every POST to /mcp
+# must carry a valid `Authorization: Bearer <JWT>`; MCPdef validates it per request
+# as an OAuth 2.1 Resource Server (signature against the JWKS, `aud == resource`,
+# `iss == issuer`, exp/nbf — no `none`/HMAC). A missing/invalid token gets 401 with
+# a WWW-Authenticate challenge pointing at the RFC 9728 Protected Resource Metadata
+# document served at /.well-known/oauth-protected-resource. The token's `sub` is the
+# audit identity; its scopes/roles drive the [[role]] RBAC gate below.
+# [gateway.auth]
+# enabled  = true
+# issuer   = "https://auth.example.com"               # the authorization server's `iss`
+# resource = "https://mcpdef.acme.internal/mcp"         # this gateway's canonical URI (the token audience)
+# jwks     = "./jwks.json"                            # pinned keys: a JWKS file (or inline JSON starting with `{`)
+# jwks_uri = "https://auth.example.com/.well-known/jwks.json"  # …or fetch at startup (egress-guarded). Prefer `jwks`.
+
+# RBAC roles layered over the allowlist for authenticated callers (HTTP + auth).
+# A caller "holds" a role when its `name` appears among the token's scopes or
+# `roles` claim. A tools/call is allowed only if some held role grants it; grants
+# are `"server-glob:tool-glob"` (a bare `"tool"` grants it on any server). With no
+# [[role]] defined the gate is off (the allowlist alone decides).
+# [[role]]
+# name   = "reader"
+# grants = ["github:get_*", "github:list_*", "files:read_*"]
+# [[role]]
+# name   = "github-writer"
+# grants = ["github:create_issue", "github:*"]
+
+# Policy-as-code RULES: a richer gate than the allowlist, evaluated AFTER it.
+# Where the allowlist decides on the tool name alone, a rule matches on the caller
+# (agent), server, tool (all globs), and the tool-call ARGUMENTS (per-field), so it
+# can express "deny delete_* on github when args.name is a prod-* repo". Rules run
+# top-to-bottom, FIRST MATCH WINS (put a specific allow before a broad deny); no
+# match = allowed. A deny is audited under the rule's own `name`. Each arg predicate
+# names exactly one of: equals / glob / contains / exists.
+# [[policy]]
+# name    = "no-delete-prod"
+# effect  = "deny"                    # allow | deny
+# servers = ["github"]               # optional; globs. omit = any server
+# tools   = ["delete_*"]             # optional; globs. omit = any tool
+# agents  = ["agent:ci-*"]           # optional; globs on the audit identity. omit = any caller
+# args    = [ { path = "name", glob = "prod-*" } ]   # AND-ed; dotted paths (e.g. "target.env")
+
+# Named, reusable allow/deny PROFILES. Define an allow/deny set once and apply it
+# across servers (DRY), or scope the whole gateway with one as the active profile.
+# Allow + deny entries are globs (`get_*`, `*_secret`).
+[profile.readonly]
+tools = ["get_*", "list_*", "search", "read_*"]
+deny  = ["*_secret"]
+
+[profile.ci-bot]
+tools = ["list_issues", "get_file_contents", "create_issue"]
+
+# To make one of the profiles above the active gateway profile, set
+# `profile = "..."` under the [gateway] table near the top of this file (NOT here —
+# a key after `[profile.ci-bot]` would belong to that profile), or pass
+# `mcpdef run --profile <name>` at launch.
+
+# A stdio upstream: only the two listed tools are exposed, and any `delete_*`
+# tool is denied even if listed (deny wins). A `tools/call` to anything else is
+# denied-by-default and audited.
+[[server]]
+id        = "github"
+transport = "stdio"
+command   = ["mcp-server-github"]
+tools     = ["list_issues", "get_file_contents"]
+deny      = ["delete_*"]
+# Token broker (stdio): MCPdef injects this upstream's brokered credential into the
+# child's environment (the spec's mechanism for stdio servers). The credential
+# lives in MCPdef's config, not the server's — and a downstream client's bearer is
+# never passed through to the upstream. Use real secret management in production;
+# the inert placeholder below is deliberately NOT a real-looking token.
+[server.env]
+GITHUB_TOKEN = "set-me-from-your-secret-store"
+
+# A second stdio upstream that inherits the `readonly` profile (get_*/list_*/…),
+# and appends one more deny on top of the profile's `*_secret`.
+[[server]]
+id        = "files"
+transport = "stdio"
+command   = ["mcp-server-filesystem", "--root", "./data"]
+profile   = "readonly"
+deny      = ["write_*"]             # appended to the profile's deny set
+
+# A Streamable HTTP upstream. mcpdef POSTs to this endpoint and, if the server
+# only speaks the legacy 2024-11-05 transport (405 on POST), automatically falls
+# back to the GET-SSE bridge.
+[[server]]
+id        = "remote-tools"
+transport = "streamable-http"
+url       = "https://mcp.internal.example/mcp"
+tools     = ["search", "fetch"]
+
+# A forced legacy HTTP+SSE upstream (no probe): GET opens the SSE stream, the
+# server's `endpoint` event names the POST URL, and responses return over SSE.
+[[server]]
+id        = "legacy-tools"
+transport = "sse"
+url       = "https://legacy.internal.example/sse"
+deny      = ["delete_*", "*_secret"]
+
+# An in-path WASM upstream (Phase 4): MCPdef runs the untrusted `.wasm` MCP server
+# itself, under Wasmtime, with no child process and no ambient capability. The
+# module is instantiated against an EMPTY linker — it cannot touch the filesystem,
+# network, or clock (a module importing WASI fails to load, by design). Each call
+# is bounded by a fuel budget (CPU) and a linear-memory ceiling. The module speaks
+# the gateway's normal MCP envelope over a tiny `alloc`/`handle` ABI (see the
+# `mcpdef-sandbox` crate docs). Governance (allowlist, RBAC, scanning, audit) applies
+# exactly as it does to a stdio or HTTP upstream.
+[[server]]
+id        = "sandboxed"
+transport = "wasm"
+wasm      = "./servers/echo.wasm"  # path to the module to run in the sandbox
+tools     = ["echo"]
+# wasm_fuel          = 200000000   # fuel granted per call (≈ instructions); unset = default
+# wasm_max_memory_mb = 64          # max linear memory the module may grow to; unset = default
+# wasm_deadline_ms   = 5000        # per-call WALL-CLOCK deadline: a call running longer than this
+                                   #   traps even with fuel to spare (defense-in-depth on top of the
+                                   #   fuel/CPU bound). Unset or 0 = no wall-clock bound.
+
+# An in-path WASM *component* upstream (Phase 4). Unlike `wasm` (a core module with
+# zero ambient capability), this runs a `wasm32-wasip2` component exporting the
+# `mcpdef:server` WIT world under a capability-scoped WASI: it still has no filesystem
+# or clock, but it MAY be granted outbound TCP — and only to the destinations listed
+# in `wasm_allow_egress` (default: none = deny all). A connection is allowed only if
+# its resolved ip:port is listed AND passes the egress IP classification, so
+# cloud-metadata / special-use addresses are blocked even if mistakenly listed. Fuel,
+# memory, and the wall-clock deadline apply exactly as for `wasm`.
+#
+# NOTE: entries are `ip:port` (hostnames are a follow-up), and the address must be a
+# real destination that is not in an always-blocked class. Private/loopback (allowed
+# by default) and public addresses are both fine; cloud-metadata, link-local, and the
+# special-use/documentation ranges (e.g. 203.0.113.0/24) are rejected at connect time
+# even if listed here.
+[[server]]
+id        = "sandboxed-component"
+transport = "wasm-component"
+wasm      = "./servers/scraper.component.wasm"  # a wasm32-wasip2 component
+tools     = ["fetch_url"]
+wasm_allow_egress = ["10.0.0.7:8443"]           # e.g. the one internal API it may reach
+# wasm_deadline_ms  = 2000                       # (optional) wall-clock cap per call

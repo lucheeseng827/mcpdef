@@ -1,0 +1,23 @@
+# Release image — assembles the distroless container from the ALREADY-BUILT static musl
+# binaries (the release build matrix produced them natively/cross in ~2 min each). No compile
+# here, so multi-arch buildx is seconds instead of a ~30-min emulated arm64 cargo+LTO build.
+#
+# The docker job stages `mcpdef-amd64` and `mcpdef-arm64` into the build context; buildx sets
+# TARGETARCH per platform, so each image gets its matching static binary. For a from-source
+# local build use the plain ./Dockerfile instead.
+#
+# distroless/static carries just the static-musl binary. The binary now embeds the Phase-4
+# Wasmtime sandbox (Cranelift JIT), which generates code into runtime-mmap'd W^X pages — that
+# works on this base (it needs the mmap syscall, not a dynamic glibc). Hosts that FORBID W^X
+# pages (hardened seccomp) should run the fully-static no-JIT (Pulley) build profile instead.
+FROM gcr.io/distroless/static-debian12:nonroot
+ARG TARGETARCH
+LABEL org.opencontainers.image.source="https://github.com/lucheeseng827/mcpdef" \
+      org.opencontainers.image.description="Fast, self-hostable, single-binary MCP gateway & governance plane" \
+      org.opencontainers.image.licenses="Apache-2.0"
+COPY mcpdef-${TARGETARCH} /usr/local/bin/mcpdef
+# The downstream Streamable HTTP listener (Phase 1 tail) will bind this port; today mcpdef serves
+# its client over stdio. Reserved here so the published image is ready when the listener lands.
+EXPOSE 7878
+ENTRYPOINT ["/usr/local/bin/mcpdef"]
+CMD ["version"]

@@ -1,0 +1,37 @@
+[package]
+name = "mcpdef"
+description = "MCPdef — the MCP gateway & governance plane binary: config, the transport-mux proxy loop, allowlist + audit, CLI (Phase 1)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+default-run = "mcpdef"
+
+[dependencies]
+mcpdef-core.workspace = true
+mcpdef-transport.workspace = true
+mcpdef-policy.workspace = true
+mcpdef-audit.workspace = true
+mcpdef-inspect.workspace = true
+mcpdef-pin.workspace = true
+mcpdef-ratelimit.workspace = true
+mcpdef-auth.workspace = true
+mcpdef-sandbox.workspace = true
+tokio.workspace = true
+clap.workspace = true
+toml.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+# downstream Streamable HTTP listener (the `mcpdef run --http` server) + Origin parsing
+axum.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+reqwest.workspace = true
+tokio = { workspace = true, features = ["net"] }
+# sign test bearer tokens for the OAuth listener integration tests
+jsonwebtoken.workspace = true
+# compile WAT fixtures for the in-path wasm-sandbox gateway test
+wat.workspace = true

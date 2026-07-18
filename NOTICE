@@ -1,0 +1,38 @@
+MCPdef — MCP gateway & governance plane
+Copyright 2026 The MCPdef Authors
+
+This product includes software developed by The MCPdef Authors.
+
+The OSS engine (the `mcpdef` binary and the `mcpdef-*` engine crates at the module
+root) is licensed under the Apache License, Version 2.0 (see ./LICENSE).
+
+The paid governance plane under ./ee/ is licensed under the Business Source
+License 1.1 (see ./ee/LICENSE). It is source-available, not open source, and
+converts to Apache-2.0 on its Change Date. ./ee/ is never packaged into the
+public engine crate published to crates.io.
+
+================================================================================
+Third-party dependencies
+================================================================================
+
+This software builds on third-party open-source components, each under its own
+license (see each crate's own license metadata and the generated SBOM for the
+authoritative, version-pinned list). Notable runtime dependencies include:
+
+  - tokio, axum, tower         (MIT)            — async runtime / HTTP
+  - reqwest, hyper             (MIT / Apache-2.0)— HTTP client, used for the
+                                                   Streamable HTTP + legacy SSE
+                                                   upstream transports
+  - serde, serde_json          (MIT / Apache-2.0)— serialization
+  - clap                       (MIT / Apache-2.0)— CLI parsing
+  - sha2, hex                  (MIT / Apache-2.0)— audit-ledger hash chain
+  - thiserror, anyhow          (MIT / Apache-2.0)— error handling
+  - toml                       (MIT / Apache-2.0)— config parsing
+  - async-trait, futures-util  (MIT / Apache-2.0)— async plumbing
+
+Planned dependencies for later roadmap phases (not yet vendored): the official
+MCP Rust SDK (`rmcp`), `wasmtime` (WASM sandbox, Phase 4), and an OAuth/JWKS
+stack (Phase 2). When added, their attribution is reflected here and in the SBOM.
+
+A complete, version-pinned dependency manifest with licenses is produced as a
+CycloneDX SBOM at release time (see OSS-ROLLOUT.md §5–§6).

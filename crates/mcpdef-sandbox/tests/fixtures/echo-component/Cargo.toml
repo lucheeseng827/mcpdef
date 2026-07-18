@@ -1,0 +1,31 @@
+# Test fixture (NOT a workspace member — excluded in the root Cargo.toml). A
+# minimal MCP server compiled to a `wasm32-wasip2` component that exports the
+# `mcpdef:server` world, used by the mcpdef-sandbox component-path tests. Rebuild with:
+#
+#   cd crates/mcpdef-sandbox/tests/fixtures/echo-component
+#   cargo build --release --target wasm32-wasip2
+#   cp target/wasm32-wasip2/release/echo_component.wasm ../echo_component.wasm
+#
+# (requires `rustup target add wasm32-wasip2`). The built artifact is committed at
+# crates/mcpdef-sandbox/tests/fixtures/echo_component.wasm so tests need no toolchain.
+#
+# An empty [workspace] table makes this its own workspace root, so it builds for
+# wasm32-wasip2 independently of the host workspace it physically lives inside.
+[workspace]
+
+[package]
+name = "echo-component"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wit-bindgen = "0.46"
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+strip = true

@@ -1,0 +1,440 @@
+# mcpdef release pipeline — runs on the PUBLIC mirror (lucheeseng827/mcpdef).
+#
+# Synced from the private monorepo to `.github/workflows/release.yml` (see .ossync.yaml). Cuts a
+# release on a `v*` tag:
+#   1. build   — static musl (x86_64 + aarch64) + macOS (x86_64 + arm64); archive + sha256;
+#                cosign keyless signature (.sig/.pem) + SLSA build provenance per artifact
+#   2. sbom    — CycloneDX SBOM (cargo-cyclonedx) for the whole engine workspace
+#   3. release — attach every artifact + SHA256SUMS + signatures + SBOM to the GitHub release
+#   4. crates  — `cargo publish` the OSS engine crates in dependency order (real tags only,
+#                idempotent). The paid `ee/` plane is a SEPARATE workspace and is never published.
+#   5. brew    — rewrite Formula/mcpdef.rb with the tag version + the four desktop/linux sha256
+#   6. docker  — buildx multi-arch (linux/amd64 + linux/arm64) distroless image → Docker Hub,
+#                cosign-signed + SLSA-attested
+#
+# A gateway that sits in the data path must be verifiable to the byte (OSS-ROLLOUT.md §6):
+# every artifact + the image is signed (cosign keyless OIDC), carries SLSA provenance, and ships
+# with a CycloneDX SBOM.
+#
+# Supply-chain hardening (matches the monorepo gates):
+#   • every `uses:` is pinned to a full commit SHA with the human tag in a trailing comment —
+#     a moved tag can't swap the action out from under a release. Refresh a pin with
+#     `git ls-remote https://github.com/<action> refs/tags/<newtag>^{}` and update the comment.
+#   • top-level `permissions: {}` (deny-all); each job elevates only the scopes it needs.
+#   • every checkout runs `persist-credentials: false` so the job token is never written to
+#     .git/config where a later build step could read it (zizmor "artipacked"); the brew job
+#     re-supplies the token at the point of push only.
+#
+# Mirror repo secrets: DOCKER_USERNAME / DOCKER_PASSWORD (Docker Hub) and CRATESIO_TOKEN live in
+# the `cicd` environment. cosign + SLSA use the workflow's OIDC token (no stored keys).
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v0.1.0"
+        required: true
+      promote:
+        description: "Promote formula + :latest image (only safe for the newest tag)"
+        type: boolean
+        default: false
+
+# Deny-all by default; every job below grants itself the minimum it needs.
+permissions: {}
+
+env:
+  BIN: mcpdef
+  IMAGE: docker.io/mancube/mcpdef
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  validate:
+    name: validate release tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - name: Assert TAG is v<semver> and matches the workspace version
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A non-semver branch/ref, or a tag whose version disagrees with the crate
+          # version, would let `cargo publish` (which uses the manifest version) push an
+          # irreversible crates.io release while `wait_indexed` polls ${TAG#v} and then
+          # times out. Fail closed BEFORE any build or publish runs.
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] \
+            || { echo "::error::TAG '$TAG' is not a v<semver> release tag"; exit 1; }
+          ver="$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          [ "v$ver" = "$TAG" ] \
+            || { echo "::error::tag '$TAG' != workspace version 'v$ver' (Cargo.toml)"; exit 1; }
+          echo "validated: $TAG == workspace v$ver"
+
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    needs: validate
+    permissions:
+      contents: read      # checkout the tagged source
+      id-token: write     # cosign keyless + SLSA provenance (Sigstore OIDC)
+      attestations: write # SLSA build-provenance attestation
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl,  os: ubuntu-latest, cross: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, cross: true }
+          # Both macOS targets build on macos-14 (Apple Silicon): arm64 native, x86_64 via an
+          # in-macOS cross-compile. (No Windows: mcpdef targets Linux/macOS servers — OSS-ROLLOUT §5.)
+          - { target: x86_64-apple-darwin,         os: macos-14 }
+          - { target: aarch64-apple-darwin,        os: macos-14 }
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (linux musl)
+        if: matrix.cross
+        uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
+        with:
+          tool: cross
+
+      - name: Build (cross)
+        if: matrix.cross
+        run: cross build --release --bin "$BIN" --target ${{ matrix.target }}
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --bin "$BIN" --target ${{ matrix.target }}
+        shell: bash
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          dist="target/${{ matrix.target }}/release"
+          asset="${BIN}-${{ matrix.target }}.tar.gz"
+          tar -czf "$asset" -C "$dist" "$BIN"
+          if command -v sha256sum >/dev/null; then
+            sha256sum "$asset" > "$asset.sha256"
+          else
+            shasum -a 256 "$asset" > "$asset.sha256"
+          fi
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      - name: Sign artifact (cosign keyless)
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+      - name: cosign sign-blob
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="${{ steps.pkg.outputs.asset }}"
+          # Keyless: identity = this workflow's OIDC token; emits a detached sig + cert.
+          cosign sign-blob --yes \
+            --output-signature "$asset.sig" \
+            --output-certificate "$asset.pem" \
+            "$asset"
+
+      - name: SLSA build provenance
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: ${{ steps.pkg.outputs.asset }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.target }}
+          path: |
+            ${{ steps.pkg.outputs.asset }}
+            ${{ steps.pkg.outputs.asset }}.sha256
+            ${{ steps.pkg.outputs.asset }}.sig
+            ${{ steps.pkg.outputs.asset }}.pem
+          if-no-files-found: error
+
+  sbom:
+    name: cyclonedx sbom
+    runs-on: ubuntu-latest
+    needs: validate
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
+        with:
+          tool: cargo-cyclonedx
+      - name: Generate SBOM (engine workspace; ee/ is a separate workspace, excluded)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo cyclonedx --all --format json
+          # Collect the per-crate boms into one artifact directory.
+          mkdir -p sbom
+          find . -name '*.cdx.json' -not -path './sbom/*' -exec cp {} sbom/ \;
+          ls -l sbom
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom
+          path: sbom/*.cdx.json
+          if-no-files-found: error
+
+  release:
+    name: github release
+    needs: [build, sbom]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the GitHub release + upload assets
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with: { path: dist, merge-multiple: true }
+      - name: Aggregate checksums
+        # Block scalar (not a one-liner): concatenate the per-asset .sha256 sidecars.
+        run: |
+          ( cd dist && cat ./*.sha256 > SHA256SUMS && cat SHA256SUMS )
+      - name: Publish release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          tag_name: ${{ env.TAG }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          # A pre-release suffix (vX.Y.Z-rc.N) is marked a GitHub pre-release — exercise the
+          # pipeline without presenting an rc as a GA download.
+          prerelease: ${{ contains(env.TAG, '-') }}
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/*.sig
+            dist/*.pem
+            dist/*.cdx.json
+            dist/SHA256SUMS
+
+  cratesio:
+    name: publish engine to crates.io
+    needs: release
+    # Publish only a real (non pre-release) tag that was pushed or explicitly promoted. crates.io
+    # is append-only — never publish an rc.
+    if: ${{ !contains(github.event.inputs.tag || github.ref_name, '-') && (github.event_name == 'push' || inputs.promote) }}
+    environment: cicd
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # checkout only; the publish authenticates with CRATESIO_TOKEN, not the job token
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - name: Publish OSS engine crates in dependency order
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATESIO_TOKEN }}
+        run: |
+          set -euo pipefail
+          ver="${TAG#v}"
+          # Wait until a freshly-published crate version is queryable, so the next dependent
+          # crate can build against it during its own publish verification.
+          wait_indexed() {
+            local crate="$1"
+            for _ in $(seq 1 30); do
+              if curl -sf "https://crates.io/api/v1/crates/${crate}/${ver}" >/dev/null 2>&1; then
+                return 0
+              fi
+              sleep 10
+            done
+            echo "timed out waiting for ${crate} ${ver} to index" >&2
+            return 1
+          }
+          publish_one() {
+            local crate="$1"
+            if curl -sf "https://crates.io/api/v1/crates/${crate}/${ver}" >/dev/null 2>&1; then
+              echo "${crate} ${ver} already on crates.io — skipping"
+              return 0
+            fi
+            cargo publish -p "$crate"
+            wait_indexed "$crate"
+          }
+          # Dependency order: core first; the leaves that depend only on core next; mcpdef last.
+          # `ee/` is a separate workspace and is never a member here, so it is never published.
+          publish_one mcpdef-core
+          publish_one mcpdef-pin
+          publish_one mcpdef-ratelimit
+          publish_one mcpdef-audit
+          publish_one mcpdef-inspect
+          publish_one mcpdef-policy
+          publish_one mcpdef-auth
+          publish_one mcpdef-transport
+          # mcpdef-sandbox depends on mcpdef-core + mcpdef-transport, so it follows them.
+          publish_one mcpdef-sandbox
+          publish_one mcpdef
+
+  brew:
+    name: bump homebrew formula
+    needs: release
+    if: ${{ !contains(github.event.inputs.tag || github.ref_name, '-') && (github.event_name == 'push' || inputs.promote) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # commit + push the regenerated formula to main
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with: { path: dist, merge-multiple: true }
+      - name: Generate Formula/mcpdef.rb
+        shell: bash
+        # Written fresh from the release's checksums. The mirror's Formula/mcpdef.rb is owned by
+        # THIS job (not synced from the monorepo), so a sync can never clobber the real shas.
+        run: |
+          set -euo pipefail
+          ver="${TAG#v}"
+          sha() { cut -d' ' -f1 < "dist/${BIN}-$1.tar.gz.sha256"; }
+          mac_arm=$(sha aarch64-apple-darwin)
+          mac_x86=$(sha x86_64-apple-darwin)
+          lin_arm=$(sha aarch64-unknown-linux-musl)
+          lin_x86=$(sha x86_64-unknown-linux-musl)
+          base="https://github.com/lucheeseng827/mcpdef/releases/download/v#{version}"
+          mkdir -p Formula
+          cat > Formula/mcpdef.rb <<EOF
+          # Generated by .github/workflows/release.yml on each v* tag — do not hand-edit.
+          class Mcpdef < Formula
+            desc "Fast, self-hostable, single-binary MCP gateway & governance plane"
+            homepage "https://github.com/lucheeseng827/mcpdef"
+            version "$ver"
+            license "Apache-2.0"
+
+            on_macos do
+              on_arm do
+                url "$base/mcpdef-aarch64-apple-darwin.tar.gz"
+                sha256 "$mac_arm"
+              end
+              on_intel do
+                url "$base/mcpdef-x86_64-apple-darwin.tar.gz"
+                sha256 "$mac_x86"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "$base/mcpdef-aarch64-unknown-linux-musl.tar.gz"
+                sha256 "$lin_arm"
+              end
+              on_intel do
+                url "$base/mcpdef-x86_64-unknown-linux-musl.tar.gz"
+                sha256 "$lin_x86"
+              end
+            end
+
+            def install
+              bin.install "mcpdef"
+            end
+
+            test do
+              assert_match "mcpdef", shell_output("#{bin}/mcpdef version")
+            end
+          end
+          EOF
+          echo "--- generated formula ---"; cat Formula/mcpdef.rb
+      - name: Commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/mcpdef.rb
+          git commit -m "brew: mcpdef ${TAG}" || { echo "no formula change"; exit 0; }
+          # Checkout ran with persist-credentials:false. Supply the token as an EPHEMERAL
+          # per-command header — never written to .git/config or the remote URL. origin keeps
+          # its tokenless https URL; the credential exists only for this one push.
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" push origin HEAD:main
+
+  docker:
+    name: distroless image
+    needs: release
+    environment: cicd
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read      # checkout the tagged source (Dockerfile.release + DOCKERHUB.md)
+      id-token: write     # cosign keyless + image SLSA provenance (Sigstore OIDC)
+      attestations: write # SLSA provenance attestation for the image
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+      - name: Stage prebuilt static binaries into the build context
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          path: art
+          merge-multiple: true
+      - name: Lay out the context
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ctx
+          tar -xzf art/mcpdef-x86_64-unknown-linux-musl.tar.gz  -C ctx && mv ctx/mcpdef ctx/mcpdef-amd64
+          tar -xzf art/mcpdef-aarch64-unknown-linux-musl.tar.gz -C ctx && mv ctx/mcpdef ctx/mcpdef-arm64
+          cp Dockerfile.release ctx/Dockerfile
+      - name: Compute image tags
+        id: imgtags
+        env:
+          PROMOTE: ${{ github.event_name == 'push' || inputs.promote }}
+        shell: bash
+        run: |
+          tags="${IMAGE}:${TAG}"
+          if [[ "$TAG" != *-* && "$PROMOTE" == "true" ]]; then tags="$tags"$'\n'"${IMAGE}:latest"; fi
+          { echo "list<<EOF"; echo "$tags"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+      - name: Build + push
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: ctx
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.imgtags.outputs.list }}
+      - name: cosign sign image (keyless)
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+      - name: SLSA provenance for the image
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      - name: Update Docker Hub description
+        if: ${{ !contains(env.TAG, '-') && (github.event_name == 'push' || inputs.promote) }}
+        uses: peter-evans/dockerhub-description@432a30c9e07499fd01da9f8a49f0faf9e0ca5b77 # v4.0.2
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+          repository: mancube/mcpdef
+          readme-filepath: ./docs/DOCKERHUB.md

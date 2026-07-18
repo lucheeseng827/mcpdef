@@ -1,0 +1,78 @@
+# mcpdef Founding Tester intake. Lives under module_58 in the monorepo (inert here —
+# GitHub only reads .github/ at a repo root) and is mirrored to the public mcpdef
+# repo via .ossync.yaml, where it becomes the "New issue" → Founding Tester form.
+# Replaces the placeholder referenced in PRICING.md "How to enroll".
+#
+# NB: no `labels:` are hard-coded — a GitHub issue form rejects submission if it
+# names a label the repo doesn't have. Add an `early-access` label on the mirror
+# and re-add it here if you want auto-labeling.
+name: Founding Tester application
+description: Apply for early access to the mcpdef governance plane (ee/) as a design partner.
+title: "[Founding Tester] <your org>"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for your interest in the mcpdef **Founding Tester** program.
+
+        You don't need this form to use mcpdef — the OSS gateway is free and needs no
+        signup (`mcpdef run --config mcpdef.toml`, then `mcpdef audit tail --follow`). This
+        intake is for teams that want to help shape the **governance plane** (managed
+        registry, central secret broker, SSO/SCIM, fleet SIEM export) and lock in
+        Founder pricing. The more concrete your setup below, the faster we can scope
+        a 30-minute intake call.
+  - type: input
+    id: org
+    attributes:
+      label: Organization
+      description: Company / team name (also put it in the issue title).
+      placeholder: Acme Corp
+    validations:
+      required: true
+  - type: input
+    id: server-count
+    attributes:
+      label: How many MCP servers?
+      description: Rough count of upstream MCP servers you'd put behind mcpdef.
+      placeholder: e.g. ~20
+    validations:
+      required: true
+  - type: input
+    id: team-count
+    attributes:
+      label: How many teams?
+      description: Number of teams / distinct agent fleets that would share the gateway.
+      placeholder: e.g. 4
+    validations:
+      required: true
+  - type: checkboxes
+    id: transports
+    attributes:
+      label: Which transports are in play?
+      options:
+        - label: stdio (local child processes)
+        - label: Streamable HTTP
+        - label: legacy HTTP+SSE
+  - type: input
+    id: idp
+    attributes:
+      label: Identity provider (IdP)
+      description: What you'd drive SSO/RBAC from (Okta, Entra ID, Google, Auth0, …).
+      placeholder: e.g. Okta (OIDC)
+    validations:
+      required: true
+  - type: textarea
+    id: gap
+    attributes:
+      label: The governance gap you most need closed
+      description: What's the single biggest thing you can't do safely today?
+      placeholder: e.g. per-identity attribution + audit exported to our SIEM across a fleet of nodes.
+    validations:
+      required: true
+  - type: textarea
+    id: anything-else
+    attributes:
+      label: Anything else? (optional)
+      description: Air-gap / residency constraints, compliance drivers, timeline, etc.
+    validations:
+      required: false

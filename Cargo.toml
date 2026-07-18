@@ -1,0 +1,98 @@
+# module_58 — MCPdef (MCP gateway & governance plane), OSS engine. Apache-2.0.
+#
+# Its OWN Cargo workspace (like module_54/dagron and module_57): the OSS engine
+# crates that make up the single `mcpdef` binary share one Cargo.lock + target dir.
+# This is the Phase-1 slice of the layout in ARCHITECTURE.md §11 — the
+# transport-mux proxy + allowlist + tamper-evident audit core. Later phases add
+# mcpdef-auth / mcpdef-policy(full) / mcpdef-sandbox / mcpdef-secrets, and the paid
+# control plane lands in `ee/` (BSL 1.1) as its own workspace — never here.
+#
+#   mcpdef-core       normalized JSON-RPC 2.0 envelope + MCP method/decision types
+#   mcpdef-transport  the Transport trait + stdio child + in-memory duplex (tests)
+#   mcpdef-policy     static tool allowlist (deny-by-default) — Phase 1 stub of P3
+#   mcpdef-audit      append-only, hash-linked (tamper-evident) audit ledger + verify
+#   mcpdef            the `mcpdef` binary: config, the gateway proxy loop, CLI
+#
+# Excluded from the repo-root workspace (root Cargo.toml `exclude`) because the
+# root `module_*` glob would otherwise try to absorb this nested workspace —
+# the same reason module_54 / module_57 are excluded.
+[workspace]
+resolver = "2"
+members = [
+    "crates/mcpdef-core",
+    "crates/mcpdef-transport",
+    "crates/mcpdef-policy",
+    "crates/mcpdef-audit",
+    "crates/mcpdef-inspect",
+    "crates/mcpdef-pin",
+    "crates/mcpdef-ratelimit",
+    "crates/mcpdef-auth",
+    "crates/mcpdef-sandbox",
+    "crates/mcpdef",
+]
+# The wasip2 guest test fixture is a standalone crate compiled for a *different*
+# target (`wasm32-wasip2`); it is not part of this (host) workspace.
+exclude = ["crates/mcpdef-sandbox/tests/fixtures/echo-component"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+# Minimum Supported Rust Version — the declared floor for the OSS engine, set by
+# the highest-MSRV dependency in the tree. Currently `time` (0.3.x) requires 1.88
+# (Wasmtime 36 itself needs only 1.86). CI enforces it via the `msrv` job in
+# mcpdef-ci.yml; bump both together (here and the job's toolchain pin) when a
+# dependency raises the floor.
+rust-version = "1.88"
+license = "Apache-2.0"
+repository = "https://github.com/lucheeseng827/nick-rust-project"
+
+[workspace.dependencies]
+# shared third-party
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "process", "sync", "time", "net"] }
+async-trait = "0.1"
+thiserror = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+tempfile = "3"
+# HTTP transports (Phase 1.5: Streamable HTTP + legacy HTTP+SSE bridge)
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+futures-util = "0.3"
+# URL parsing for the egress/SSRF guard (host classification + DNS pinning)
+url = "2"
+# OAuth 2.1 Resource Server: JWT validation + JWKS (Phase 2 auth)
+jsonwebtoken = "9"
+# dev-only mock servers for the HTTP transport tests
+axum = "0.7"
+tokio-stream = { version = "0.1", features = ["sync"] }
+# In-path WASM sandbox for untrusted upstreams (Phase 4). `cranelift` compiles,
+# `runtime` runs with fuel + memory caps; both paths use a synchronous engine.
+# The core-module path (`WasmUpstream`) has zero ambient imports. The component
+# path (`WasmComponentUpstream`) adds `component-model` and pairs with
+# `wasmtime-wasi` to run a `wasm32-wasip2` component under a capability-scoped
+# WASI with a per-destination egress allowlist. `wat` compiles text fixtures.
+wasmtime = { version = "36", default-features = false, features = ["runtime", "cranelift", "component-model"] }
+wasmtime-wasi = "36"
+wat = "1"
+# internal path deps (one-way: leaves depend on core, never the reverse).
+# A `version` alongside `path` is required for `cargo publish` (crates.io uses
+# the version, local builds use the path); it must track workspace.package.version.
+mcpdef-core = { path = "crates/mcpdef-core", version = "0.1.0" }
+mcpdef-transport = { path = "crates/mcpdef-transport", version = "0.1.0" }
+mcpdef-policy = { path = "crates/mcpdef-policy", version = "0.1.0" }
+mcpdef-audit = { path = "crates/mcpdef-audit", version = "0.1.0" }
+mcpdef-inspect = { path = "crates/mcpdef-inspect", version = "0.1.0" }
+mcpdef-pin = { path = "crates/mcpdef-pin", version = "0.1.0" }
+mcpdef-ratelimit = { path = "crates/mcpdef-ratelimit", version = "0.1.0" }
+mcpdef-auth = { path = "crates/mcpdef-auth", version = "0.1.0" }
+mcpdef-sandbox = { path = "crates/mcpdef-sandbox", version = "0.1.0" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

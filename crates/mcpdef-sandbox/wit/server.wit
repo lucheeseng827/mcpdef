@@ -1,0 +1,20 @@
+package mcpdef:server@0.1.0;
+
+/// The interface a sandboxed MCP server component exports to MCPdef. The component
+/// is a pure request→response function over JSON-RPC lines; MCPdef drives the MCP
+/// lifecycle (initialize → tools/list → tools/call) by calling `handle` once per
+/// downstream message. This is the in-process analog of a stdio MCP server, but
+/// the "process" is a Wasmtime component with capability-scoped WASI.
+interface handler {
+    /// Handle one newline-free JSON-RPC request line and return the response
+    /// line. An empty string means "no response" (e.g. for a notification).
+    handle: func(request: string) -> string;
+}
+
+/// The world a guest server must target (`wit-bindgen` `export!`), built to a
+/// `wasm32-wasip2` component. The guest may import WASI, but MCPdef grants it only
+/// the capabilities policy allows — by default none (no preopened dirs, no
+/// network); outbound sockets are gated by a per-destination egress allowlist.
+world server {
+    export handler;
+}

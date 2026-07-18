@@ -1,0 +1,26 @@
+[package]
+name = "mcpdef-sandbox"
+description = "MCPdef — in-path WASM sandbox: run an untrusted .wasm MCP server (core module or wasm32-wasip2 component) under Wasmtime with fuel/memory/epoch limits, capability-scoped WASI, and a per-destination egress allowlist (OSS engine, Phase 4)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# `wit/` is needed to build (the `bindgen!` macro reads it); the test fixture (a
+# nested wasm32-wasip2 guest crate + its built .wasm) is not needed by dependents,
+# so keep it out of the published crate.
+exclude = ["tests/fixtures"]
+
+[dependencies]
+mcpdef-core.workspace = true
+mcpdef-transport.workspace = true
+async-trait.workspace = true
+wasmtime.workspace = true
+# Component-model path: capability-scoped WASI for `wasm32-wasip2` components.
+wasmtime-wasi.workspace = true
+# `spawn_blocking`: a sandboxed call runs synchronous, non-yielding Wasmtime, so the
+# core-module path offloads it to the blocking pool instead of an async worker.
+tokio.workspace = true
+
+[dev-dependencies]
+wat.workspace = true
+serde_json.workspace = true

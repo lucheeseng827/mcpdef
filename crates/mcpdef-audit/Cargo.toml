@@ -1,0 +1,18 @@
+[package]
+name = "mcpdef-audit"
+description = "MCPdef — append-only, hash-linked (tamper-evident) audit ledger + offline chain verification (OSS engine, Phase 1)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+mcpdef-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,8 @@
+# Issue chooser config for the public mcpdef mirror.
+# Keep blank issues enabled so bug reports and spec-conformance issues still work;
+# the Founding Tester form is an addition, not the only path.
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability (private disclosure)
+    url: https://github.com/lucheeseng827/mcpdef/blob/main/SECURITY.md
+    about: mcpdef sits in the data path — report vulnerabilities privately per SECURITY.md, never as a public issue.

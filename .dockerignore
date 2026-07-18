@@ -1,0 +1,7 @@
+target
+**/target
+ee
+.git
+*.md
+mcpdef-audit
+mcpdef-pins.toml

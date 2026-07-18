@@ -1,0 +1,11 @@
+[package]
+name = "mcpdef-inspect"
+description = "MCPdef — inline injection / secret-exfil rule-pack scanner for untrusted tool descriptions and tool-call results (OSS engine, Phase 3)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Dependency-free by design: the scanner is pure-`std` pattern matching so the
+# trust surface of an in-path content inspector stays tiny and auditable.
+[dependencies]
