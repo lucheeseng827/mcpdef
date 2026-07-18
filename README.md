@@ -23,27 +23,75 @@ OSS engine and the paid `ee/` governance plane share one repository under a
 documented open-core boundary (the licensing note is under
 [Install / build](#install--build)).
 
-## Boundary: MCPdef governs the **tool/MCP layer**, not model traffic
+## How it fits together
 
-This is a hard architectural boundary. A separate **LLM gateway / router** owns
-the **HTTP edge + LLM-traffic proxy/router** — it routes *model* requests
-(provider routing, fallback, token/spend accounting). **MCPdef does not route model
-traffic.** It governs the **MCP wire** — the tools / resources / prompts an agent
-invokes against MCP servers, plus the initialize/capabilities handshake and
-session lifecycle. MCPdef never sits between an agent and an LLM provider; it sits
-between an agent and its **tool servers**. That keeps MCPdef from overlapping a
-separate LLM-gateway product and keeps each layer's threat model crisp.
+`mcpdef` is **one static binary you drop into the data path** between your MCP
+clients and the MCP servers they call. Clients connect over stdio or Streamable
+HTTP; you declare the servers to front in a single `mcpdef.toml`. Every
+`tools/call` crosses the same gate pipeline — auth → allowlist → pinning →
+rate-limit → injection scan — and is written to a tamper-evident audit ledger
+**before** it reaches a server. Deny-by-default: a call that isn't explicitly
+allowed returns a tool-error and is audited, so the model can self-correct.
 
 ```text
-   agent / MCP client
-        │ model traffic            │ MCP tool traffic
-        ▼                          ▼
-   LLM gateway / router          MCPdef  (this)
-   (a separate product)          MCP gateway + governance
-        ▼                          ▼
-   LLM providers                 MCP tool servers
-   (NOT MCPdef's concern)          (tools / resources / prompts)
+   YOUR CLIENTS                       mcpdef                    YOUR MCP SERVERS
+   agents · IDE · CI            one binary, in the path         (you declare these)
+
+   agent / IDE   ─┐                        ┌──────────┐    ┌─▶ stdio child process
+   app / service ─┼─ stdio · Streamable ──▶│  mcpdef  │──▶─┼─▶ Streamable-HTTP server
+   CI / script   ─┘   HTTP (+ bearer JWT)  │ (1 binary)│   ├─▶ legacy HTTP+SSE server
+                                           └──────────┘    └─▶ untrusted .wasm (sandbox)
+
+   ┌─ the gate pipeline, in order — one binary; each crate is one stage ──────
+   │  mcpdef-transport ▸ speak stdio / Streamable HTTP / legacy SSE; bridge + resume
+   │  mcpdef-auth      ▸ OAuth 2.1 resource server (JWKS) + RBAC on the HTTP listener
+   │  mcpdef-policy    ▸ deny-by-default allowlist · named profiles · per-argument rules
+   │  mcpdef-pin       ▸ pin each tool definition; deny + audit a rug-pull on change
+   │  mcpdef-ratelimit ▸ token-bucket limits (per-tool + global) + per-call timeout
+   │  mcpdef-inspect   ▸ scan tool descriptions + results for injection / secret exfil
+   │  mcpdef-sandbox   ▸ run an untrusted server in-process under Wasmtime (egress-gated)
+   │  mcpdef-audit     ▸ append every decision to a tamper-evident, hash-linked ledger
+   │  mcpdef-core      ▸ the shared JSON-RPC 2.0 / MCP types the rest are built on
+   └──────────────────────────────────────────────────────────────────────────
+     allow → forwarded to the server      deny → audited MCP tool-error
 ```
+
+**The boundary — the MCP tool wire only, never model traffic.** A separate LLM
+gateway/router owns *model* requests (provider routing, fallback, token/spend).
+`mcpdef` never sits between an agent and a model provider; it sits between an agent
+and its **tool servers**, governing the tools / resources / prompts it invokes plus
+the initialize/capabilities handshake. That keeps each layer's threat model crisp.
+
+### Plug your MCP servers in
+
+Point your client at `mcpdef` and declare each server once. Minimal example —
+front a local stdio MCP server with a deny-by-default allowlist:
+
+```toml
+# mcpdef.toml
+[gateway]
+listen = "127.0.0.1:7878"
+
+[[server]]
+id        = "github"
+transport = "stdio"
+command   = ["mcp-server-github"]
+tools     = ["list_issues", "get_file_contents"]   # only these are exposed
+deny      = ["delete_*"]                            # deny wins over allow
+```
+
+```sh
+mcpdef up   --config mcpdef.toml          # serve your clients over Streamable HTTP
+mcpdef call list_issues --args '{}'       # one governed call from the CLI (audited)
+mcpdef audit tail --format ocsf           # stream the tamper-evident ledger to a SIEM
+```
+
+Then point an MCP client at it — Claude Code / Cursor over stdio (`mcpdef run
+--config mcpdef.toml`), or any Streamable-HTTP client at
+`http://127.0.0.1:7878/mcp`. Remote **HTTP** servers and untrusted
+**WASM-sandboxed** servers are declared the same way — see
+[Usage / config sketch](#usage--config-sketch) for all three transports and
+[docs/CONFIG.md](./docs/CONFIG.md) for every knob.
 
 ### Connectivity vs governance: MCPdef sits *behind* a tunnel, not instead of one
 

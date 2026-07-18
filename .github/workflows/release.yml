@@ -258,7 +258,7 @@ jobs:
           wait_indexed() {
             local crate="$1"
             for _ in $(seq 1 30); do
-              if curl -sf "https://crates.io/api/v1/crates/${crate}/${ver}" >/dev/null 2>&1; then
+              if curl -sf -A "mcpdef-release (github.com/lucheeseng827/mcpdef)" "https://crates.io/api/v1/crates/${crate}/${ver}" >/dev/null 2>&1; then
                 return 0
               fi
               sleep 10
@@ -268,7 +268,7 @@ jobs:
           }
           publish_one() {
             local crate="$1"
-            if curl -sf "https://crates.io/api/v1/crates/${crate}/${ver}" >/dev/null 2>&1; then
+            if curl -sf -A "mcpdef-release (github.com/lucheeseng827/mcpdef)" "https://crates.io/api/v1/crates/${crate}/${ver}" >/dev/null 2>&1; then
               echo "${crate} ${ver} already on crates.io — skipping"
               return 0
             fi
