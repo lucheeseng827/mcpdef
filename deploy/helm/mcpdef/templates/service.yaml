@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "mcpdef.fullname" . }}
+  labels:
+    {{- include "mcpdef.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "mcpdef.selectorLabels" . | nindent 4 }}
+  ports:
+    - { name: mcp, port: {{ .Values.service.mcpPort }}, targetPort: mcp }
+    {{- if .Values.admin.enabled }}
+    # Unauthenticated admin/metrics surface — only published when admin.enabled.
+    - { name: admin, port: {{ .Values.service.adminPort }}, targetPort: admin }
+    {{- end }}

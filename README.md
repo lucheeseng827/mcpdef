@@ -338,6 +338,7 @@ mcpdef pin && mcpdef diff-tools                      # approve tool definitions 
 | [docs/CONFIG.md](./docs/CONFIG.md) | **Reference.** Every knob: `mcpdef.toml` keys (gateway, auth, rate limits, egress, roles, profiles, servers/sandbox), CLI flags, on-disk data formats (ledger, pin store). |
 | [docs/API.md](./docs/API.md) | **Reference.** The wire surface as built: HTTP listener endpoints + status codes, the MCP method dispatch, the `tools/call` gate order and every deny rule/error a client can see. |
 | [docs/OPERATIONS.md](./docs/OPERATIONS.md) | **Runbook.** Deploy, what state to back up, the audit-ledger verification procedure (incl. out-of-band seals), monitoring, symptom-first troubleshooting, security posture. |
+| [docs/DEPLOY.md](./docs/DEPLOY.md) | **Deploy.** Run on a cloud VM (docker/podman-compose) or Kubernetes (the [`deploy/helm/mcpdef`](./deploy/helm/mcpdef) chart), plus the importable Grafana dashboard. |
 | [docs/DOCKERHUB.md](./docs/DOCKERHUB.md) | The published container image — tags, a quick `docker run`, and where MCPdef fits in a stack. |
 
 Repo-level docs:

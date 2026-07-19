@@ -1,0 +1,24 @@
+# Run mcpdef on a single cloud VM with Docker or Podman.
+#
+#   1. cp mcpdef.example.toml mcpdef.toml   # then declare your MCP servers in it
+#   2. docker compose up -d                 # or: podman-compose up -d
+#   3. point MCP clients at  http://<vm>:7878/mcp
+#      view the status UI at http://127.0.0.1:7879  (SSH-tunnel it; no auth)
+#
+# The admin port is bound to loopback (127.0.0.1) — it has no auth, so it is not
+# exposed off-box. Put a TLS-terminating reverse proxy + [gateway.auth] in front
+# of :7878 for real internet exposure (the binary has no in-process TLS).
+services:
+  mcpdef:
+    image: mancube/mcpdef:0.2.0
+    command: ["run", "--http", "--config", "/etc/mcpdef/mcpdef.toml"]
+    ports:
+      - "7878:7878"              # MCP Streamable HTTP (bring your own TLS proxy)
+      - "127.0.0.1:7879:7879"    # admin /metrics + status UI — loopback only
+    volumes:
+      - ./mcpdef.toml:/etc/mcpdef/mcpdef.toml:ro
+      - mcpdef-audit:/var/lib/mcpdef   # tamper-evident audit ledger (persisted)
+    restart: unless-stopped
+
+volumes:
+  mcpdef-audit:

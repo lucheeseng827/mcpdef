@@ -1,0 +1,26 @@
+# Copy to mcpdef.toml and declare the MCP servers to front. Full reference:
+# docs/CONFIG.md. This example enables the read-only admin server (metrics + UI).
+[gateway]
+listen = "0.0.0.0:7878"
+audit  = "/var/lib/mcpdef/audit.log"   # persisted via the compose volume
+
+[gateway.admin]
+enabled = true
+listen  = "0.0.0.0:7879"               # published to 127.0.0.1 only by compose
+
+# --- declare your MCP servers (deny-by-default allowlist) ---
+# A remote Streamable-HTTP MCP server:
+# [[server]]
+# id        = "internal"
+# transport = "streamable-http"
+# url       = "https://mcp.internal.example/mcp"
+# tools     = ["list_issues", "get_file_contents"]
+# deny      = ["delete_*"]
+
+# A local stdio MCP server (its binary must exist in the mcpdef image — for
+# arbitrary stdio servers, prefer wrapping them as their own HTTP service):
+# [[server]]
+# id        = "local"
+# transport = "stdio"
+# command   = ["mcp-server-foo", "--flag"]
+# tools     = ["*"]

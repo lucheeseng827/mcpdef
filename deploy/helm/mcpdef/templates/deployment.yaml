@@ -1,0 +1,83 @@
+{{- if and .Values.persistence.enabled (ne (int .Values.replicaCount) 1) }}
+{{- fail "persistence.enabled=true requires replicaCount=1: the audit ledger is single-writer and its PVC is ReadWriteOnce, so multiple replicas cannot share it. To scale out, give each replica its own storage (a StatefulSet) and aggregate the per-replica ledgers downstream." }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "mcpdef.fullname" . }}
+  labels:
+    {{- include "mcpdef.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  {{- if .Values.persistence.enabled }}
+  # The audit PVC is ReadWriteOnce (single-writer): Recreate makes the old Pod
+  # detach the volume before the new one attaches. RollingUpdate would leave the
+  # new Pod stuck waiting on the still-attached RWO claim.
+  strategy:
+    type: Recreate
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "mcpdef.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "mcpdef.selectorLabels" . | nindent 8 }}
+      annotations:
+        # roll the pod when the config changes
+        checksum/config: {{ .Values.config | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "mcpdef.fullname" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: mcpdef
+          image: {{ include "mcpdef.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["run", "--http", "--config", "/etc/mcpdef/mcpdef.toml"]
+          ports:
+            - { name: mcp, containerPort: {{ .Values.service.mcpPort }} }
+            {{- if .Values.admin.enabled }}
+            - { name: admin, containerPort: {{ .Values.service.adminPort }} }
+            {{- end }}
+          startupProbe:
+            tcpSocket: { port: mcp }
+            failureThreshold: {{ .Values.startupProbe.failureThreshold }}
+            periodSeconds: {{ .Values.startupProbe.periodSeconds }}
+          readinessProbe:
+            tcpSocket: { port: mcp }
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket: { port: mcp }
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - { name: config, mountPath: /etc/mcpdef, readOnly: true }
+            - { name: audit, mountPath: /var/lib/mcpdef }
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "mcpdef.fullname" . }}
+        - name: audit
+        {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "mcpdef.fullname" . }}
+        {{- else }}
+          emptyDir: {}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

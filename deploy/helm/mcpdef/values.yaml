@@ -1,0 +1,95 @@
+# mcpdef Helm chart values.
+# The chart deploys the gateway; you declare the upstream MCP servers it fronts
+# in `config` below. See docs/DEPLOY.md and docs/CONFIG.md.
+
+image:
+  repository: mancube/mcpdef
+  # Defaults to the chart appVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# The gateway serialises upstream calls behind a mutex, and each replica keeps
+# its OWN audit ledger / pin store (no cross-replica coordination in OSS). Scale
+# out only if you aggregate the per-replica ledgers downstream.
+replicaCount: 1
+
+# The full mcpdef.toml, rendered into a ConfigMap and mounted at
+# /etc/mcpdef/mcpdef.toml. Declare your MCP servers here. The read-only admin
+# server (Prometheus /metrics + status UI) has no auth of its own, so it is
+# DISABLED by default. To turn it on, set `enabled = true` here AND
+# `admin.enabled=true` below (which publishes the port); keep it in-cluster /
+# behind a NetworkPolicy or an auth proxy — never internet-facing.
+config: |
+  [gateway]
+  listen = "0.0.0.0:7878"
+  audit  = "/var/lib/mcpdef/audit.log"
+
+  # Unauthenticated read-only admin/metrics — off by default. To enable, flip
+  # this to true and set `admin.enabled=true` in values to expose the port.
+  [gateway.admin]
+  enabled = false
+  listen  = "0.0.0.0:7879"
+
+  # --- declare the MCP servers to front (deny-by-default allowlist) ---
+  # [[server]]
+  # id        = "example"
+  # transport = "streamable-http"     # or "stdio" (command=[...]) / "wasm-component"
+  # url       = "http://example-mcp.default.svc:8000/mcp"
+  # tools     = ["*"]                  # allowlist; deny wins over allow
+  # deny      = ["delete_*"]
+
+# Expose the read-only admin/metrics listener (:7879) on the container and the
+# Service. OFF by default because it is unauthenticated — any in-cluster workload
+# could otherwise reach it. Enabling here only publishes the port; you must also
+# turn the listener on in `config` ([gateway.admin] enabled = true). Keep it
+# behind a NetworkPolicy / auth proxy, never internet-facing.
+admin:
+  enabled: false
+
+service:
+  type: ClusterIP
+  mcpPort: 7878
+  adminPort: 7879
+
+# Audit ledger volume. emptyDir (ephemeral, lost on restart) by default; enable
+# persistence to keep the tamper-evident ledger across pod restarts.
+persistence:
+  enabled: false
+  size: 1Gi
+  storageClass: ""
+
+# Prometheus Operator ServiceMonitor for the admin /metrics endpoint. Requires
+# the ServiceMonitor CRD in the cluster.
+serviceMonitor:
+  enabled: false
+  interval: 15s
+  scrapeTimeout: 10s
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: "1"
+    memory: 256Mi
+
+# The published image is distroless nonroot (uid 65532); fsGroup makes the audit
+# volume writable.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+
+# The gateway's connect-time handshake to all upstreams can take a while before
+# the listener binds; a startupProbe keeps that from tripping liveness.
+startupProbe:
+  failureThreshold: 60
+  periodSeconds: 5
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+podAnnotations: {}
+nameOverride: ""
+fullnameOverride: ""
