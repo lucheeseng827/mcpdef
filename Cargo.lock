@@ -1218,7 +1218,7 @@ checksum = "4facc753ae494aeb6e3c22f839b158aebd4f9270f55cd3c79906c45476c47ab4"
 
 [[package]]
 name = "mcpdef"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1245,7 +1245,7 @@ dependencies = [
 
 [[package]]
 name = "mcpdef-audit"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "mcpdef-core",
@@ -1258,7 +1258,7 @@ dependencies = [
 
 [[package]]
 name = "mcpdef-auth"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
  "jsonwebtoken",
@@ -1269,7 +1269,7 @@ dependencies = [
 
 [[package]]
 name = "mcpdef-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1278,11 +1278,11 @@ dependencies = [
 
 [[package]]
 name = "mcpdef-inspect"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "mcpdef-pin"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "serde",
@@ -1295,7 +1295,7 @@ dependencies = [
 
 [[package]]
 name = "mcpdef-policy"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "mcpdef-core",
  "serde",
@@ -1304,11 +1304,11 @@ dependencies = [
 
 [[package]]
 name = "mcpdef-ratelimit"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "mcpdef-sandbox"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "mcpdef-core",
@@ -1322,7 +1322,7 @@ dependencies = [
 
 [[package]]
 name = "mcpdef-transport"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",

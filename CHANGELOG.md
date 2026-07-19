@@ -11,6 +11,27 @@ MCP spec revision(s) it supports (see ROADMAP.md "Spec-version reality").
 
 _Nothing yet._
 
+## [0.2.0] - 2026-07-19
+
+### Added
+- **Native observability — `[gateway.admin]`** (off by default, a separate port
+  from the MCP data path, no auth of its own). A read-only, self-served view of a
+  running gateway:
+  - `GET /metrics` — Prometheus: `mcpdef_tools_calls_total{server,tool,decision,rule}`,
+    a call-latency histogram, `mcpdef_upstreams`, `mcpdef_uptime_seconds`. Native
+    in-process counters incremented at the single audit chokepoint — every governed
+    `tools/call` counted once, no log parsing.
+  - `GET /api/v1/{status,servers,stats,audit}` — read-only JSON.
+  - `GET /` — a built-in single-file status UI (embedded, no build step): fronted
+    servers + effective allowlists, a live audit tail (allow/deny), and counters.
+
+  This is the OSS "view it yourself" surface; the `ee/` dashboard remains the
+  richer control plane. Zero new dependencies (reuses the axum/serde stack).
+
+### Spec support
+- Unchanged from 0.1.0: built against MCP spec **2025-11-25**, forward-planning the
+  stateless **2026-07-28** RC.
+
 ## [0.1.0] - 2026-07-19
 
 ### Added

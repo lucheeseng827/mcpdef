@@ -35,7 +35,7 @@ members = [
 exclude = ["crates/mcpdef-sandbox/tests/fixtures/echo-component"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # Minimum Supported Rust Version — the declared floor for the OSS engine, set by
 # the highest-MSRV dependency in the tree. Currently `time` (0.3.x) requires 1.88
@@ -81,15 +81,15 @@ wat = "1"
 # internal path deps (one-way: leaves depend on core, never the reverse).
 # A `version` alongside `path` is required for `cargo publish` (crates.io uses
 # the version, local builds use the path); it must track workspace.package.version.
-mcpdef-core = { path = "crates/mcpdef-core", version = "0.1.0" }
-mcpdef-transport = { path = "crates/mcpdef-transport", version = "0.1.0" }
-mcpdef-policy = { path = "crates/mcpdef-policy", version = "0.1.0" }
-mcpdef-audit = { path = "crates/mcpdef-audit", version = "0.1.0" }
-mcpdef-inspect = { path = "crates/mcpdef-inspect", version = "0.1.0" }
-mcpdef-pin = { path = "crates/mcpdef-pin", version = "0.1.0" }
-mcpdef-ratelimit = { path = "crates/mcpdef-ratelimit", version = "0.1.0" }
-mcpdef-auth = { path = "crates/mcpdef-auth", version = "0.1.0" }
-mcpdef-sandbox = { path = "crates/mcpdef-sandbox", version = "0.1.0" }
+mcpdef-core = { path = "crates/mcpdef-core", version = "0.2.0" }
+mcpdef-transport = { path = "crates/mcpdef-transport", version = "0.2.0" }
+mcpdef-policy = { path = "crates/mcpdef-policy", version = "0.2.0" }
+mcpdef-audit = { path = "crates/mcpdef-audit", version = "0.2.0" }
+mcpdef-inspect = { path = "crates/mcpdef-inspect", version = "0.2.0" }
+mcpdef-pin = { path = "crates/mcpdef-pin", version = "0.2.0" }
+mcpdef-ratelimit = { path = "crates/mcpdef-ratelimit", version = "0.2.0" }
+mcpdef-auth = { path = "crates/mcpdef-auth", version = "0.2.0" }
+mcpdef-sandbox = { path = "crates/mcpdef-sandbox", version = "0.2.0" }
 
 [profile.release]
 opt-level = "z"
