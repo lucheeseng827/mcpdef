@@ -79,6 +79,20 @@ no per-request transport identity, so auth is not enforced there.
 | `jwks` | inline JSON or path | unset | Pinned keys: inline JWKS JSON (a value starting with `{`) or a path to a JWKS file. Preferred for hardened deploys — no startup network dependency. |
 | `jwks_uri` | string (URL) | unset | Fetch the JWKS at startup, through the egress/SSRF guard. `jwks` wins if both are set. |
 
+## `[gateway.admin]` — OSS read-only admin / observability server
+
+Struct: `AdminConfig`. Prometheus `/metrics`, a small JSON API, and the
+built-in status UI — see [API.md § Admin listener](./API.md#admin-listener-gatewayadmin).
+Off by default; runs on a **separate port** from the MCP data path so scraping
+it never touches the governed hot path. Carries no auth of its own (that's the
+EE control plane's job) — bind it to loopback or keep it behind your own
+network policy, same as the audit ledger.
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `enabled` | bool | `false` | Start the admin server alongside the gateway. |
+| `listen` | string `host:port` | `"127.0.0.1:7879"` | Bind address for the admin server. Loopback by default, and a different port than `[gateway] listen`. |
+
 ## `[[role]]` — RBAC
 
 Struct: `RoleConfig`. Layered over the allowlist for **authenticated** HTTP

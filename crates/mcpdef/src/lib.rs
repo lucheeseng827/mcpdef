@@ -7,13 +7,17 @@
 //! drives it as a stdio MCP server. See the module docs in
 //! [`gateway`] for the Phase-1 governance scope.
 
+pub mod admin;
 pub mod config;
 pub mod gateway;
 pub mod listener;
+pub mod metrics;
 
+pub use self::admin::{serve_admin, AdminState, ServerView};
 pub use self::config::Config;
 pub use self::gateway::{handshake_list, Gateway};
 pub use self::listener::{serve_http, HttpConfig};
+pub use self::metrics::Metrics;
 
 use anyhow::Result;
 use mcpdef_core::Message;

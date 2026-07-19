@@ -10,6 +10,7 @@
 //! the policy-as-code engine, and the WASM sandbox are later phases that slot in
 //! at the same call sites.
 
+use crate::metrics::Metrics;
 use anyhow::{anyhow, Result};
 use mcpdef_audit::{Entry, Ledger};
 use mcpdef_auth::Principal;
@@ -21,6 +22,7 @@ use mcpdef_ratelimit::{RateDecision, RateLimiter};
 use mcpdef_transport::Transport;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// The pin-store key for one governed tool.
@@ -82,6 +84,9 @@ pub struct Gateway {
     /// one shared instance, so letting request content rename the shared identity
     /// would let one client's `initialize` mis-attribute another's audit records.
     capture_client_info: bool,
+    /// Shared metrics registry for the OSS admin server; incremented at each
+    /// audited decision. `None` = metrics off (nothing observing).
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl Gateway {
@@ -103,7 +108,15 @@ impl Gateway {
             rbac: None,
             policy_rules: PolicyRules::default(),
             capture_client_info: true,
+            metrics: None,
         }
+    }
+
+    /// Attach a shared [`Metrics`] registry so every audited decision is counted
+    /// for the admin server / `/metrics`. A no-op observability-wise when unset.
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Mark this gateway as serving many clients over one shared instance (the
@@ -747,13 +760,34 @@ impl Gateway {
         server: &str,
         started: Instant,
     ) {
+        let latency_ms = started.elapsed().as_millis() as u64;
+        // Only the governed `tools/call` hot path counts toward mcpdef_tools_calls_total —
+        // the pin/rug-pull `connect`-time inspection and forward_to_primary's un-governed
+        // relay of arbitrary methods (resources/*, prompts/*, …) are audited too, but
+        // labeling them as tool calls would inflate a counter clients read as exactly that.
+        if let (Some(metrics), Some(method::TOOLS_CALL)) = (&self.metrics, method) {
+            let (decision_label, rule) = match decision {
+                Decision::Allow => ("allow", ""),
+                Decision::Deny { rule, .. } => ("deny", rule.as_str()),
+            };
+            // An "unknown-tool" deny's tool name is caller-controlled and never revisited
+            // (the audit ledger keeps it in full; `Metrics` keeps every distinct label
+            // tuple forever) — collapse it to a fixed label so a flood of made-up tool
+            // names can't grow the Prometheus series set without bound.
+            let tool_label = if rule == "unknown-tool" {
+                "(unknown)"
+            } else {
+                tool.unwrap_or("-")
+            };
+            metrics.record_call(server, tool_label, decision_label, rule, latency_ms);
+        }
         let entry = Entry {
             agent: agent.to_string(),
             server: server.to_string(),
             method: method.map(str::to_string),
             tool: tool.map(str::to_string),
             decision: decision.clone(),
-            latency_ms: started.elapsed().as_millis() as u64,
+            latency_ms,
         };
         if let Err(e) = self.ledger.append(entry) {
             eprintln!("mcpdef: audit append failed: {e}");

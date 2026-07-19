@@ -13,7 +13,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use mcpdef::config::ServerConfig;
 use mcpdef::listener::{AuthState, JwksRefresher};
-use mcpdef::{handshake_list, serve_http, serve_stdio, Config, Gateway, HttpConfig};
+use mcpdef::{
+    handshake_list, serve_admin, serve_http, serve_stdio, AdminState, Config, Gateway, HttpConfig,
+    Metrics, ServerView,
+};
 use mcpdef_audit::{tail, verify, verify_against, ExportFormat, Ledger};
 use mcpdef_auth::Verifier;
 use mcpdef_core::{method, Id, Message};
@@ -22,6 +25,7 @@ use mcpdef_sandbox::{WasmComponentUpstream, WasmUpstream};
 use mcpdef_transport::{EgressPolicy, HttpClient, StdioChild, Transport};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(
@@ -701,7 +705,18 @@ fn tool_result_text(resp: &Message) -> String {
 
 async fn cmd_run(path: &Path, profile_override: Option<String>, http: bool) -> Result<()> {
     let cfg = load_validated(path, profile_override)?;
+    // Only built when the admin server is enabled — nothing else ever reads it, and it
+    // otherwise sits accumulating (server, tool, decision, rule) label tuples in memory
+    // for a caller who never asked for it.
+    let metrics = cfg
+        .gateway
+        .admin
+        .enabled
+        .then(|| Arc::new(Metrics::new(cfg.servers.len() as u64)));
     let mut gw = build_gateway(&cfg).await?;
+    if let Some(m) = &metrics {
+        gw = gw.with_metrics(m.clone());
+    }
 
     let profile_note = cfg
         .gateway
@@ -748,6 +763,42 @@ async fn cmd_run(path: &Path, profile_override: Option<String>, http: bool) -> R
         auth_note,
         transport_note
     );
+
+    // OSS admin / observability server (Prometheus /metrics + JSON API + status
+    // UI) on a separate port. Runs for stdio and HTTP gateways alike — it just
+    // reads the shared metrics registry, a config snapshot, and the ledger file.
+    if cfg.gateway.admin.enabled {
+        let servers = cfg
+            .servers
+            .iter()
+            .map(|s| {
+                let sp = cfg.resolve_server(s);
+                ServerView {
+                    id: s.id.clone(),
+                    transport: s.transport.clone(),
+                    url: s.url.clone(),
+                    tools: sp.allow_tools,
+                    deny: sp.deny,
+                    profile: s.profile.clone(),
+                }
+            })
+            .collect();
+        let admin_state = Arc::new(AdminState {
+            metrics: metrics
+                .clone()
+                .expect("metrics is built whenever admin is enabled"),
+            servers,
+            audit_path: cfg.gateway.audit.clone(),
+            version: env!("CARGO_PKG_VERSION"),
+        });
+        let listen = cfg.gateway.admin.listen.clone();
+        eprintln!("mcpdef: admin/metrics UI on http://{listen}");
+        tokio::spawn(async move {
+            if let Err(e) = serve_admin(admin_state, listen).await {
+                eprintln!("mcpdef: admin server error: {e}");
+            }
+        });
+    }
 
     if http {
         let http_cfg = HttpConfig {

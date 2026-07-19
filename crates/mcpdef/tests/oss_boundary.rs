@@ -32,7 +32,10 @@ fn crate_dirs(root: &Path) -> Vec<PathBuf> {
             dirs.push(path);
         }
     }
-    assert!(!dirs.is_empty(), "expected at least one crate under crates/");
+    assert!(
+        !dirs.is_empty(),
+        "expected at least one crate under crates/"
+    );
     dirs
 }
 

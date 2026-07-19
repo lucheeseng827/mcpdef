@@ -109,6 +109,23 @@ MCPdef's edge over a vendor tunnel is exactly what a tunnel doesn't provide — 
 **no vendor in it**. (Reachability is the LLM-edge concern; MCPdef stays on the
 tool layer.)
 
+## Observability
+
+Turn on `[gateway.admin]` (off by default, a separate port from the MCP data
+path) for a **read-only, self-served view** of a running gateway — no external
+stack required: a built-in status UI at `/`, Prometheus `GET /metrics`, and a
+small JSON API (`/api/v1/{status,servers,stats,audit}`). The UI shows the fronted
+servers + their effective allowlists, a live audit tail (allow/deny), and
+counters; metrics are native in-process counters incremented at each governed
+decision (no log parsing).
+
+![The built-in mcpdef status UI: fronted servers with allow/deny allowlists and a live governed-call audit tail](./docs/screenshots/admin-ui.png)
+
+`/metrics` feeds any Prometheus/Grafana setup — e.g. the cluster lab ships a
+ready-made dashboard ([deploy/cluster-lab](./deploy/cluster-lab)):
+
+![Grafana "mcpdef — gateway governance" dashboard: call rate by decision, denies by rule, calls by server, latency p50/p95](./docs/screenshots/grafana-dashboard.png)
+
 ## Quickstart — see it working
 
 Every command and output below is real (run from this directory; `$` lines are

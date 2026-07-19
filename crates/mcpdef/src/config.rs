@@ -152,6 +152,34 @@ pub struct GatewayConfig {
     /// (`[gateway.inspect]`).
     #[serde(default)]
     pub inspect: InspectConfig,
+    /// OSS read-only admin / observability server (`[gateway.admin]`).
+    #[serde(default)]
+    pub admin: AdminConfig,
+}
+
+/// `[gateway.admin]` — the OSS read-only admin / observability server (Prometheus
+/// `/metrics`, a small JSON API, and the built-in status UI). Off by default; a
+/// separate port from the MCP data path. Carries no auth of its own — bind it to
+/// loopback or keep it behind your own network policy.
+#[derive(Debug, Deserialize)]
+pub struct AdminConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_admin_listen")]
+    pub listen: String,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        AdminConfig {
+            enabled: false,
+            listen: default_admin_listen(),
+        }
+    }
+}
+
+fn default_admin_listen() -> String {
+    "127.0.0.1:7879".to_string()
 }
 
 /// `[gateway.inspect]` — inline injection / secret-exfil scanning. `mode` is

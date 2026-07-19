@@ -124,6 +124,25 @@ authenticated callers by token, and this local operator path carries no bearer.
 On a denial the CLI prints the deny text on stderr and exits non-zero;
 `--json` prints the raw JSON-RPC result instead.
 
+## Admin listener (`[gateway.admin]`)
+
+The OSS read-only observability server: Prometheus metrics, a small JSON API,
+and an embedded status UI — a self-served view of a running gateway, on a
+**separate port** from the MCP data path (`[gateway.admin] listen`, default
+`127.0.0.1:7879`). Off by default. Never mutates state and never touches the
+MCP wire; carries no auth of its own — see
+[CONFIG.md § `[gateway.admin]`](./CONFIG.md#gatewayadmin--oss-read-only-admin--observability-server).
+Source of truth: [`crates/mcpdef/src/admin.rs`](../crates/mcpdef/src/admin.rs).
+
+| Endpoint | Returns |
+|---|---|
+| `GET /` | The built-in status UI (single-file, vanilla JS): status header, fronted-servers table, live audit tail, counters. |
+| `GET /metrics` | Prometheus text exposition: `mcpdef_tools_calls_total{server,tool,decision,rule}`, a call-latency histogram, `mcpdef_upstreams`, `mcpdef_uptime_seconds`. Incremented at the single audit chokepoint (`Gateway::audit`) — every governed `tools/call` counted once. |
+| `GET /api/v1/status` | `{ version, upstreams, uptime_seconds }`. |
+| `GET /api/v1/servers` | The configured upstreams' effective (profile-applied) allow/deny, as `ServerView[]` (`id`, `transport`, `url`, `tools`, `deny`, `profile`). |
+| `GET /api/v1/stats` | The metrics registry's JSON snapshot (call counts by allow/deny/rule/server). |
+| `GET /api/v1/audit` | The last N audit records, newest first (`?limit=` up to 1000, default 100). Reads the same ledger file as `mcpdef audit tail`. |
+
 ## Auditability
 
 Every decision above lands in the hash-linked ledger (`[gateway] audit`) as one

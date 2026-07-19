@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- mcpdef built-in status UI (OSS). Vanilla JS, no build step, no external deps.
+     Polls the read-only admin API on this same origin. -->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>mcpdef · gateway status</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --border: #30363d; --fg: #e6edf3;
+    --muted: #8b949e; --allow: #2ea043; --deny: #f85149; --accent: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  header { padding: 16px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+  header h1 { margin: 0; font-size: 18px; letter-spacing: .5px; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  main { padding: 20px; max-width: 1100px; margin: 0 auto; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 12px; margin-bottom: 24px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 14px; }
+  .card .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .6px; }
+  .card .v { font-size: 24px; margin-top: 4px; }
+  h2 { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .6px;
+    margin: 24px 0 8px; }
+  table { width: 100%; border-collapse: collapse; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border);
+    font-size: 12px; vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  tr:last-child td { border-bottom: none; }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; }
+  .badge.allow { background: rgba(46,160,67,.15); color: var(--allow); }
+  .badge.deny { background: rgba(248,81,73,.15); color: var(--deny); }
+  .pill { display: inline-block; background: #21262d; border: 1px solid var(--border);
+    border-radius: 4px; padding: 0 5px; margin: 1px 2px 1px 0; font-size: 11px; }
+  .pill.deny { color: var(--deny); border-color: rgba(248,81,73,.4); }
+  .muted { color: var(--muted); }
+  a { color: var(--accent); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--allow); margin-right: 6px; }
+  footer { color: var(--muted); font-size: 11px; padding: 16px 20px; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="dot" id="live"></span>mcpdef</h1>
+  <span class="sub" id="hdr">connecting…</span>
+  <span class="sub" style="margin-left:auto">read-only observability · refreshes every 3s ·
+    <a href="/metrics">/metrics</a></span>
+</header>
+<main>
+  <div class="cards" id="cards"></div>
+
+  <h2>Fronted MCP servers</h2>
+  <table id="servers"><thead><tr>
+    <th>id</th><th>transport</th><th>url / command</th><th>allowed tools</th><th>denied</th>
+  </tr></thead><tbody><tr><td colspan="5" class="muted">loading…</td></tr></tbody></table>
+
+  <h2>Recent governed calls</h2>
+  <table id="audit"><thead><tr>
+    <th>time</th><th>server</th><th>tool</th><th>decision</th><th>rule</th><th>ms</th>
+  </tr></thead><tbody><tr><td colspan="6" class="muted">loading…</td></tr></tbody></table>
+</main>
+<footer>mcpdef OSS · the tamper-evident audit ledger is the source of truth ·
+  Apache-2.0</footer>
+
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+function card(k, v) {
+  return `<div class="card"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`;
+}
+function fmtUptime(s) {
+  s = Number(s) || 0;
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return h ? `${h}h ${m}m` : `${m}m ${s % 60}s`;
+}
+
+async function getJSON(u) { const r = await fetch(u); if (!r.ok) throw new Error(r.status); return r.json(); }
+
+async function refresh() {
+  try {
+    const [status, stats, servers, audit] = await Promise.all([
+      getJSON("/api/v1/status"),
+      getJSON("/api/v1/stats"),
+      getJSON("/api/v1/servers"),
+      getJSON("/api/v1/audit?limit=50"),
+    ]);
+    $("#live").style.background = "var(--allow)";
+    $("#hdr").textContent =
+      `v${status.version} · ${status.upstreams} upstream(s) · up ${fmtUptime(status.uptime_seconds)}`;
+
+    $("#cards").innerHTML =
+      card("Total calls", stats.total) +
+      card("Allowed", stats.allow) +
+      card("Denied", stats.deny) +
+      card("Avg latency", (stats.avg_latency_ms || 0).toFixed(1) + " ms") +
+      card("Upstreams", stats.upstreams);
+
+    $("#servers > tbody").innerHTML = servers.length
+      ? servers.map((s) => {
+          const tools = s.tools == null ? '<span class="muted">— (deny-only)</span>'
+            : (s.tools.length ? s.tools.map((t) => `<span class="pill">${esc(t)}</span>`).join("")
+              : '<span class="muted">none</span>');
+          const deny = s.deny && s.deny.length
+            ? s.deny.map((d) => `<span class="pill deny">${esc(d)}</span>`).join("")
+            : '<span class="muted">—</span>';
+          return `<tr><td>${esc(s.id)}</td><td>${esc(s.transport)}</td>` +
+            `<td class="muted">${esc(s.url || "(stdio)")}</td><td>${tools}</td><td>${deny}</td></tr>`;
+        }).join("")
+      : '<tr><td colspan="5" class="muted">no servers</td></tr>';
+
+    $("#audit > tbody").innerHTML = audit.length
+      ? audit.map((r) => {
+          const t = new Date(r.ts_unix_ms).toLocaleTimeString();
+          const badge = r.decision === "allow"
+            ? '<span class="badge allow">allow</span>'
+            : '<span class="badge deny">deny</span>';
+          return `<tr><td class="muted">${esc(t)}</td><td>${esc(r.server)}</td>` +
+            `<td>${esc(r.tool || "—")}</td><td>${badge}</td>` +
+            `<td class="muted">${esc(r.rule || "")}</td><td>${esc(r.latency_ms)}</td></tr>`;
+        }).join("")
+      : '<tr><td colspan="6" class="muted">no calls yet</td></tr>';
+  } catch (e) {
+    $("#live").style.background = "var(--deny)";
+    $("#hdr").textContent = "disconnected — retrying…";
+  }
+}
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

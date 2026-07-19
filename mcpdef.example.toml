@@ -62,6 +62,15 @@ mode = "off"                       # off (default) · warn (log findings) · enf
 injection_phrases = []             # extra injection phrases, matched case-INsensitively (e.g. "exfiltrate the")
 secret_substrings = []             # extra secret substrings, matched case-sensitively (e.g. an internal token prefix "acme_sk_")
 
+# OSS read-only admin / observability server: Prometheus `/metrics`, a small JSON
+# API (/api/v1/status|servers|stats|audit), and a built-in status UI at `/`. Runs
+# on a SEPARATE port from the MCP data path, and carries NO auth of its own — bind
+# it to loopback or keep it behind your own network policy / an authenticating
+# proxy. Off by default.
+[gateway.admin]
+enabled = false                    # set true to serve /metrics + the status UI
+listen  = "127.0.0.1:7879"         # bind wider (e.g. "0.0.0.0:7879") only behind a network boundary
+
 # OAuth 2.1 termination (HTTP listener only). When enabled, every POST to /mcp
 # must carry a valid `Authorization: Bearer <JWT>`; MCPdef validates it per request
 # as an OAuth 2.1 Resource Server (signature against the JWKS, `aud == resource`,

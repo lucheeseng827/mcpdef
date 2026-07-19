@@ -80,8 +80,14 @@ mcpdef audit tail --format ocsf -n 500 | your-siem-forwarder   # also: json | ce
 
 ## Monitoring
 
-MCPdef 0.1.x has **no metrics endpoint** — the audit ledger *is* the telemetry.
-What to watch:
+The audit ledger is the source of truth, and an optional **read-only admin /
+observability server** (`[gateway.admin]`, off by default) exposes it for humans
+and scrapers on a separate port: Prometheus `GET /metrics`
+(`mcpdef_tools_calls_total{server,tool,decision,rule}`, a call-latency histogram,
+`mcpdef_upstreams`, `mcpdef_uptime_seconds`), a small JSON API
+(`/api/v1/status|servers|stats|audit`), and a built-in status UI at `/`. It
+carries no auth of its own — bind it to loopback or keep it behind your own
+network boundary. What to watch:
 
 - **Deny spikes:** `mcpdef audit tail --format json` → `decision:"deny"` grouped
   by `rule`. A burst of `rate-limited` = an agent loop or an undersized bucket;
@@ -154,6 +160,7 @@ What the client sees → why → what to do. Full gate semantics in
   before auth/parse, optional in-flight cap with explicit `503` shed, no
   sessions (stateless per the 2026-07-28 direction).
 - **Deliberately out of scope (0.1.x):** TLS in-binary, policy-as-code,
-  inline result-content/injection scanning (roadmap Phase 3), multi-replica
-  coordination (each replica has its own ledger/pin store), and metrics
-  endpoints. Disclosure policy: [SECURITY.md](../SECURITY.md).
+  inline result-content/injection scanning (roadmap Phase 3), and multi-replica
+  coordination (each replica has its own ledger/pin store/metrics registry — see
+  [Monitoring](#monitoring) for the `[gateway.admin]` `/metrics` endpoint this no
+  longer excludes). Disclosure policy: [SECURITY.md](../SECURITY.md).
