@@ -11,6 +11,25 @@ MCP spec revision(s) it supports (see ROADMAP.md "Spec-version reality").
 
 _Nothing yet._
 
+## [0.2.1] - 2026-09-24
+
+Maintenance release — **no engine source changes** since 0.2.0. The gateway's
+behaviour, config schema, and audit format are unchanged.
+
+### Added
+- **Deployment assets**: a Helm chart (`deploy/helm/mcpdef`, with an optional
+  `ServiceMonitor`), a Docker Compose stack (`deploy/compose`), a Grafana dashboard
+  for the `/metrics` surface, and `docs/DEPLOY.md` deployment guidance.
+- A developer `Makefile` (build / test / lint / image targets).
+
+### Security
+- Refreshed the dependency lockfile: Wasmtime/Cranelift `36.0.12` → `36.0.15`,
+  `rustls` `0.23.41` → `0.23.45`, `rustls-webpki` `0.103.13` → `0.103.15`.
+
+### Spec support
+- Unchanged from 0.1.0: built against MCP spec **2025-11-25**, forward-planning the
+  stateless **2026-07-28** RC.
+
 ## [0.2.0] - 2026-07-19
 
 ### Added

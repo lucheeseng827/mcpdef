@@ -1,3 +1,5 @@
+<img src="docs/images/mcpdef-logo.svg" alt="" width="72">
+
 # MCPdef — MCP Gateway & Governance Plane
 
 A fast, self-hostable, **single-binary MCP gateway & governance plane** in Rust

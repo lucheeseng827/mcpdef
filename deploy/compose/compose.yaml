@@ -10,7 +10,7 @@
 # of :7878 for real internet exposure (the binary has no in-process TLS).
 services:
   mcpdef:
-    image: mancube/mcpdef:0.2.0
+    image: mancube/mcpdef:0.2.1
     command: ["run", "--http", "--config", "/etc/mcpdef/mcpdef.toml"]
     ports:
       - "7878:7878"              # MCP Streamable HTTP (bring your own TLS proxy)
