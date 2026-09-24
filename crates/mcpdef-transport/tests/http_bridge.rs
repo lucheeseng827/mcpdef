@@ -142,6 +142,64 @@ fn build_app() -> Router {
         .route("/mcp", post(modern_mcp))
         .route("/legacy", get(legacy_sse))
         .route("/legacy/messages", post(legacy_post))
+        // The same legacy bridge, but answering an unexpected POST the way a
+        // real framework does rather than the way axum's router does: a body,
+        // and not a JSON one. Express sends exactly this for `Cannot POST /sse`.
+        // A modern (2026-07-28) endpoint: it answers `initialize` normally, and
+        // answers anything else the way the revision requires — `404` carrying a
+        // JSON-RPC `-32601`. One route exercises both the opening probe and a
+        // request sent after the wire is resolved.
+        .route(
+            "/modern-404",
+            post(|body: String| async move {
+                let msg = Message::from_json_line(body.trim()).ok();
+                let id = msg
+                    .as_ref()
+                    .and_then(|m| m.id.clone())
+                    .unwrap_or(Id::Num(0));
+                match msg.as_ref().and_then(|m| m.method()) {
+                    Some("initialize") => (
+                        StatusCode::OK,
+                        Message::result(
+                            id,
+                            serde_json::json!({
+                                "protocolVersion": "2026-07-28",
+                                "capabilities": { "tools": {} },
+                                "serverInfo": { "name": "mock", "version": "0" }
+                            }),
+                        )
+                        .to_json_line(),
+                    ),
+                    _ => (
+                        StatusCode::NOT_FOUND,
+                        Message::error(id, -32601, "no such method here").to_json_line(),
+                    ),
+                }
+            }),
+        )
+        // One that refuses even the opening request, with a modern error body.
+        .route(
+            "/modern-refuses",
+            post(|body: String| async move {
+                let id = Message::from_json_line(body.trim())
+                    .ok()
+                    .and_then(|m| m.id)
+                    .unwrap_or(Id::Num(0));
+                let mut err = Message::error(id, -32022, "unsupported protocol version");
+                err.error.as_mut().unwrap()["data"] =
+                    serde_json::json!({ "supported": ["2026-07-28"] });
+                (StatusCode::BAD_REQUEST, err.to_json_line())
+            }),
+        )
+        .route(
+            "/framework",
+            get(legacy_sse).post(|| async {
+                (
+                    StatusCode::NOT_FOUND,
+                    "<!DOCTYPE html>\n<html><body>Cannot POST /framework</body></html>",
+                )
+            }),
+        )
         .route("/resume", get(resume_sse))
         .route("/resume/messages", post(|| async { StatusCode::ACCEPTED }))
         .with_state(state)
@@ -226,6 +284,27 @@ async fn streamable_probe_falls_back_to_legacy() {
     assert_eq!(resp.result.unwrap()["serverInfo"]["name"], "mock");
 }
 
+/// The same fallback, against a server that answers the probe with a body.
+///
+/// `streamable_probe_falls_back_to_legacy` above gets axum's own `405`, which
+/// carries nothing — so it passed even while the fallback was broken for real
+/// servers. A framework-generated `404` or `405` carries HTML, and decoding that
+/// strictly returned `Err` from the probe before the fallback branch was ever
+/// reached. The body of an error status is only interesting when it is JSON-RPC.
+#[tokio::test]
+async fn streamable_probe_falls_back_when_the_error_page_is_not_json() {
+    let base = spawn_app().await;
+    let mut c = HttpClient::streamable(format!("{base}/framework")).unwrap();
+
+    c.send(init()).await.unwrap();
+    let resp = recv_msg(&mut c).await;
+    assert!(
+        resp.is_response(),
+        "an HTML error page must not stop the legacy fallback"
+    );
+    assert_eq!(resp.result.unwrap()["serverInfo"]["name"], "mock");
+}
+
 #[tokio::test]
 async fn legacy_sse_resumes_with_last_event_id() {
     let base = spawn_app().await;
@@ -298,4 +377,61 @@ async fn default_policy_allows_loopback_upstream() {
     let base = spawn_app().await;
     let mut c = HttpClient::streamable(format!("{base}/mcp")).unwrap();
     assert!(c.send(init()).await.is_ok());
+}
+
+/// A modern upstream's JSON-RPC error is the answer to the request, not a
+/// transport failure.
+///
+/// The revision has a modern server return `404` with a `-32601` body for a
+/// method it does not implement, and `400` with `-32022` or `-32020` for an
+/// unsupported version or a header mismatch. Dropping those bodies for a
+/// `TransportError` means the gateway can only report "gateway error", and the
+/// reason the upstream stated never reaches whoever could act on it.
+#[tokio::test]
+async fn a_modern_error_body_reaches_the_caller_instead_of_a_transport_failure() {
+    let base = spawn_app().await;
+    let mut c = HttpClient::streamable(format!("{base}/modern-404")).unwrap();
+
+    // The opening request succeeds, so the wire resolves to Streamable HTTP.
+    c.send(init()).await.unwrap();
+    let resp = recv_msg(&mut c).await;
+    assert_eq!(resp.result.unwrap()["serverInfo"]["name"], "mock");
+
+    // A later method the upstream does not implement: `404` + `-32601`. That is
+    // its answer, and it has to survive the hop.
+    c.send(Message::request(Id::Num(2), "prompts/list", None))
+        .await
+        .expect("a 404 carrying JSON-RPC is an answer, not a send failure");
+    let resp = recv_msg(&mut c).await;
+    assert!(resp.is_response(), "got: {resp:?}");
+    assert_eq!(
+        resp.error.as_ref().and_then(|e| e["code"].as_i64()),
+        Some(-32601),
+        "the upstream's own error must survive the hop: {resp:?}"
+    );
+}
+
+/// The same, on the *opening* request. An error only a modern server produces
+/// settles the transport question — it is a Streamable-HTTP endpoint that did
+/// not like this request — so the client is left able to retry with a version
+/// the upstream named, rather than holding a failed transport.
+#[tokio::test]
+async fn a_probe_refused_with_a_modern_error_resolves_rather_than_failing() {
+    let base = spawn_app().await;
+    let mut c = HttpClient::streamable(format!("{base}/modern-refuses")).unwrap();
+
+    c.send(init())
+        .await
+        .expect("a modern refusal is an answer, not a dead transport");
+    let resp = recv_msg(&mut c).await;
+
+    assert_eq!(
+        resp.error.as_ref().and_then(|e| e["code"].as_i64()),
+        Some(-32022)
+    );
+    assert_eq!(
+        resp.error.as_ref().unwrap()["data"]["supported"],
+        serde_json::json!(["2026-07-28"]),
+        "the versions it does serve are the useful half: {resp:?}"
+    );
 }

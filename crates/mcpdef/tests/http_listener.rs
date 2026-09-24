@@ -7,6 +7,7 @@
 use mcpdef::listener::{serve_http_on, HttpConfig};
 use mcpdef::Gateway;
 use mcpdef_audit::Ledger;
+use mcpdef_core::wire::WireMode;
 use mcpdef_policy::{Policy, ServerPolicy};
 use mcpdef_transport::StdioChild;
 use serde_json::Value;
@@ -49,6 +50,7 @@ async fn start(allowed_origins: Vec<String>) -> (String, tempfile::TempDir) {
         listen: addr.to_string(),
         allowed_origins,
         max_inflight: None,
+        wire: WireMode::default(),
     };
     // No OAuth verifier — these tests cover the unauthenticated listener.
     tokio::spawn(serve_http_on(listener, gw, cfg, None));

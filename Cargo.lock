@@ -1271,6 +1271,7 @@ dependencies = [
 name = "mcpdef-core"
 version = "0.2.1"
 dependencies = [
+ "base64",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

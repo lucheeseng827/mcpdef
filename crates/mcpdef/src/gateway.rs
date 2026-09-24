@@ -14,6 +14,7 @@ use crate::metrics::Metrics;
 use anyhow::{anyhow, Result};
 use mcpdef_audit::{Entry, Ledger};
 use mcpdef_auth::Principal;
+use mcpdef_core::wire::{self, SpecSetting, UpstreamSpec, WireMode, WireModel};
 use mcpdef_core::{method, Decision, Id, Message};
 use mcpdef_inspect::{Finding, Scanner};
 use mcpdef_pin::{tool_hash, PinCheck, PinStore};
@@ -36,6 +37,12 @@ struct Upstream {
     id: String,
     transport: Box<dyn Transport>,
     next_id: i64,
+    /// Which MCP era this upstream speaks, from its `spec` knob. A modern one
+    /// has no handshake to have learned the protocol version from, so every
+    /// request sent to it carries that itself — see [`Upstream::stamp`].
+    era: WireModel,
+    /// The revision string to declare to it.
+    spec_version: &'static str,
     /// Tool definitions from the upstream's `tools/list` (cached at connect),
     /// used to aggregate `tools/list` and route `tools/call`.
     tools: Vec<serde_json::Value>,
@@ -87,6 +94,27 @@ pub struct Gateway {
     /// Shared metrics registry for the OSS admin server; incremented at each
     /// audited decision. `None` = metrics off (nothing observing).
     metrics: Option<Arc<Metrics>>,
+    /// What MCPdef calls itself to a modern upstream. Built once, shared by
+    /// reference: it goes on every request to such a server.
+    client_info: Arc<serde_json::Value>,
+    /// The MCP revisions this gateway answers for, from `[gateway] wire`.
+    /// `server/discover` reports exactly this, so it must never name a revision
+    /// the listener will then refuse. Defaults to legacy-only, matching the
+    /// config default.
+    served: &'static [&'static str],
+}
+
+impl Upstream {
+    /// Put the per-request `_meta` on a request bound for a modern upstream.
+    ///
+    /// A no-op for a legacy one: that wire has an `initialize` handshake to have
+    /// learned the version and client identity from, so repeating them on every
+    /// message would be noise a 2025-11-25 server has no rule for.
+    fn stamp(&self, req: &mut Message, client: &serde_json::Value) {
+        if self.era == WireModel::Modern {
+            wire::stamp_request(req, self.spec_version, client);
+        }
+    }
 }
 
 impl Gateway {
@@ -109,7 +137,20 @@ impl Gateway {
             policy_rules: PolicyRules::default(),
             capture_client_info: true,
             metrics: None,
+            client_info: Arc::new(client_info()),
+            served: WireMode::default().served(),
         }
+    }
+
+    /// Set which MCP revisions this gateway answers for.
+    ///
+    /// Only `server/discover` reads it today: the listener does the per-request
+    /// era check itself, because that needs the HTTP headers. Keeping the list
+    /// here too means the one method whose whole job is to answer "what do you
+    /// speak" gives the same answer on stdio as over HTTP.
+    pub fn with_wire(mut self, mode: WireMode) -> Self {
+        self.served = mode.served();
+        self
     }
 
     /// Attach a shared [`Metrics`] registry so every audited decision is counted
@@ -201,24 +242,63 @@ impl Gateway {
     /// Connect an upstream: run the MCP lifecycle handshake (initialize →
     /// notifications/initialized), cache its `tools/list` for routing, and
     /// check each tool against the pin store (if pinning is enabled).
+    /// Connect an upstream that speaks the legacy (2025-11-25) wire.
+    ///
+    /// The default, and every existing caller: an upstream's era is a fact about
+    /// that server, so assuming the newer one would break configs on upgrade.
     pub async fn add_upstream(
         &mut self,
         id: impl Into<String>,
+        transport: Box<dyn Transport>,
+    ) -> Result<()> {
+        self.add_upstream_speaking(id, transport, SpecSetting::default())
+            .await
+    }
+
+    /// Connect an upstream, saying which revision it speaks (`[[server]] spec`).
+    ///
+    /// A legacy upstream gets the `initialize` handshake it expects. A modern one
+    /// gets no handshake at all — there is none in that revision — just
+    /// `server/discover` to confirm it really does speak what the config claims,
+    /// then a `tools/list` carrying its own `_meta`.
+    pub async fn add_upstream_speaking(
+        &mut self,
+        id: impl Into<String>,
         mut transport: Box<dyn Transport>,
+        spec: SpecSetting,
     ) -> Result<()> {
         let id = id.into();
         // Bound the connect handshake by the same per-call upstream timeout, so a
         // wedged upstream fails startup fast instead of hanging it indefinitely.
-        let tools = match self.upstream_timeout {
-            Some(timeout) => tokio::time::timeout(timeout, handshake_list(&mut *transport))
-                .await
-                .map_err(|_| {
-                    anyhow!(
-                        "upstream '{id}' did not complete its initialize handshake within {}ms",
-                        timeout.as_millis()
-                    )
-                })??,
-            None => handshake_list(&mut *transport).await?,
+        //
+        // `spec = "auto"` opens with an era probe first, and that probe carries
+        // its own bound because *silence* is one of its answers. Its budget goes
+        // on top of the operator's rather than out of it: the two measure
+        // different things, and carving the probe out of a per-call timeout
+        // would let that knob decide which era a slow server is judged to speak.
+        // A timeout shorter than the probe used to fire before the fallback
+        // could run at all, failing startup on an upstream that opens fine
+        // pinned — and naming a number the operator set for something else.
+        let client = Arc::clone(&self.client_info);
+        let open = open_upstream(&id, &mut *transport, spec, &client);
+        let (budget, probe_note) = match (self.upstream_timeout, spec.pinned()) {
+            (Some(t), None) => (
+                Some(t + PROBE_TIMEOUT),
+                format!(
+                    " (`upstream_timeout_ms` plus {}ms for the `spec = \"auto\"` probe)",
+                    PROBE_TIMEOUT.as_millis()
+                ),
+            ),
+            (t, _) => (t, String::new()),
+        };
+        let (spec, tools) = match budget {
+            Some(budget) => tokio::time::timeout(budget, open).await.map_err(|_| {
+                anyhow!(
+                    "upstream '{id}' did not finish opening within {}ms{probe_note}",
+                    budget.as_millis()
+                )
+            })??,
+            None => open.await?,
         };
 
         let idx = self.upstreams.len();
@@ -233,6 +313,8 @@ impl Gateway {
             id,
             transport,
             next_id: 100,
+            era: spec.era(),
+            spec_version: spec.version(),
             tools,
         });
         Ok(())
@@ -375,6 +457,7 @@ impl Gateway {
                 .await
                 .map(Some),
             method::PING => Ok(Some(Message::result(id, serde_json::json!({})))),
+            method::SERVER_DISCOVER => Ok(Some(self.handle_discover(id))),
             _ => self.forward_to_primary(id, msg, &agent).await.map(Some),
         }
     }
@@ -399,9 +482,43 @@ impl Gateway {
         Message::result(
             id,
             serde_json::json!({
-                "protocolVersion": "2025-11-25",
+                "protocolVersion": wire::SPEC_2025_11_25,
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "mcpdef", "version": env!("CARGO_PKG_VERSION") }
+            }),
+        )
+    }
+
+    /// `server/discover` — how a modern client learns what this gateway speaks.
+    ///
+    /// The 2026-07-28 revision requires every server to implement it, and on
+    /// stdio it is also how a dual-era client probes which era it is talking to:
+    /// a real result means modern, anything else means fall back to
+    /// `initialize`. So it is answered on both transports, from the same list.
+    ///
+    /// No `ttlMs` / `cacheScope`: the revision allows caching this result, but a
+    /// gateway's tool surface moves underneath it — a pin drifts, a description
+    /// trips the injection scanner, an upstream goes away — and promising a
+    /// lifetime we cannot honour would have clients acting on a surface that is
+    /// no longer offered.
+    fn handle_discover(&self, id: Id) -> Message {
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            wire::meta_key::SERVER_INFO.to_string(),
+            serde_json::json!({ "name": "mcpdef", "version": env!("CARGO_PKG_VERSION") }),
+        );
+        Message::result(
+            id,
+            serde_json::json!({
+                "resultType": "complete",
+                "supportedVersions": self.served,
+                "capabilities": { "tools": {} },
+                "_meta": meta,
+                "instructions": "Tool calls through this gateway are governed: an \
+                    allow-list, an argument policy, a tool-definition pin and a rate limit \
+                    apply, and every call is recorded in a tamper-evident ledger. A denied \
+                    call comes back as a tool error naming the rule that matched, so it can \
+                    be corrected and retried rather than treated as a transport failure.",
             }),
         )
     }
@@ -622,11 +739,13 @@ impl Gateway {
 
         // Allowed: forward to the owning upstream, bounded by the per-call timeout.
         let timeout = self.upstream_timeout;
+        let client = Arc::clone(&self.client_info);
         let resp_opt = {
             let up = &mut self.upstreams[idx];
             let local = Id::Num(up.next_id);
             up.next_id += 1;
-            let req = Message::request(local.clone(), method::TOOLS_CALL, msg.params.clone());
+            let mut req = Message::request(local.clone(), method::TOOLS_CALL, msg.params.clone());
+            up.stamp(&mut req, &client);
             dispatch(&mut *up.transport, req, &local, timeout).await?
         };
 
@@ -708,11 +827,13 @@ impl Gateway {
         }
         let server_id = self.upstreams[0].id.clone();
         let timeout = self.upstream_timeout;
+        let client = Arc::clone(&self.client_info);
         let resp_opt = {
             let up = &mut self.upstreams[0];
             let local = Id::Num(up.next_id);
             up.next_id += 1;
-            let req = Message::request(local.clone(), method.as_str(), msg.params.clone());
+            let mut req = Message::request(local.clone(), method.as_str(), msg.params.clone());
+            up.stamp(&mut req, &client);
             dispatch(&mut *up.transport, req, &local, timeout).await?
         };
         match resp_opt {
@@ -832,6 +953,202 @@ async fn dispatch(
     }
 }
 
+/// Open an upstream in the era its `spec` names, and return its tool list.
+///
+/// Legacy is the handshake MCPdef has always run. Modern has no handshake to
+/// run — the revision removed it — so this instead asks `server/discover`, which
+/// every modern server must implement, and checks that the revision the config
+/// claims is one the server actually lists. That check is the difference between
+/// a clear failure at startup and a confusing one on the first tool call: a
+/// legacy server answers `server/discover` with a method-not-found, and saying
+/// so by name beats letting `tools/list` fail for reasons an operator has to
+/// reverse-engineer.
+/// What MCPdef calls itself to a modern upstream.
+///
+/// One definition, because it goes out on every request a modern server sees and
+/// `list_tools_speaking` must send the same thing the gateway does.
+fn client_info() -> serde_json::Value {
+    serde_json::json!({ "name": "mcpdef", "version": env!("CARGO_PKG_VERSION") })
+}
+
+/// List an upstream's tools in whatever era its `spec` names.
+///
+/// What `mcpdef pin` and `mcpdef diff-tools` need: the same opening the gateway
+/// performs, without building a gateway around it. They used to call
+/// [`handshake_list`] directly, which sends `initialize` — a method a 2026-07-28
+/// server does not have, so pinning or diffing a modern upstream failed.
+pub async fn list_tools_speaking(
+    id: &str,
+    transport: &mut dyn Transport,
+    spec: SpecSetting,
+) -> Result<Vec<serde_json::Value>> {
+    open_upstream(id, transport, spec, &client_info())
+        .await
+        .map(|(_, tools)| tools)
+}
+
+/// A JSON-RPC error in reply to an opening request means the upstream did not
+/// open — so say so, with what it said.
+///
+/// Without this a rejected handshake was *silent*: `handshake_list` discarded the
+/// `initialize` reply, `tools/list` then failed too, and `unwrap_or_default`
+/// turned that into an empty tool list. The gateway came up advertising nothing
+/// from that server and told nobody why, which surfaces much later as "the tool
+/// isn't there" rather than as the wire mismatch it is.
+fn reject_error(reply: &Message, what: &str) -> Result<()> {
+    let Some(err) = reply.error.as_ref() else {
+        return Ok(());
+    };
+    let code = err
+        .get("code")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    let message = err
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("no message");
+    Err(anyhow!("this upstream rejected {what} ({code}: {message})"))
+}
+
+/// How long to wait for a `server/discover` reply before concluding an upstream
+/// has never heard of it.
+///
+/// A deliberate constant rather than a knob. It answers a different question from
+/// `upstream_timeout` — "how long until I conclude this server is legacy", not
+/// "how long may a tool call take" — and that one defaults to waiting forever,
+/// which would hang `spec = "auto"` against a server that silently ignores an
+/// unknown method instead of answering `-32601` as JSON-RPC requires.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Work out which era an upstream speaks, for `spec = "auto"`.
+///
+/// The revision's own rule, which is about the *body* and never the status: ask
+/// `server/discover`, and a recognized modern JSON-RPC error still identifies a
+/// modern server. Anything else — an ordinary error, a closed pipe, or silence —
+/// is a legacy server, because that is what a 2025-11-25 server looks like when
+/// asked for a method from a revision it predates.
+///
+/// The answer is a property of the server, not of the request, so it is resolved
+/// once here and then kept for the life of the connection.
+async fn probe_era(
+    id: &str,
+    transport: &mut dyn Transport,
+    client: &serde_json::Value,
+) -> UpstreamSpec {
+    // An id no opening request reuses. The probe gives up after `PROBE_TIMEOUT`
+    // but the upstream may answer later, and `handshake_list` sends `initialize`
+    // as id 0 — so sharing that id would let a slow `-32601` for the *probe* be
+    // read as the answer to `initialize`, failing startup with a diagnosis about
+    // the wrong request entirely. `recv_response` skips ids it did not ask for,
+    // so a distinct one makes a late reply harmless.
+    let probe_id = Id::Str("mcpdef-era-probe".into());
+    let mut discover = Message::request(probe_id.clone(), method::SERVER_DISCOVER, None);
+    wire::stamp_request(&mut discover, UpstreamSpec::V20260728.version(), client);
+    if transport.send(discover).await.is_err() {
+        return UpstreamSpec::V20251125;
+    }
+
+    let reply = match tokio::time::timeout(PROBE_TIMEOUT, recv_response(transport, &probe_id)).await
+    {
+        Ok(Ok(reply)) => reply,
+        // Silence is the 2025-11-25 answer here as much as `-32601` is: a server
+        // that ignores an unknown method tells us the same thing, more slowly.
+        _ => {
+            eprintln!(
+                "mcpdef: upstream '{id}' gave no usable `server/discover` reply; \
+                 treating it as {}",
+                UpstreamSpec::V20251125.version()
+            );
+            return UpstreamSpec::V20251125;
+        }
+    };
+
+    if !wire::discover_proves_modern(&reply) {
+        return UpstreamSpec::V20251125;
+    }
+
+    // It is a modern server. Which revision, though, is its own answer: take the
+    // newest we both speak. A modern server that lists only older revisions has
+    // told us to talk to it the old way, and doing so is reading its answer
+    // rather than guessing.
+    let advertised = wire::advertised_versions(&reply);
+    if advertised.is_empty()
+        || advertised
+            .iter()
+            .any(|v| v == UpstreamSpec::V20260728.version())
+    {
+        UpstreamSpec::V20260728
+    } else {
+        eprintln!(
+            "mcpdef: upstream '{id}' is a modern server but lists {advertised:?}, which does \
+             not include {}; speaking {} to it",
+            UpstreamSpec::V20260728.version(),
+            UpstreamSpec::V20251125.version()
+        );
+        UpstreamSpec::V20251125
+    }
+}
+
+async fn open_upstream(
+    id: &str,
+    transport: &mut dyn Transport,
+    setting: SpecSetting,
+    client: &serde_json::Value,
+) -> Result<(UpstreamSpec, Vec<serde_json::Value>)> {
+    let spec = match setting.pinned() {
+        Some(spec) => spec,
+        None => probe_era(id, transport, client).await,
+    };
+
+    if spec.era() == WireModel::Legacy {
+        return handshake_list(transport).await.map(|tools| (spec, tools));
+    }
+
+    let mut discover = Message::request(Id::Num(0), method::SERVER_DISCOVER, None);
+    wire::stamp_request(&mut discover, spec.version(), client);
+    transport.send(discover).await?;
+    let reply = recv_response(transport, &Id::Num(0)).await?;
+
+    reject_error(&reply, "`server/discover`").map_err(|e| {
+        anyhow!(
+            "{e}, so it is probably not a {} server — set its `spec` to the revision it does \
+             speak",
+            spec.version()
+        )
+    })?;
+
+    let supported: Vec<&str> = reply
+        .result
+        .as_ref()
+        .and_then(|r| r.get("supportedVersions"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default();
+    if !supported.is_empty() && !supported.contains(&spec.version()) {
+        return Err(anyhow!(
+            "this upstream is configured as {} but reports speaking {supported:?}. Set its \
+             `spec` to one of those.",
+            spec.version()
+        ));
+    }
+
+    let mut list = Message::request(Id::Num(1), method::TOOLS_LIST, None);
+    wire::stamp_request(&mut list, spec.version(), client);
+    transport.send(list).await?;
+    let tools = recv_response(transport, &Id::Num(1)).await?;
+    reject_error(&tools, "`tools/list`")?;
+    Ok((
+        spec,
+        tools
+            .result
+            .as_ref()
+            .and_then(|r| r.get("tools"))
+            .and_then(|t| t.as_array())
+            .cloned()
+            .unwrap_or_default(),
+    ))
+}
+
 /// Run the MCP lifecycle handshake (initialize → notifications/initialized) and
 /// return the upstream's `tools/list` array. Shared by [`Gateway::add_upstream`]
 /// and the `mcpdef pin` / `mcpdef diff-tools` commands (which only need the tool defs,
@@ -842,13 +1159,19 @@ pub async fn handshake_list(transport: &mut dyn Transport) -> Result<Vec<serde_j
             Id::Num(0),
             method::INITIALIZE,
             Some(serde_json::json!({
-                "protocolVersion": "2025-11-25",
+                "protocolVersion": wire::SPEC_2025_11_25,
                 "capabilities": {},
                 "clientInfo": { "name": "mcpdef", "version": env!("CARGO_PKG_VERSION") }
             })),
         ))
         .await?;
-    let _ = recv_response(transport, &Id::Num(0)).await?;
+    let hello = recv_response(transport, &Id::Num(0)).await?;
+    reject_error(&hello, "the `initialize` handshake").map_err(|e| {
+        anyhow!(
+            "{e}. A server with no `initialize` is speaking {} or later; set its `spec` to that.",
+            wire::SPEC_2026_07_28
+        )
+    })?;
 
     transport
         .send(Message::notification(method::INITIALIZED, None))
@@ -858,6 +1181,7 @@ pub async fn handshake_list(transport: &mut dyn Transport) -> Result<Vec<serde_j
         .send(Message::request(Id::Num(1), method::TOOLS_LIST, None))
         .await?;
     let list = recv_response(transport, &Id::Num(1)).await?;
+    reject_error(&list, "`tools/list`")?;
     Ok(list
         .result
         .as_ref()

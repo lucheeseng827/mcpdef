@@ -10,6 +10,8 @@
 //! Dependency direction is one-way: the other `mcpdef-*` crates depend on this
 //! one, never the reverse.
 
+pub mod wire;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -25,6 +27,10 @@ pub mod method {
     pub const PROMPTS_LIST: &str = "prompts/list";
     pub const PROMPTS_GET: &str = "prompts/get";
     pub const PING: &str = "ping";
+    /// 2026-07-28: what a client asks to learn the versions and capabilities a
+    /// server speaks, replacing `initialize` as the way to find that out.
+    /// Servers **MUST** implement it.
+    pub const SERVER_DISCOVER: &str = "server/discover";
 }
 
 /// The JSON-RPC protocol version string MCP uses.

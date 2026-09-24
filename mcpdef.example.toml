@@ -25,6 +25,10 @@ audit  = "./mcpdef-audit/audit.log"  # append-only, hash-linked ledger
                                    #   <name>` overrides this. Must live HERE, under [gateway].
 # allowed_origins = ["https://app.example.com"]  # extra Origins beyond loopback (DNS-rebind defense)
 # max_inflight = 512               # cap concurrent HTTP requests; excess → 503 + Retry-After
+# Which MCP revisions the listener serves. Default `legacy` (2025-11-25 only), so
+# upgrading never changes what an existing deployment accepts. `dual` adds the
+# stateless 2026-07-28 wire on the same endpoint; `modern` serves only it.
+# wire = "dual"
 # pins = "./mcpdef-pins.toml"        # enable tool-def pinning + rug-pull detection:
                                    #   on connect MCPdef pins each tool's definition (TOFU); if a
                                    #   server later changes a tool, the call is denied + audited
@@ -136,6 +140,11 @@ transport = "stdio"
 command   = ["mcp-server-github"]
 tools     = ["list_issues", "get_file_contents"]
 deny      = ["delete_*"]
+# Which MCP revision this server speaks. Default 2025-11-25 (the `initialize`
+# handshake). Set "2026-07-28" for a stateless server: MCPdef then opens it with
+# server/discover and stamps every request with the version, its identity and its
+# capabilities. "auto" probes the server and uses whichever it turns out to be.
+# spec      = "auto"
 # Token broker (stdio): MCPdef injects this upstream's brokered credential into the
 # child's environment (the spec's mechanism for stdio servers). The credential
 # lives in MCPdef's config, not the server's — and a downstream client's bearer is

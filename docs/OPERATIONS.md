@@ -17,7 +17,7 @@ MCPdef is one binary + one TOML file. No database, no sidecars.
   via [`Dockerfile.release`](../Dockerfile.release) — see
   [RELEASING.md](../RELEASING.md) and [docs/DOCKERHUB.md](./DOCKERHUB.md).
   Musl caveat: Wasmtime's Cranelift JIT must be validated on the fully-static
-  target (ARCHITECTURE.md §13) — "static-ish", not a blanket promise.
+  target — "static-ish", not a blanket promise.
 - **Run:** `mcpdef run --config mcpdef.toml` (stdio client) or
   `mcpdef up --config mcpdef.toml` (HTTP listener). Validate first:
   `mcpdef validate --config mcpdef.toml`.
@@ -62,7 +62,7 @@ Exit is non-zero on a break, printing `chain BROKEN at seq=<n>`.
 **Plain `verify` cannot detect tail-truncation or wholesale replacement** — a
 shortened-but-valid chain still verifies. To close that, periodically **seal**
 the `(head, count)` pair somewhere the same attacker cannot edit (a ticket, a
-separate WORM store, the `ee/` control plane), then verify against the seal:
+separate WORM store), then verify against the seal:
 
 ```sh
 # seal: record the current head hash and record count out-of-band, then later:
@@ -159,8 +159,7 @@ What the client sees → why → what to do. Full gate semantics in
 - **Listener hardening.** Origin validation (DNS-rebinding), 2 MiB body cap
   before auth/parse, optional in-flight cap with explicit `503` shed, no
   sessions (stateless per the 2026-07-28 direction).
-- **Deliberately out of scope (0.1.x):** TLS in-binary, policy-as-code,
-  inline result-content/injection scanning (roadmap Phase 3), and multi-replica
-  coordination (each replica has its own ledger/pin store/metrics registry — see
+- **Deliberately out of scope:** TLS in-binary, the `transform` policy effect,
+  and multi-replica coordination (each replica has its own ledger/pin store/metrics registry — see
   [Monitoring](#monitoring) for the `[gateway.admin]` `/metrics` endpoint this no
   longer excludes). Disclosure policy: [SECURITY.md](../SECURITY.md).

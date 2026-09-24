@@ -8,14 +8,14 @@ guards egress (SSRF/cloud-metadata block + DNS pinning), pins tool definitions t
 
 ## Where it fits
 
-`mcpd` is the **governance choke-point** between agents and their tools: it sits
+`mcpdef` is the **governance choke-point** between agents and their tools: it sits
 *in the data path*, multiplexes the transports agents speak, and gates every
 `tools/call` before it reaches an MCP server. It governs the **MCP/tool wire**
-only — a separate LLM gateway owns model traffic; `mcpd` never sits between an
+only — a separate LLM gateway owns model traffic; `mcpdef` never sits between an
 agent and a model provider.
 
 ```
-   CALLERS                 MCPD                       GOVERNANCE          UPSTREAMS
+   CALLERS                 MCPDEF                     GOVERNANCE          UPSTREAMS
    (agents / clients)      (this image)               (per tools/call)    (MCP servers it fronts)
 
  ┌──────────────┐
@@ -27,7 +27,7 @@ agent and a model provider.
  │ (MCP client) │                            │      │ RBAC · pins │───▶│ HTTP + SSE server│
  └──────────────┘                            │      │ egress guard│    │ WASM sandbox     │
  ┌──────────────┐        ┌───────────────┐   │      └─────────────┘    │ (in-proc         │
- │ Automation / │  ────▶ │     mcpd      │ ◀─┘             │           │  Wasmtime)       │
+ │ Automation / │  ────▶ │    mcpdef     │ ◀─┘             │           │  Wasmtime)       │
  │ CI · scripts │        │ govern · mux  │                 ▼           └──────────────────┘
  └──────────────┘        └───────┬───────┘        deny → MCP tool-execution error (audited)
                                  │
@@ -36,9 +36,9 @@ agent and a model provider.
 ```
 
 - **Upstream** — the agents and MCP clients that call tools: a coding agent/IDE
-  over stdio, an app or service over Streamable HTTP, a CI job or script. `mcpd`
+  over stdio, an app or service over Streamable HTTP, a CI job or script. `mcpdef`
   is in the data path — every call goes through it, not around it.
-- **mcpd** — multiplexes the transport, then runs each `tools/call` through the
+- **mcpdef** — multiplexes the transport, then runs each `tools/call` through the
   deny-by-default allowlist, RBAC, tool-def pins (rug-pull detection), rate
   limits, and the egress/SSRF guard before forwarding.
 - **Downstream** — the MCP servers it fronts: local stdio children, remote

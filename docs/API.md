@@ -7,10 +7,13 @@ router in [`crates/mcpdef/src/listener.rs`](../crates/mcpdef/src/listener.rs) an
 the method dispatch in [`crates/mcpdef/src/gateway.rs`](../crates/mcpdef/src/gateway.rs);
 regenerate this file when they change.
 
-Only the gates that are implemented are documented here (allowlist/profiles,
-RBAC, pin/rug-pull, rate limiting, upstream timeout, sandbox traps). The
-Phase-3 policy-as-code engine and inline result-content scanning are **not
-built** — see [ROADMAP.md](../ROADMAP.md).
+The gate table below itemises the allowlist/profiles, RBAC, pin/rug-pull, rate
+limit and upstream-timeout gates, plus sandbox traps. Two more gates sit on the
+same path and are configured in [CONFIG.md](./CONFIG.md): the policy-as-code
+rules (`[[policy]]`, evaluated after the allowlist and audited under the rule's
+own `name`) and the inline injection / secret-exfil scan (`[gateway.inspect]`,
+audited as `injection` / `secret-exfil`). The `transform` policy effect, which
+would rewrite arguments or results, is **not built**.
 
 ## HTTP listener endpoints
 

@@ -64,6 +64,42 @@ gateway/router owns *model* requests (provider routing, fallback, token/spend).
 and its **tool servers**, governing the tools / resources / prompts it invokes plus
 the initialize/capabilities handshake. That keeps each layer's threat model crisp.
 
+### Inside the binary
+
+[![MCPdef architecture — how one tools/call moves through the single mcpdef binary: front ends, OAuth authentication, the gateway loop, the policy / pin / rate-limit / inspect gates, then a transport or the Wasmtime sandbox to the upstream server, with every outcome written to the hash-linked audit ledger](docs/images/mcpdef-architecture-oss.png)](docs/images/mcpdef-architecture-oss.png)
+
+Every box is one crate in the one binary, and the arrows are the path a single
+`tools/call` takes:
+
+1. **Front ends.** A client speaks stdio (`mcpdef run`) or Streamable HTTP
+   (`mcpdef run --http` / `mcpdef up`). The HTTP listener binds loopback by
+   default, validates `Origin` (a cross-site request gets `403`), sheds load at an
+   optional in-flight cap (`503`) and caps request bodies at 2 MiB.
+2. **Auth (HTTP only).** `mcpdef-auth` validates the per-request bearer JWT
+   against a JWKS and serves the RFC 9728 metadata and challenge. The resulting
+   *principal* becomes the audit identity and the input to RBAC.
+3. **Gateway loop.** Answers `initialize`, `tools/list` and `ping` itself, routes
+   `tools/call` through the gates, and forwards everything else.
+4. **Gates, in order.** `mcpdef-policy` (deny-by-default allowlist and profiles,
+   then RBAC role grants and per-argument rules) → `mcpdef-pin` (a tool whose definition drifted from its
+   pin is hidden and denied) → `mcpdef-ratelimit` (token buckets, per tool and
+   global) → `mcpdef-inspect` (scans tool descriptions at connect and results per
+   call for injection and secret exfiltration). A refusal is an MCP tool-error the
+   model can read and correct.
+5. **Transport or sandbox.** `mcpdef-transport` reaches a stdio child (credentials
+   injected via `[server.env]`), a Streamable-HTTP server, or a legacy HTTP+SSE
+   server, behind an egress/SSRF guard with DNS pinning. `mcpdef-sandbox` sits
+   behind the *same* transport seam and runs an untrusted `.wasm` server
+   in-process under Wasmtime (fuel, memory and epoch limits, egress allowlist), so
+   every gate applies to it unchanged.
+6. **Ledger.** The gateway appends **every** outcome, allow or deny, to the
+   append-only hash-linked ledger in `mcpdef-audit`; `mcpdef audit tail` exports
+   it to a SIEM. `mcpdef-core` (the JSON-RPC 2.0 envelope and decision types) is
+   shared by every crate.
+
+The same walkthrough, with the per-gate deny reasons a client sees, is on the
+[docs site](https://mcpdef.mancube.net/docs/architecture.html).
+
 ### Plug your MCP servers in
 
 Point your client at `mcpdef` and declare each server once. Minimal example —
@@ -334,11 +370,15 @@ mcpdef pin && mcpdef diff-tools                      # approve tool definitions 
 
 ## Documentation
 
+The same docs are readable online, with no GitHub account or checkout needed, at
+**[mcpdef.mancube.net/docs](https://mcpdef.mancube.net/docs/index.html)**.
+
 | Doc | What's in it |
 |---|---|
 | [README.md](./README.md) | This file — overview, the gap, a verified quickstart session + audit record, install, the boundary note. |
 | [docs/CONFIG.md](./docs/CONFIG.md) | **Reference.** Every knob: `mcpdef.toml` keys (gateway, auth, rate limits, egress, roles, profiles, servers/sandbox), CLI flags, on-disk data formats (ledger, pin store). |
 | [docs/API.md](./docs/API.md) | **Reference.** The wire surface as built: HTTP listener endpoints + status codes, the MCP method dispatch, the `tools/call` gate order and every deny rule/error a client can see. |
+| [docs/WIRE.md](./docs/WIRE.md) | **Reference.** The two MCP eras — legacy `2025-11-25` and stateless `2026-07-28` — what each revision changed, how to pick one per listener and per upstream, and which parts of the newer revision are not implemented yet. |
 | [docs/OPERATIONS.md](./docs/OPERATIONS.md) | **Runbook.** Deploy, what state to back up, the audit-ledger verification procedure (incl. out-of-band seals), monitoring, symptom-first troubleshooting, security posture. |
 | [docs/DEPLOY.md](./docs/DEPLOY.md) | **Deploy.** Run on a cloud VM (docker/podman-compose) or Kubernetes (the [`deploy/helm/mcpdef`](./deploy/helm/mcpdef) chart), plus the importable Grafana dashboard. |
 | [docs/DOCKERHUB.md](./docs/DOCKERHUB.md) | The published container image — tags, a quick `docker run`, and where MCPdef fits in a stack. |
@@ -416,8 +456,11 @@ the CLI (`mcpdef audit verify` / `mcpdef audit tail --format ocsf`). For demos a
 shorthand for `run --http` and **`mcpdef call <tool>`** invokes a single tool through
 the governance path (allowlist/profiles/pinning/rate-limit + audit; RBAC gates
 authenticated HTTP callers, not this local CLI) and prints the result. Driven by one
-[`mcpdef.toml`](./mcpdef.example.toml). Built against MCP spec **2025-11-25** while
-forward-planning the stateless **2026-07-28** RC.
+[`mcpdef.toml`](./mcpdef.example.toml). Speaks MCP **2025-11-25** by default and the stateless
+**2026-07-28** revision when asked: `[gateway] wire` picks what the listener
+serves, `[[server]] spec` what each upstream speaks, and one gateway can front
+both at once. See [docs/WIRE.md](./docs/WIRE.md) for what each era gets and which
+parts of the newer revision are not implemented yet.
 
 ```sh
 cargo run -p mcpdef -- validate --config mcpdef.example.toml

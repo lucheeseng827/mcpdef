@@ -15,7 +15,7 @@ pub mod metrics;
 
 pub use self::admin::{serve_admin, AdminState, ServerView};
 pub use self::config::Config;
-pub use self::gateway::{handshake_list, Gateway};
+pub use self::gateway::{handshake_list, list_tools_speaking, Gateway};
 pub use self::listener::{serve_http, HttpConfig};
 pub use self::metrics::Metrics;
 

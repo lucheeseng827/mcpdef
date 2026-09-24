@@ -19,6 +19,7 @@ use mcpdef::listener::{serve_http_on, AuthState, HttpConfig, JwksRefresher};
 use mcpdef::Gateway;
 use mcpdef_audit::Ledger;
 use mcpdef_auth::Verifier;
+use mcpdef_core::wire::WireMode;
 use mcpdef_policy::{Policy, Rbac, ServerPolicy};
 use mcpdef_transport::{EgressPolicy, StdioChild};
 use serde::Serialize;
@@ -111,6 +112,7 @@ async fn start_authed() -> (String, tempfile::TempDir) {
         listen: addr.to_string(),
         allowed_origins: vec![],
         max_inflight: None,
+        wire: WireMode::default(),
     };
     tokio::spawn(serve_http_on(
         listener,
@@ -157,6 +159,7 @@ async fn start_authed_needing_refresh() -> (String, tempfile::TempDir) {
         listen: addr.to_string(),
         allowed_origins: vec![],
         max_inflight: None,
+        wire: WireMode::default(),
     };
     tokio::spawn(serve_http_on(
         listener,

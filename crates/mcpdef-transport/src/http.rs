@@ -25,6 +25,7 @@ use crate::egress::{self, EgressPolicy};
 use crate::{Transport, TransportError};
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use mcpdef_core::wire::{is_modern_error, mirrored_headers};
 use mcpdef_core::Message;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -237,6 +238,18 @@ impl HttpClient {
         if let Some(sid) = session_id {
             rb = rb.header("Mcp-Session-Id", sid);
         }
+        // The 2026-07-28 mirrored headers, when this message is a modern one.
+        //
+        // They belong to the Streamable-HTTP binding rather than to the protocol,
+        // so this is the right layer for them — and they are derived from the very
+        // message being sent, which means a request and its headers cannot
+        // disagree by construction. An upstream MUST reject a mismatch, so
+        // deriving them here rather than accepting them from a caller is what
+        // keeps that impossible. `mirrored_headers` yields nothing for a legacy
+        // message, so this is a no-op on the 2025-11-25 wire.
+        for (name, value) in mirrored_headers(msg) {
+            rb = rb.header(name, value);
+        }
         let resp = rb
             .body(msg.to_json_line())
             .send()
@@ -257,7 +270,14 @@ impl HttpClient {
             .to_lowercase();
 
         let mut messages = Vec::new();
-        if status.is_success() && status.as_u16() != 202 {
+        // 2xx, and also the statuses a *modern* (2026-07-28) server uses to carry
+        // a JSON-RPC error: `400` for an unsupported version or a header
+        // mismatch, `404` for an unknown method. Those bodies used to be dropped,
+        // which left the fallback below with nothing to read and no way to tell a
+        // modern server from a 2024-11-05 one.
+        let carries_body = (status.is_success() && status.as_u16() != 202)
+            || matches!(status.as_u16(), 400 | 404 | 405);
+        if carries_body {
             let body = resp
                 .text()
                 .await
@@ -269,7 +289,7 @@ impl HttpClient {
                 for ev in events {
                     push_message(&ev.data, &mut messages);
                 }
-            } else {
+            } else if status.is_success() {
                 let trimmed = body.trim();
                 if !trimmed.is_empty() {
                     messages.push(
@@ -277,6 +297,16 @@ impl HttpClient {
                             .map_err(|e| TransportError::Decode(e.to_string()))?,
                     );
                 }
+            } else {
+                // Leniently, on an error status. A 2024-11-05 server answers a
+                // POST to its SSE URL with a `404` and whatever its framework
+                // felt like — Express sends the HTML string `Cannot POST /sse`.
+                // Decoding that strictly returns `Err` from here and the caller
+                // never reaches the legacy fallback, which breaks every
+                // `transport = "streamable-http"` config pointed at such a
+                // server. Only a body that really is JSON-RPC is worth keeping,
+                // and `push_message` already drops the rest.
+                push_message(&body, &mut messages);
             }
         }
         Ok(ModernPost {
@@ -342,12 +372,36 @@ impl Transport for HttpClient {
                             endpoint: url,
                             session_id: probe.session_id,
                         };
+                    } else if probe.messages.iter().any(is_modern_error) {
+                        // It answered with a JSON-RPC error only a modern server
+                        // produces — an unsupported version, a header mismatch, a
+                        // method it does not implement. That settles the
+                        // *transport* question: this is a Streamable-HTTP
+                        // endpoint, which simply did not like this particular
+                        // request. So resolve as modern and hand the caller the
+                        // reason. Failing here instead would lose it, and the
+                        // caller cannot pick a supported version from a dead
+                        // transport.
+                        for m in probe.messages {
+                            let _ = self.inbound_tx.send(Ok(m));
+                        }
+                        self.state = State::Modern {
+                            endpoint: url,
+                            session_id: probe.session_id,
+                        };
                     } else if matches!(probe.status.as_u16(), 400 | 404 | 405) {
                         // Fall back to legacy by re-POSTing `initialize` to the
-                        // SSE endpoint. This assumes a 400/404/405 means the
-                        // upstream did NOT process the probe body (true for these
-                        // statuses: bad-request / no-such-route / method-not-
-                        // allowed) — so no double-`initialize` side effect.
+                        // SSE endpoint. The assumption is that a 400/404/405 means
+                        // the upstream did NOT process the probe body, so there is
+                        // no double-`initialize` side effect.
+                        //
+                        // That was unconditionally true until 2026-07-28, and is
+                        // not any more: a modern server answers an unsupported
+                        // version, a header mismatch or an unknown method with
+                        // exactly these statuses *and* a JSON-RPC error body —
+                        // which the arm above has already claimed. What is left
+                        // here is a status with no MCP body at all, which is what
+                        // a 2024-11-05 server with no modern endpoint looks like.
                         let post_url = self.connect_legacy(&url).await?;
                         // The server NAMES this POST URL — it is untrusted input,
                         // a classic SSRF vector. Guard it before posting.
@@ -389,6 +443,19 @@ impl Transport for HttpClient {
                     .modern_post(&endpoint, session_id.as_deref(), &msg)
                     .await?;
                 if !post.status.is_success() {
+                    // A modern (2026-07-28) server puts its JSON-RPC error in the
+                    // body of a 400 or 404 — an unsupported version, a header
+                    // mismatch, a method it does not implement. That error *is*
+                    // the upstream's answer to this request, and the client asked
+                    // for it. Replacing it with a transport failure loses it: the
+                    // gateway can only report "gateway error" and the reason the
+                    // upstream stated never reaches whoever can act on it.
+                    if post.messages.iter().any(Message::is_response) {
+                        for m in post.messages {
+                            let _ = self.inbound_tx.send(Ok(m));
+                        }
+                        return Ok(());
+                    }
                     return Err(TransportError::Http(format!(
                         "Streamable HTTP POST to {endpoint} returned {}",
                         post.status

@@ -3,6 +3,7 @@
 //! per-server `tools`/`deny` to the Phase-1 [`Policy`].
 
 use anyhow::Context;
+use mcpdef_core::wire::{SpecSetting, WireMode};
 use mcpdef_policy::{ArgMatch, ArgOp, Effect, Policy, PolicyRules, Rbac, Rule, ServerPolicy};
 use mcpdef_sandbox::{EgressAllow, SandboxLimits};
 use mcpdef_transport::EgressPolicy;
@@ -155,6 +156,13 @@ pub struct GatewayConfig {
     /// OSS read-only admin / observability server (`[gateway.admin]`).
     #[serde(default)]
     pub admin: AdminConfig,
+    /// Which MCP wire models the downstream listener serves: `legacy`
+    /// (2025-11-25, the default), `modern` (the stateless 2026-07-28), or
+    /// `dual`. Defaulting to `legacy` means upgrading MCPdef never changes what
+    /// an existing deployment accepts — for an in-path enforcer, a surprise in
+    /// what the wire takes is a surprise in what gets governed.
+    #[serde(default)]
+    pub wire: WireMode,
 }
 
 /// `[gateway.admin]` — the OSS read-only admin / observability server (Prometheus
@@ -328,6 +336,16 @@ pub struct ServerConfig {
     /// streamable-http / sse: the upstream endpoint (reserved in Phase 1).
     #[serde(default)]
     pub url: Option<String>,
+    /// Which MCP revision this server speaks: `"2025-11-25"` (the default),
+    /// `"2026-07-28"`, or `"auto"` to probe it. The newer one has no `initialize` handshake, so MCPdef
+    /// opens it with `server/discover` instead and puts the protocol version,
+    /// its own identity and its capabilities on every request it sends.
+    ///
+    /// It is a fact about the server, not a preference — set it to whatever the
+    /// server actually speaks, and MCPdef translates for a client speaking the
+    /// other one.
+    #[serde(default)]
+    pub spec: SpecSetting,
     /// Allowlist: if present, only these tools are exposed (deny-by-default).
     #[serde(default)]
     pub tools: Option<Vec<String>>,
@@ -465,6 +483,23 @@ impl Config {
                     s.id, s.transport, SUPPORTED_TRANSPORTS
                 ));
                 continue;
+            }
+            // `auto` probes with `server/discover` before anything else is sent.
+            // On stdio that is free — the pipe carries whatever it carries. On an
+            // HTTP upstream it is not: `HttpClient`'s first send also decides the
+            // *transport* (Streamable HTTP vs the 2024-11-05 SSE bridge), a
+            // one-shot negotiation the probe would consume and could leave
+            // failed before the real opening request. Two negotiations, one first
+            // message. Until they are untangled, say so rather than ship a knob
+            // that half works.
+            if s.spec == SpecSetting::Auto && s.transport != "stdio" {
+                errs.push(format!(
+                    "server '{}': `spec = \"auto\"` is only supported on the stdio transport \
+                     today, because probing an HTTP upstream would consume the same first \
+                     request that selects its transport. Pin it to \"2025-11-25\" or \
+                     \"2026-07-28\".",
+                    s.id
+                ));
             }
             match s.transport.as_str() {
                 "stdio" => {
@@ -771,6 +806,115 @@ mod tests {
         assert!(pol.is_governed("github"));
         assert!(pol.decide_tool("github", "delete_repo").as_str() == "deny");
         assert!(pol.decide_tool("github", "list_issues").is_allow());
+    }
+
+    /// The knob has to survive the round trip an operator actually makes:
+    /// a string in TOML. An enum that only ever gets constructed in Rust is a
+    /// knob nobody can turn.
+    #[test]
+    fn the_wire_mode_parses_from_toml_and_defaults_to_legacy() {
+        let with = |line: &str| -> Result<Config, toml::de::Error> {
+            toml::from_str(&format!(
+                "[gateway]\n{line}\n[[server]]\nid = \"x\"\ntransport = \"stdio\"\ncommand = [\"true\"]\n"
+            ))
+        };
+
+        assert_eq!(
+            with("").unwrap().gateway.wire,
+            WireMode::Legacy,
+            "an upgrade must not change what an existing deployment accepts"
+        );
+        assert_eq!(
+            with(r#"wire = "legacy""#).unwrap().gateway.wire,
+            WireMode::Legacy
+        );
+        assert_eq!(
+            with(r#"wire = "dual""#).unwrap().gateway.wire,
+            WireMode::Dual
+        );
+        assert_eq!(
+            with(r#"wire = "modern""#).unwrap().gateway.wire,
+            WireMode::Modern
+        );
+
+        // A typo is refused at load, naming what is accepted, rather than
+        // silently leaving the listener on a wire the operator did not intend.
+        let e = with(r#"wire = "stateless""#).unwrap_err().to_string();
+        assert!(e.contains("legacy") && e.contains("modern"), "got: {e}");
+    }
+
+    /// The per-server knob, through the TOML an operator actually writes.
+    #[test]
+    fn an_upstream_spec_parses_from_toml_and_defaults_to_the_old_wire() {
+        let with = |line: &str| -> Result<Config, toml::de::Error> {
+            toml::from_str(&format!(
+                "[gateway]\n[[server]]\nid = \"x\"\ntransport = \"stdio\"\ncommand = [\"true\"]\n{line}\n"
+            ))
+        };
+
+        assert_eq!(
+            with("").unwrap().servers[0].spec,
+            SpecSetting::V20251125,
+            "an unset knob must keep speaking the old wire"
+        );
+        assert_eq!(
+            with(r#"spec = "2026-07-28""#).unwrap().servers[0].spec,
+            SpecSetting::V20260728
+        );
+        assert_eq!(
+            with(r#"spec = "auto""#).unwrap().servers[0].spec,
+            SpecSetting::Auto,
+            "auto is accepted now that something actually probes"
+        );
+
+        // A revision MCPdef does not speak is refused at load, naming what it
+        // does, rather than silently leaving the upstream on a wire the operator
+        // did not intend.
+        let e = with(r#"spec = "2024-11-05""#).unwrap_err().to_string();
+        assert!(
+            e.contains("2026-07-28") && e.contains("auto"),
+            "the error must name what is accepted: {e}"
+        );
+    }
+
+    /// `auto` is stdio-only for now, and the refusal says why and what to do.
+    #[test]
+    fn auto_is_refused_on_a_transport_whose_first_request_also_picks_the_wire() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [gateway]
+            [[server]]
+            id = "remote"
+            transport = "streamable-http"
+            url = "http://127.0.0.1:9/mcp"
+            spec = "auto"
+        "#,
+        )
+        .unwrap();
+        let joined = cfg.validate().join(" | ");
+        assert!(joined.contains("auto"), "got: {joined}");
+        assert!(
+            joined.contains("stdio"),
+            "it must name where auto does work: {joined}"
+        );
+        assert!(
+            joined.contains("2026-07-28"),
+            "and what to pin instead: {joined}"
+        );
+
+        // Pinned, the same upstream is fine.
+        let cfg: Config = toml::from_str(
+            r#"
+            [gateway]
+            [[server]]
+            id = "remote"
+            transport = "streamable-http"
+            url = "http://127.0.0.1:9/mcp"
+            spec = "2026-07-28"
+        "#,
+        )
+        .unwrap();
+        assert!(cfg.validate().is_empty(), "got: {:?}", cfg.validate());
     }
 
     #[test]

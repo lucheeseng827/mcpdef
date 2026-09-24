@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# The `=?base64?…?=` sentinel the 2026-07-28 transport wraps header values in.
+# Already in this workspace's graph, and the decode gates a tool-name comparison
+# the allowlist then keys on — not a place to hand-roll a codec.
+base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
