@@ -61,6 +61,27 @@ fn audit_verify_reports_ok_on_an_intact_chain() {
     assert!(stdout.contains("3 record(s)"), "got: {stdout}");
 }
 
+/// A 0.2.1 ledger whose seq 6 denied a tool name carrying U+001F: the chain is
+/// intact, and the record whose field boundaries its hash cannot pin is named.
+#[test]
+fn audit_verify_warns_about_a_record_holding_the_separator() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../mcpdef-audit/tests/fixtures/ledger-0.2.1.jsonl");
+    let out = Command::new(BIN)
+        .args(["audit", "verify", "--path"])
+        .arg(&fixture)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "the chain itself is intact");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("chain OK · 8 record(s)"), "got: {stdout}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("1 record(s) hold U+001F inside a field (seq [6])"),
+        "got: {stderr}"
+    );
+}
+
 #[test]
 fn audit_verify_fails_on_a_tampered_chain() {
     let dir = tempfile::tempdir().unwrap();

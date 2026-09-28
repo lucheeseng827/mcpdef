@@ -328,4 +328,33 @@ mod tests {
             .evaluate(&ctx("a", "s", "deploy", &args))
             .is_allow());
     }
+
+    /// A `*` inside a rule's globs, in its conditions and in an `args` glob.
+    /// These used to match nothing, so a deny rule written this way never fired.
+    #[test]
+    fn stars_inside_rule_globs_match() {
+        let r = Rule {
+            agents: Some(vec!["agent:*-bot".into()]),
+            servers: Some(vec!["k8s-*-eu".into()]),
+            tools: Some(vec!["*admin*".into()]),
+            args: vec![ArgMatch {
+                path: "cluster".into(),
+                op: ArgOp::Glob("*prod*".into()),
+            }],
+            ..rule("no-admin-on-prod", Effect::Deny)
+        };
+        let p = PolicyRules::new(vec![r]);
+        let prod = json!({ "cluster": "eu-prod-1" });
+        match p.evaluate(&ctx("agent:ci-bot", "k8s-west-eu", "set_admin_role", &prod)) {
+            Decision::Deny { rule, .. } => assert_eq!(rule, "no-admin-on-prod"),
+            other => panic!("expected deny, got {other:?}"),
+        }
+        let dev = json!({ "cluster": "eu-dev-1" });
+        assert!(p
+            .evaluate(&ctx("agent:ci-bot", "k8s-west-eu", "set_admin_role", &dev))
+            .is_allow());
+        assert!(p
+            .evaluate(&ctx("agent:ci-bot", "k8s-west-eu", "list_pods", &prod))
+            .is_allow());
+    }
 }

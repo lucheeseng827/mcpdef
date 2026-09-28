@@ -192,17 +192,40 @@ impl Rbac {
     }
 }
 
-/// Minimal glob matcher: exact, single trailing `*` (prefix), or single leading
-/// `*` (suffix). Enough for Phase-1 patterns like `delete_*`; the Phase-3 engine
-/// replaces this with the full policy language.
+/// Whether `s` matches the glob `pattern`, as a whole.
+///
+/// `*` matches any run of characters, including none. It may appear anywhere in
+/// the pattern, any number of times. It is the only wildcard: every other
+/// character, `?` and `[` included, matches only itself, and matching is
+/// case-sensitive. A pattern with no `*` is an exact match.
+///
+/// The stars split the pattern into literal pieces. The first piece must start
+/// `s`, the last must end it, and the ones between must appear in order in what
+/// is left, each taken at its leftmost match. With `*` as the only wildcard, the
+/// leftmost match is never wrong, so nothing backtracks and the cost stays
+/// linear in practice.
+///
+/// Matching compares whole UTF-8 pieces, so it is safe on any name: a piece only
+/// ever matches at a character boundary, and every slice below is cut at one.
 pub(crate) fn glob_match(pattern: &str, s: &str) -> bool {
-    if let Some(prefix) = pattern.strip_suffix('*') {
-        s.starts_with(prefix)
-    } else if let Some(suffix) = pattern.strip_prefix('*') {
-        s.ends_with(suffix)
-    } else {
-        pattern == s
+    let Some((first, after_first)) = pattern.split_once('*') else {
+        return pattern == s;
+    };
+    let (middle, last) = after_first.rsplit_once('*').unwrap_or(("", after_first));
+    // The first and last pieces are anchored, and must not overlap.
+    let Some(rest) = s.strip_prefix(first) else {
+        return false;
+    };
+    let Some(mut rest) = rest.strip_suffix(last) else {
+        return false;
+    };
+    for piece in middle.split('*').filter(|p| !p.is_empty()) {
+        match rest.find(piece) {
+            Some(at) => rest = &rest[at + piece.len()..],
+            None => return false,
+        }
     }
+    true
 }
 
 #[cfg(test)]
@@ -371,5 +394,159 @@ mod tests {
             Decision::Deny { rule, .. } => assert_eq!(rule, "deny-glob"),
             other => panic!("expected server deny-glob, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_star_at_both_ends_matches_anywhere_in_the_name() {
+        for name in ["delete_file", "rm_delete_all", "delete", "undelete"] {
+            assert!(glob_match("*delete*", name), "{name}");
+        }
+        for name in ["remove_file", "Delete_file", "delet", ""] {
+            assert!(!glob_match("*delete*", name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_middle_star_matches_any_run_including_none() {
+        assert!(glob_match("get_*_info", "get_user_info"));
+        assert!(glob_match("get_*_info", "get_a_b_info"));
+        assert!(glob_match("get_*_info", "get__info"));
+        // The fixed pieces are anchored and may not overlap.
+        for name in ["get_info", "get_user_info_x", "xget_user_info", "get_user"] {
+            assert!(!glob_match("get_*_info", name), "{name}");
+        }
+    }
+
+    #[test]
+    fn several_stars_match_their_pieces_in_order() {
+        assert!(glob_match("a*b*c", "abc"));
+        assert!(glob_match("a*b*c", "aXbYc"));
+        assert!(glob_match("a*b*c", "abcbc"));
+        assert!(!glob_match("a*b*c", "ac"));
+        assert!(!glob_match("a*b*c", "acb"));
+        assert!(glob_match("*_*_*", "x_y_z"));
+        assert!(!glob_match("*_*_*", "x_y"));
+        // Adjacent stars are one star.
+        assert!(glob_match("a**b", "ab"));
+        assert!(glob_match("**", "anything"));
+    }
+
+    #[test]
+    fn a_lone_star_matches_everything_and_an_empty_pattern_only_nothing() {
+        for name in ["", "x", "delete_repo", "ツール"] {
+            assert!(glob_match("*", name), "{name:?}");
+        }
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "x"));
+        assert!(!glob_match("a*", ""));
+        assert!(!glob_match("*a", ""));
+    }
+
+    #[test]
+    fn exact_prefix_and_suffix_patterns_match_as_before() {
+        assert!(glob_match("list_issues", "list_issues"));
+        assert!(!glob_match("list_issues", "list_issues2"));
+        assert!(glob_match("delete_*", "delete_repo"));
+        assert!(!glob_match("delete_*", "undelete_repo"));
+        assert!(glob_match("*_secret", "db_secret"));
+        assert!(!glob_match("*_secret", "db_secret_ro"));
+    }
+
+    #[test]
+    fn non_ascii_names_match_by_character() {
+        assert!(glob_match("ツ*ル", "ツール"));
+        assert!(glob_match("*ü*", "grün"));
+        assert!(glob_match("données_*", "données_clients"));
+        assert!(glob_match("*é", "café"));
+        // `é` and `©` share their last UTF-8 byte; only a whole `é` may match.
+        assert!(!glob_match("*é", "a©"));
+        assert!(!glob_match("*é*", "a©b"));
+    }
+
+    #[test]
+    fn question_marks_and_brackets_match_only_themselves() {
+        assert!(glob_match("get_?", "get_?"));
+        assert!(!glob_match("get_?", "get_x"));
+        assert!(glob_match("[ab]*", "[ab]_tool"));
+        assert!(!glob_match("[ab]*", "a_tool"));
+    }
+
+    /// Every pattern and name up to four characters, over an alphabet with
+    /// multi-byte characters and the would-be metacharacters, against a
+    /// character-by-character reference.
+    #[test]
+    fn agrees_with_a_reference_matcher_on_every_short_input() {
+        fn reference(pattern: &str, name: &str) -> bool {
+            let p: Vec<char> = pattern.chars().collect();
+            let s: Vec<char> = name.chars().collect();
+            // m[i][j]: the first i pattern characters match the first j name ones.
+            let mut m = vec![vec![false; s.len() + 1]; p.len() + 1];
+            m[0][0] = true;
+            for i in 1..=p.len() {
+                for j in 0..=s.len() {
+                    m[i][j] = if p[i - 1] == '*' {
+                        m[i - 1][j] || (j > 0 && m[i][j - 1])
+                    } else {
+                        j > 0 && m[i - 1][j - 1] && p[i - 1] == s[j - 1]
+                    };
+                }
+            }
+            m[p.len()][s.len()]
+        }
+        let alphabet = ['a', 'é', '©', '?', '*'];
+        let mut all = vec![String::new()];
+        let mut longest = vec![String::new()];
+        for _ in 0..4 {
+            longest = longest
+                .iter()
+                .flat_map(|s| {
+                    alphabet.iter().map(move |c| {
+                        let mut t = s.clone();
+                        t.push(*c);
+                        t
+                    })
+                })
+                .collect();
+            all.extend(longest.iter().cloned());
+        }
+        for pattern in &all {
+            for name in &all {
+                assert_eq!(
+                    glob_match(pattern, name),
+                    reference(pattern, name),
+                    "pattern {pattern:?} against {name:?}"
+                );
+            }
+        }
+    }
+
+    /// The fail-open this matcher fixes: a server with no allowlist and a deny
+    /// pattern starred at both ends denied nothing.
+    #[test]
+    fn a_deny_starred_at_both_ends_denies_without_an_allowlist() {
+        let mut p = Policy::new();
+        p.insert(
+            "fs",
+            ServerPolicy {
+                allow_tools: None,
+                deny: vec!["*delete*".into()],
+            },
+        );
+        for tool in ["delete_file", "rm_delete_all", "delete"] {
+            match p.decide_tool("fs", tool) {
+                Decision::Deny { rule, .. } => assert_eq!(rule, "deny-glob", "{tool}"),
+                other => panic!("{tool}: expected deny-glob, got {other:?}"),
+            }
+        }
+        assert!(p.decide_tool("fs", "read_file").is_allow());
+    }
+
+    #[test]
+    fn rbac_grants_match_a_middle_star() {
+        let mut rbac = Rbac::new();
+        rbac.insert_role("reader", vec![("*".into(), "get_*_info".into())]);
+        let held = || ["reader"].into_iter();
+        assert!(rbac.decide(held(), "gh", "get_user_info").is_allow());
+        assert!(!rbac.decide(held(), "gh", "get_user").is_allow());
     }
 }

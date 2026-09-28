@@ -14,8 +14,8 @@ use clap::{Parser, Subcommand};
 use mcpdef::config::ServerConfig;
 use mcpdef::listener::{AuthState, JwksRefresher};
 use mcpdef::{
-    list_tools_speaking, serve_admin, serve_http, serve_stdio, AdminState, Config, Gateway,
-    HttpConfig, Metrics, ServerView,
+    handshake_list, serve_admin, serve_http, serve_stdio, AdminState, Config, Gateway, HttpConfig,
+    Metrics, ServerView,
 };
 use mcpdef_audit::{tail, verify, verify_against, ExportFormat, Ledger};
 use mcpdef_auth::Verifier;
@@ -277,7 +277,7 @@ async fn collect_tool_hashes(cfg: &Config) -> Result<Vec<(String, BTreeMap<Strin
     let mut out = Vec::new();
     for s in &cfg.servers {
         let mut transport = build_transport(s, egress).await?;
-        let tools = list_tools_speaking(&s.id, &mut *transport, s.spec)
+        let tools = handshake_list(&mut *transport)
             .await
             .with_context(|| format!("listing tools for upstream '{}'", s.id))?;
         let mut map = BTreeMap::new();
@@ -378,9 +378,7 @@ fn print_version() {
         "mcpdef {}  ·  MCP gateway & governance plane",
         env!("CARGO_PKG_VERSION")
     );
-    println!(
-        "  spec target : 2025-11-25 default; stateless 2026-07-28 via `[gateway] wire` / `[[server]] spec`"
-    );
+    println!("  spec target : 2025-11-25 (planning the stateless 2026-07-28 RC)");
     println!(
         "  phase       : 1.5 — transport-mux proxy (stdio · Streamable HTTP · legacy SSE) + allowlist + audit"
     );
@@ -485,6 +483,17 @@ fn cmd_audit(cmd: AuditCmd) -> Result<()> {
                 }
                 _ => anyhow::bail!("--head and --count must be given together (or neither)"),
             };
+            if !report.ambiguous.is_empty() {
+                eprintln!(
+                    "warning: {} record(s) hold U+001F inside a field (seq {:?}): the chain \
+                     covers them, but their hash does not pin where one field ends and the next \
+                     begins, so their fields could have been re-split without breaking it. A \
+                     current gateway never writes such a record; an older one did, for a \
+                     crafted tool or method name",
+                    report.ambiguous.len(),
+                    report.ambiguous
+                );
+            }
             if report.ok() {
                 println!(
                     "chain OK · {} record(s) · head={}",
@@ -583,16 +592,12 @@ async fn build_gateway(cfg: &Config) -> Result<Gateway> {
         // no-op when no `[[policy]]` rules are defined.
         .with_policy_rules(cfg.policy_rules())
         // Inline injection / secret-exfil scanning (a no-op when mode is off).
-        .with_inspect(cfg.gateway.inspect_scanner())
-        // Which MCP revisions to answer for. Only `server/discover` reads this
-        // on the gateway itself; the listener does its own per-request era
-        // check, because that one needs the HTTP headers.
-        .with_wire(cfg.gateway.wire);
+        .with_inspect(cfg.gateway.inspect_scanner());
     let egress = cfg.gateway.egress_policy();
 
     for s in &cfg.servers {
         let transport = build_transport(s, egress).await?;
-        gw.add_upstream_speaking(s.id.clone(), transport, s.spec)
+        gw.add_upstream(s.id.clone(), transport)
             .await
             .with_context(|| format!("initializing upstream '{}'", s.id))?;
     }
@@ -811,7 +816,6 @@ async fn cmd_run(path: &Path, profile_override: Option<String>, http: bool) -> R
             listen: cfg.gateway.listen.clone(),
             allowed_origins: cfg.gateway.allowed_origins.clone(),
             max_inflight: cfg.gateway.max_inflight,
-            wire: cfg.gateway.wire,
         };
         serve_http(gw, http_cfg, auth).await
     } else {

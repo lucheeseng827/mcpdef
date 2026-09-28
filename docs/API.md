@@ -7,13 +7,10 @@ router in [`crates/mcpdef/src/listener.rs`](../crates/mcpdef/src/listener.rs) an
 the method dispatch in [`crates/mcpdef/src/gateway.rs`](../crates/mcpdef/src/gateway.rs);
 regenerate this file when they change.
 
-The gate table below itemises the allowlist/profiles, RBAC, pin/rug-pull, rate
-limit and upstream-timeout gates, plus sandbox traps. Two more gates sit on the
-same path and are configured in [CONFIG.md](./CONFIG.md): the policy-as-code
-rules (`[[policy]]`, evaluated after the allowlist and audited under the rule's
-own `name`) and the inline injection / secret-exfil scan (`[gateway.inspect]`,
-audited as `injection` / `secret-exfil`). The `transform` policy effect, which
-would rewrite arguments or results, is **not built**.
+Only the gates that are implemented are documented here (allowlist/profiles,
+RBAC, pin/rug-pull, rate limiting, upstream timeout, sandbox traps). The
+Phase-3 policy-as-code engine and inline result-content scanning are **not
+built** — see [ROADMAP.md](../ROADMAP.md).
 
 ## HTTP listener endpoints
 
@@ -35,7 +32,8 @@ Request-processing order (each step can end the request):
    `503 Service Unavailable` + `Retry-After: 1`, body
    `gateway overloaded — retry shortly`. Never queued unboundedly.
 3. **OAuth 2.1 bearer validation** (only when `[gateway.auth] enabled`) — a
-   missing/invalid/expired token, wrong `aud`/`iss`, unknown `kid`, or a
+   missing/invalid/expired token, one not valid yet (`nbf`), one whose `exp` or
+   `nbf` is not a number, wrong `aud`/`iss`, unknown `kid`, or a
    `none`/HMAC algorithm → `401 Unauthorized` with
    `WWW-Authenticate: Bearer resource_metadata="<PRM url>", error="invalid_token"`
    and body `missing or invalid bearer token`. The validated token's `sub`

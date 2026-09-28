@@ -11,7 +11,7 @@
 //!    asymmetric allow-list is accepted);
 //! 2. verify the signature, and check `aud` contains this resource's canonical URI
 //!    (RFC 8707 / RFC 9068), `iss` matches the configured authorization server,
-//!    and `exp`/`nbf` are valid;
+//!    and `exp`/`nbf` are numbers that make the token valid now;
 //! 3. return a [`Principal`] (subject, scopes, roles, client_id).
 //!
 //! On a missing/invalid token the gateway returns `401` with a
@@ -27,9 +27,11 @@
 
 use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use serde::de::{self, Deserializer, Visitor};
 use serde::Deserialize;
+use std::fmt;
 use std::sync::{Mutex, PoisonError, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Asymmetric algorithms MCPdef will accept. `none` and HMAC are deliberately
 /// excluded — accepting a header-chosen HMAC alg against a public key is the
@@ -71,7 +73,7 @@ pub enum AuthError {
     /// The token is signed by a key id not in the JWKS.
     #[error("unknown signing key id {0:?}")]
     UnknownKey(String),
-    /// Signature / audience / issuer / expiry validation failed.
+    /// Signature / audience / issuer / expiry / not-before validation failed.
     #[error("invalid token: {0}")]
     Invalid(String),
 }
@@ -109,6 +111,12 @@ impl Principal {
 struct Claims {
     sub: String,
     iss: String,
+    /// When the token expires: a number, or the token is refused.
+    #[serde(deserialize_with = "expiry")]
+    exp: f64,
+    /// When it becomes valid, if it says: a number too.
+    #[serde(default, deserialize_with = "not_before")]
+    nbf: Option<f64>,
     #[serde(default)]
     scope: Option<String>,
     #[serde(default)]
@@ -119,6 +127,56 @@ struct Claims {
     client_id: Option<String>,
     #[serde(default)]
     azp: Option<String>,
+}
+
+/// Reads a time claim: RFC 7519's NumericDate, a JSON number of seconds since
+/// 1970, which may have a fraction. Anything else, `null` included, fails, and
+/// the token with it. jsonwebtoken 9 reads a time claim of another type as
+/// absent, and skips an absent `nbf`'s check (CVE-2026-25537): a token whose
+/// `nbf` was a string was taken before its time. It holds the claim's name, for
+/// the error to say which.
+struct NumericDate(&'static str);
+
+impl Visitor<'_> for NumericDate {
+    type Value = f64;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "`{}` as a number of seconds since 1970", self.0)
+    }
+
+    fn visit_u64<E: de::Error>(self, seconds: u64) -> Result<f64, E> {
+        Ok(seconds as f64)
+    }
+
+    fn visit_i64<E: de::Error>(self, seconds: i64) -> Result<f64, E> {
+        Ok(seconds as f64)
+    }
+
+    fn visit_f64<E: de::Error>(self, seconds: f64) -> Result<f64, E> {
+        Ok(seconds)
+    }
+}
+
+fn expiry<'de, D: Deserializer<'de>>(claim: D) -> Result<f64, D::Error> {
+    claim.deserialize_f64(NumericDate("exp"))
+}
+
+fn not_before<'de, D: Deserializer<'de>>(claim: D) -> Result<Option<f64>, D::Error> {
+    claim.deserialize_f64(NumericDate("nbf")).map(Some)
+}
+
+/// Refuse a token that has expired, or is not valid yet, allowing `leeway`
+/// seconds of clock skew either way. jsonwebtoken has checked both, but only a
+/// time it reads as a whole number of seconds that fits a u64: an `nbf` beyond
+/// that, 1e20 say, it passes over as it would a string.
+fn check_times(exp: f64, nbf: Option<f64>, now: f64, leeway: f64) -> Result<(), AuthError> {
+    if exp < now - leeway {
+        return Err(AuthError::Invalid("the token has expired".into()));
+    }
+    if nbf.is_some_and(|nbf| nbf > now + leeway) {
+        return Err(AuthError::Invalid("the token is not valid yet".into()));
+    }
+    Ok(())
 }
 
 /// Validates bearer JWTs against a JWKS as an OAuth 2.1 Resource Server.
@@ -280,6 +338,11 @@ impl Verifier {
         let data = decode::<Claims>(token, &key, &validation)
             .map_err(|e| AuthError::Invalid(e.to_string()))?;
         let c = data.claims;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        check_times(c.exp, c.nbf, now, validation.leeway as f64)?;
         let scopes = c.scp.unwrap_or_else(|| {
             c.scope
                 .map(|s| s.split_whitespace().map(String::from).collect())
@@ -316,7 +379,7 @@ mod tests {
     use super::*;
     use jsonwebtoken::{encode, EncodingKey, Header};
     use serde::Serialize;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use serde_json::{json, Value};
 
     // A fixed RSA-2048 test keypair (generated with openssl) + its public JWKS,
     // committed under src/testdata/ and embedded so the crypto path is exercised
@@ -401,6 +464,151 @@ mod tests {
             verifier().verify(&token),
             Err(AuthError::Invalid(_))
         ));
+    }
+
+    /// Sign `claims` as they are, whatever their types, with the test key.
+    fn sign_claims(claims: &Value) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("test-key-1".into());
+        let key = EncodingKey::from_rsa_pem(TEST_PRIV_PEM.as_bytes()).unwrap();
+        encode(&header, claims, &key).unwrap()
+    }
+
+    /// A valid token's claims, but with `time` (`exp` or `nbf`) set to
+    /// `value`, or left out for `None`.
+    fn with_time(time: &str, value: Option<Value>) -> Value {
+        let mut claims =
+            json!({ "sub": "agent-7", "iss": ISSUER, "aud": RESOURCE, "exp": now() + 3600 });
+        match value {
+            Some(value) => claims[time] = value,
+            None => {
+                claims.as_object_mut().unwrap().remove(time);
+            }
+        }
+        claims
+    }
+
+    /// The token jsonwebtoken 9 takes before its time (CVE-2026-25537): not
+    /// valid until tomorrow, but saying so with a string.
+    #[test]
+    fn a_string_nbf_is_refused() {
+        let tomorrow = (now() + 86_400).to_string();
+        let token = sign_claims(&with_time("nbf", Some(json!(tomorrow))));
+        let refusal = verifier().verify(&token).unwrap_err();
+        assert!(
+            matches!(&refusal, AuthError::Invalid(why) if why.contains("`nbf` as a number")),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn a_future_nbf_is_refused() {
+        let token = sign_claims(&with_time("nbf", Some(json!(now() + 3600))));
+        assert!(matches!(
+            verifier().verify(&token),
+            Err(AuthError::Invalid(_))
+        ));
+    }
+
+    /// A past `nbf` is accepted, one before 1970 as well.
+    #[test]
+    fn a_past_nbf_is_accepted() {
+        for past in [json!(now() - 3600), json!(-1)] {
+            let token = sign_claims(&with_time("nbf", Some(past.clone())));
+            let subject = verifier().verify(&token).map(|p| p.subject);
+            assert_eq!(subject, Ok("agent-7".to_string()), "{past}");
+        }
+    }
+
+    /// Clocks disagree, so a token is taken up to a minute either side of its
+    /// times, as jsonwebtoken takes it.
+    #[test]
+    fn the_leeway_allows_for_clock_skew() {
+        let mut claims = with_time("nbf", Some(json!(now() + 30)));
+        claims["exp"] = json!(now() - 30);
+        let token = sign_claims(&claims);
+        assert_eq!(verifier().verify(&token).unwrap().subject, "agent-7");
+    }
+
+    /// jsonwebtoken refuses a string `exp` too, but only because it requires
+    /// `exp` and a string does not count. This refusal is the claim's own type
+    /// check, whichever claims jsonwebtoken is told to require.
+    #[test]
+    fn a_string_exp_is_refused() {
+        let later = (now() + 3600).to_string();
+        let token = sign_claims(&with_time("exp", Some(json!(later))));
+        let refusal = verifier().verify(&token).unwrap_err();
+        assert!(
+            matches!(&refusal, AuthError::Invalid(why) if why.contains("`exp` as a number")),
+            "{refusal}"
+        );
+    }
+
+    /// A time claim is a number, or the token is refused, whatever time it
+    /// would name: each value here holds a time that, as a number, would be
+    /// valid. A token with no `exp` at all is refused as well.
+    #[test]
+    fn a_time_claim_of_any_other_type_is_refused() {
+        for (time, at) in [("exp", now() + 3600), ("nbf", now() - 3600)] {
+            let others = [
+                json!(at.to_string()),
+                json!(null),
+                json!(true),
+                json!([at]),
+                json!({ "seconds": at }),
+            ];
+            for value in others {
+                let token = sign_claims(&with_time(time, Some(value.clone())));
+                assert!(
+                    matches!(verifier().verify(&token), Err(AuthError::Invalid(_))),
+                    "{time}: {value}"
+                );
+            }
+        }
+        let token = sign_claims(&with_time("exp", None));
+        assert!(matches!(
+            verifier().verify(&token),
+            Err(AuthError::Invalid(_))
+        ));
+    }
+
+    /// RFC 7519 lets a time carry a fraction of a second. jsonwebtoken takes
+    /// one, and so does the verifier.
+    #[test]
+    fn a_time_with_a_fraction_is_accepted() {
+        let mut claims = with_time("nbf", Some(json!(now() as f64 - 3600.5)));
+        claims["exp"] = json!(now() as f64 + 3600.5);
+        let token = sign_claims(&claims);
+        assert_eq!(verifier().verify(&token).unwrap().subject, "agent-7");
+    }
+
+    /// An `nbf` too large for a u64 is still a number, so it decodes, and
+    /// jsonwebtoken passes over it as it would a string. The token is not
+    /// valid for a very long time yet.
+    #[test]
+    fn an_nbf_too_large_for_jsonwebtoken_is_refused() {
+        let token = sign_claims(&with_time("nbf", Some(json!(1e20))));
+        assert_eq!(
+            verifier().verify(&token),
+            Err(AuthError::Invalid("the token is not valid yet".into()))
+        );
+    }
+
+    /// Both times, with the leeway jsonwebtoken allows: a time up to the
+    /// leeway either side of now is valid, and one a second beyond is not.
+    #[test]
+    fn times_are_checked_with_the_leeway() {
+        let (now, leeway, later) = (1_800_000_000.0, 60.0, 1_800_003_600.0);
+        let expired = Err(AuthError::Invalid("the token has expired".into()));
+        let early = Err(AuthError::Invalid("the token is not valid yet".into()));
+        assert_eq!(check_times(now - leeway, None, now, leeway), Ok(()));
+        assert_eq!(check_times(now - leeway - 1.0, None, now, leeway), expired);
+        assert_eq!(check_times(later, Some(now + leeway), now, leeway), Ok(()));
+        assert_eq!(
+            check_times(later, Some(now + leeway + 1.0), now, leeway),
+            early
+        );
+        assert_eq!(check_times(later, Some(1e20), now, leeway), early);
     }
 
     #[test]

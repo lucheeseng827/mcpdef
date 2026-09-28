@@ -9,7 +9,7 @@ crates; most users want the `mcpdef` binary, not this library directly.
 ## What it does
 
 - Validates a bearer JWT per request against a JWKS (asymmetric-only, algorithm-confusion-safe).
-- Checks RFC 8707 / 9068 audience along with `iss` / `exp`.
+- Checks RFC 8707 / 9068 audience along with `iss`, `exp` and `nbf`, and refuses a token whose `exp` or `nbf` is not a number.
 - Serves the RFC 9728 Protected Resource Metadata document and emits a `WWW-Authenticate` challenge on 401.
 
 ## Usage

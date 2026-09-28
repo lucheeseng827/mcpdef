@@ -4,7 +4,7 @@
 
 image:
   repository: mancube/mcpdef
-  # Defaults to the chart appVersion when empty.
+  # Defaults to the release the chart is for, `v` + its appVersion, when empty.
   tag: ""
   pullPolicy: IfNotPresent
 

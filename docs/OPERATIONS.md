@@ -17,7 +17,7 @@ MCPdef is one binary + one TOML file. No database, no sidecars.
   via [`Dockerfile.release`](../Dockerfile.release) — see
   [RELEASING.md](../RELEASING.md) and [docs/DOCKERHUB.md](./DOCKERHUB.md).
   Musl caveat: Wasmtime's Cranelift JIT must be validated on the fully-static
-  target — "static-ish", not a blanket promise.
+  target (ARCHITECTURE.md §13) — "static-ish", not a blanket promise.
 - **Run:** `mcpdef run --config mcpdef.toml` (stdio client) or
   `mcpdef up --config mcpdef.toml` (HTTP listener). Validate first:
   `mcpdef validate --config mcpdef.toml`.
@@ -62,7 +62,7 @@ Exit is non-zero on a break, printing `chain BROKEN at seq=<n>`.
 **Plain `verify` cannot detect tail-truncation or wholesale replacement** — a
 shortened-but-valid chain still verifies. To close that, periodically **seal**
 the `(head, count)` pair somewhere the same attacker cannot edit (a ticket, a
-separate WORM store), then verify against the seal:
+separate WORM store, the `ee/` control plane), then verify against the seal:
 
 ```sh
 # seal: record the current head hash and record count out-of-band, then later:
@@ -118,7 +118,7 @@ What the client sees → why → what to do. Full gate semantics in
 | `MCPdef denied: tool '<t>' on '<s>' changed since it was pinned (possible rug-pull)` | Pinned definition drifted (description/schema/annotations changed) | Review with `mcpdef diff-tools`; if legitimate, re-approve with `mcpdef pin`. The tool is also hidden from `tools/list` until re-pinned. |
 | `MCPdef denied: global/tool rate limit exceeded … — retry shortly` | Token bucket empty (`[gateway.rate_limit]`) | Retry with backoff; raise `*_per_sec`/`*_burst` if the budget is undersized. |
 | `MCPdef error: upstream '<s>' did not respond to '<t>' within <n>ms` | `upstream_timeout_ms` fired; upstream wedged or slow | Check the upstream process/endpoint; raise the timeout for legitimately slow tools. |
-| HTTP `401` + `WWW-Authenticate: Bearer resource_metadata=…` | Auth on and the bearer is missing/invalid (bad signature, wrong `aud`/`iss`, expired, unknown `kid`, HMAC/`none` alg) | Fetch the PRM document from the challenge URL, get a token from the advertised AS with `aud` = `[gateway.auth] resource`. |
+| HTTP `401` + `WWW-Authenticate: Bearer resource_metadata=…` | Auth on and the bearer is missing/invalid (bad signature, wrong `aud`/`iss`, expired, not valid yet, an `exp` or `nbf` that is not a number, unknown `kid`, HMAC/`none` alg) | Fetch the PRM document from the challenge URL, get a token from the advertised AS with `aud` = `[gateway.auth] resource`. An identity provider that writes `exp` or `nbf` as a string must write a number of seconds instead: RFC 7519 requires one. |
 | HTTP `403` `origin "…" not allowed` | Browser cross-site `Origin` (DNS-rebinding defense) | Add the origin to `[gateway] allowed_origins` if it is your web app. |
 | HTTP `405` on `GET /mcp` | No server→client SSE stream in this phase | Expected; use `POST`. |
 | HTTP `413` | Request body > 2 MiB (`MAX_BODY_BYTES`) | JSON-RPC messages are small by design; oversized tool args need a code change. |
@@ -141,7 +141,8 @@ What the client sees → why → what to do. Full gate semantics in
   turn on `[gateway.auth]`.
 - **Authn/z.** OAuth 2.1 Resource Server per request (JWKS-validated bearer
   JWT, asymmetric-only — algorithm-confusion-safe, `aud`/`iss`/`exp`/`nbf`
-  checked), RFC 9728 discovery on 401. RBAC roles layer over the deny-by-default
+  checked, and a token whose `exp` or `nbf` is not a number refused), RFC 9728
+  discovery on 401. RBAC roles layer over the deny-by-default
   allowlist. The stdio path and `mcpdef call` are trusted-operator paths with no
   bearer.
 - **Token handling.** The client's bearer is validated and dropped — it is
@@ -159,7 +160,8 @@ What the client sees → why → what to do. Full gate semantics in
 - **Listener hardening.** Origin validation (DNS-rebinding), 2 MiB body cap
   before auth/parse, optional in-flight cap with explicit `503` shed, no
   sessions (stateless per the 2026-07-28 direction).
-- **Deliberately out of scope:** TLS in-binary, the `transform` policy effect,
-  and multi-replica coordination (each replica has its own ledger/pin store/metrics registry — see
+- **Deliberately out of scope (0.1.x):** TLS in-binary, policy-as-code,
+  inline result-content/injection scanning (roadmap Phase 3), and multi-replica
+  coordination (each replica has its own ledger/pin store/metrics registry — see
   [Monitoring](#monitoring) for the `[gateway.admin]` `/metrics` endpoint this no
   longer excludes). Disclosure policy: [SECURITY.md](../SECURITY.md).

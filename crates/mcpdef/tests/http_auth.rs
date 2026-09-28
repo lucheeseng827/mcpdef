@@ -19,7 +19,6 @@ use mcpdef::listener::{serve_http_on, AuthState, HttpConfig, JwksRefresher};
 use mcpdef::Gateway;
 use mcpdef_audit::Ledger;
 use mcpdef_auth::Verifier;
-use mcpdef_core::wire::WireMode;
 use mcpdef_policy::{Policy, Rbac, ServerPolicy};
 use mcpdef_transport::{EgressPolicy, StdioChild};
 use serde::Serialize;
@@ -112,7 +111,6 @@ async fn start_authed() -> (String, tempfile::TempDir) {
         listen: addr.to_string(),
         allowed_origins: vec![],
         max_inflight: None,
-        wire: WireMode::default(),
     };
     tokio::spawn(serve_http_on(
         listener,
@@ -159,7 +157,6 @@ async fn start_authed_needing_refresh() -> (String, tempfile::TempDir) {
         listen: addr.to_string(),
         allowed_origins: vec![],
         max_inflight: None,
-        wire: WireMode::default(),
     };
     tokio::spawn(serve_http_on(
         listener,
@@ -209,6 +206,36 @@ async fn missing_bearer_gets_401_with_prm_challenge() {
     assert!(challenge.starts_with("Bearer "));
     assert!(challenge.contains("resource_metadata="));
     assert!(challenge.contains("/.well-known/oauth-protected-resource"));
+}
+
+/// A bearer that is valid in all but one way: it is not valid until tomorrow,
+/// and says so with a string. jsonwebtoken 9 skips an `nbf` it cannot read as
+/// a number (CVE-2026-25537), so this call went through.
+#[tokio::test]
+async fn a_bearer_whose_nbf_is_a_string_gets_401() {
+    let (base, _dir) = start_authed().await;
+    let url = format!("{base}/mcp");
+    let claims = serde_json::json!({
+        "sub": "agent-7",
+        "iss": ISSUER,
+        "aud": RESOURCE,
+        "exp": now() + 3 * 86_400,
+        "nbf": (now() + 86_400).to_string(),
+        "roles": ["reader"],
+    });
+    let mut header = Header::new(Algorithm::RS256);
+    header.kid = Some("test-key-1".into());
+    let key = EncodingKey::from_rsa_pem(TEST_PRIV_PEM.as_bytes()).unwrap();
+    let tok = encode(&header, &claims, &key).unwrap();
+
+    let resp = client()
+        .post(&url)
+        .bearer_auth(&tok)
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"msg":"hi"}}}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
 }
 
 #[tokio::test]

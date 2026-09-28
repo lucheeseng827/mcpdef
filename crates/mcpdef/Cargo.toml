@@ -29,6 +29,8 @@ url.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# an in-process upstream for the listener's tests (the `Transport` trait is async-trait)
+async-trait.workspace = true
 reqwest.workspace = true
 tokio = { workspace = true, features = ["net"] }
 # sign test bearer tokens for the OAuth listener integration tests

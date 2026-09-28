@@ -11,6 +11,79 @@ MCP spec revision(s) it supports (see ROADMAP.md "Spec-version reality").
 
 _Nothing yet._
 
+## [0.2.2] - 2026-09-28
+
+Security release: fixes for five bugs in 0.2.1. Nothing is added, and the config
+schema is unchanged.
+
+### Upgrading from 0.2.1
+- **A `*` inside a pattern now matches.** Review deny lists, `[[role]]` grants and
+  `[[policy]]` rules written with one: a deny that denied nothing now denies, and
+  an allow that allowed nothing now allows.
+- **A bearer token must give `exp` and `nbf` as numbers**, or it gets `401`.
+- **The ledger stores U+001F as `␟`.** A ledger written by 0.2.1 verifies
+  unchanged.
+
+### Security
+- **An HTTP client that disconnected mid-call left no audit record.** The
+  listener dropped the call when the client went away, after the upstream had
+  already been asked to run the tool, so the tool ran and the ledger never
+  said so. A call now runs to its end even when its client leaves first: its
+  record is written once the upstream answers, and it keeps its
+  `[gateway] max_inflight` slot until then.
+- **A crafted name could hide an edit to its own ledger record.** A record's
+  hash joins its fields with U+001F. When a caller put that character in a tool
+  or method name, someone able to edit the ledger could re-split that one
+  record, turning a denied call into an allowed one, without breaking the chain.
+  Other records were never exposed. The ledger now stores U+001F as `␟`
+  (U+241F), and `mcpdef audit verify` names any existing record that holds one.
+- **A crafted method could forge a syslog record's structured data.** The syslog
+  export used the JSON-RPC method, which the client chooses, as the RFC 5424
+  MSGID with only CR/LF removed. A method holding a space and a bracketed element
+  became the structured data a SIEM parses, and the real `mcpdef@0` element fell
+  into the message text. The MSGID is now at most 32 printable US-ASCII
+  characters, with anything else as `_`; the full method stays in the message.
+- **A deny pattern with a `*` inside it or at both ends denied nothing.** Glob
+  patterns honoured `*` only as their first or last character.
+  `deny = ["*delete*"]` compared each tool name against the literal prefix
+  `*delete`, which no tool has, so on a server with no `tools` allowlist every
+  delete tool stayed callable. `mcpdef validate` accepted the pattern. The same
+  matcher serves profiles, `[[role]]` grants and `[[policy]]` rules, so a deny
+  rule such as `tools = ["*admin*"]` never fired either.
+
+  `*` now matches any run of characters, anywhere in a pattern, any number of
+  times. `?` and `[` still match only themselves. Allow-side patterns change
+  too: an allowlist entry, grant or `allow` rule written this way used to match
+  nothing and now matches what it names. Review deny lists, grants and rules
+  written for 0.2.1 or earlier. `docs/CONFIG.md` now documents the syntax.
+- **A bearer token whose `nbf` was not a number was accepted before its
+  time.** jsonwebtoken 9, the JWT library, reads a time claim of the wrong JSON
+  type as absent, and skips the check of an absent `nbf` (CVE-2026-25537,
+  GHSA-h395-gr6q-cpjc). A token not valid until tomorrow that gave its `nbf` as
+  a string was accepted today. Only the configured issuer could sign one. A
+  string `exp` was refused already, as a missing one is.
+
+  `exp` and `nbf` must now be JSON numbers: a token that gives either as a
+  string, `null` or anything else gets `401`, as does one whose `nbf` is too
+  large for the library to read, which it passed over the same way. A time may
+  still carry a fraction of a second, as RFC 7519 allows. An identity provider
+  that writes either claim as a string must write a number instead.
+
+### Fixed
+- **The Compose file and the Helm chart name an image that exists.** Both named
+  `mancube/mcpdef:0.2.1`, but a release's image is tagged as the release is,
+  `v0.2.1`, so neither could pull it. The chart's image now defaults to `v` and
+  its `appVersion`, and the Compose file and the Makefile name `v0.2.2`.
+
+### Changed
+- **Dev and test builds carry line tables, not full debug info**
+  (`[profile.dev]`), so each test binary is under half the size and the suite
+  fits a CI runner's disk. `CARGO_PROFILE_DEV_DEBUG=true` brings full debug info
+  back. Release builds are unchanged.
+
+### Spec support
+- Unchanged from 0.2.1: built against MCP spec **2025-11-25**.
+
 ## [0.2.1] - 2026-09-24
 
 Maintenance release — **no engine source changes** since 0.2.0. The gateway's
@@ -320,5 +393,8 @@ behaviour, config schema, and audit format are unchanged.
 - Single declarative `mcpdef.toml` config; `mcpdef run` / `mcpdef validate` /
   `mcpdef version`.
 
-[Unreleased]: https://github.com/lucheeseng827/mcpdef/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/lucheeseng827/mcpdef/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/lucheeseng827/mcpdef/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/lucheeseng827/mcpdef/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/lucheeseng827/mcpdef/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/lucheeseng827/mcpdef/releases/tag/v0.1.0

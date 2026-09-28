@@ -15,6 +15,35 @@ transport, missing `command`/`url`/`wasm`, dead rate-limit buckets, incomplete
 `[gateway.auth]`, unknown profile references, malformed egress entries) without
 starting the gateway.
 
+## Glob patterns
+
+Several settings take glob patterns:
+- `tools` and `deny`, in a `[[server]]` or a `[profile.<name>]`;
+- a `[[role]]`'s `grants`;
+- a `[[policy]]` rule's `servers`, `tools`, `agents` and its `args` `glob`.
+
+They all follow the same rules:
+- `*` matches any run of characters, including none. It can appear anywhere in a
+  pattern, any number of times.
+- `*` is the only wildcard. Every other character matches only itself, `?` and
+  `[` included.
+- Matching is case-sensitive, and a pattern must match the whole name:
+  `delete_*` does not match `undelete_file`. To match a name that *contains*
+  something, put a `*` on both sides.
+- A pattern without `*` is an exact match. A lone `*` matches everything.
+
+| Pattern | Matches | Does not match |
+|---|---|---|
+| `delete_*` | `delete_file`, `delete_` | `undelete_file` |
+| `*_secret` | `db_secret` | `db_secret_ro` |
+| `*delete*` | `delete`, `delete_file`, `rm_delete_all` | `Delete_file`, `remove_file` |
+| `get_*_info` | `get_user_info`, `get__info` | `get_info` |
+
+Releases up to 0.2.1 honoured `*` only as a pattern's first or last character.
+A pattern with a `*` inside it or at both ends matched nothing there, so a deny
+written that way denied nothing and an allow allowed nothing. Both now match as
+written.
+
 ## `[gateway]`
 
 Struct: `GatewayConfig` (`config.rs`).
@@ -23,13 +52,12 @@ Struct: `GatewayConfig` (`config.rs`).
 |---|---|---|---|
 | `listen` | string `host:port` | `"127.0.0.1:7878"` | Bind address for the downstream Streamable HTTP listener (`mcpdef run --http` / `mcpdef up`). Loopback by default — binding wider is a deliberate act. |
 | `audit` | path | `"./mcpdef-audit/audit.log"` | The append-only, hash-linked audit ledger (JSONL, one record per governed call). Parent dirs are created on first run. |
-| `policy` | path | unset | **Reserved** for a policy directory. Parsed but unused today — declare rules inline with [`[[policy]]`](#policy--policy-as-code-rules). |
+| `policy` | path | unset | **Reserved** for the Phase-3 policy-as-code directory. Parsed but unused today. |
 | `pins` | path | unset (pinning off) | Tool-def pin store (TOML). When set, MCPdef pins each upstream tool's definition (trust-on-first-use) and denies + audits a `rug-pull` if a definition later drifts. Managed with `mcpdef pin` / `mcpdef diff-tools`. |
 | `profile` | string | unset | The active gateway profile — a `[profile.<name>]` layered over **every** server, scoping the whole tool surface an agent sees. Overridable at launch with `--profile`. |
-| `upstream_timeout_ms` | int (ms) | unset / `0` = no timeout | Per-call upstream response bound. A wedged upstream is failed as an audited `upstream-timeout` instead of hanging the gateway; also bounds the connect handshake. A `spec = "auto"` upstream gets the era probe's 5s **on top of** this for its opening, since the probe measures something else — see [WIRE.md](./WIRE.md). |
+| `upstream_timeout_ms` | int (ms) | unset / `0` = no timeout | Per-call upstream response bound. A wedged upstream is failed as an audited `upstream-timeout` instead of hanging the gateway; also bounds the connect handshake. |
 | `allowed_origins` | array of strings | `[]` | Extra `Origin` values accepted on the HTTP listener beyond loopback (`localhost`/`127.0.0.1`/`::1`, any port, always allowed; requests with no Origin always pass). Anything else → `403` (DNS-rebinding defense). |
 | `max_inflight` | int | unset = unlimited | Max concurrent in-flight HTTP requests; excess is shed with `503` + `Retry-After: 1` (fail-fast load-shedding). |
-| `wire` | `legacy` \| `dual` \| `modern` | `legacy` | Which MCP revisions the HTTP listener serves. `legacy` = 2025-11-25 only (an `initialize` handshake); `modern` = the stateless 2026-07-28 only; `dual` = both on the one endpoint, chosen per request. Defaults to `legacy` so an upgrade never changes what a deployment accepts. See [WIRE.md](./WIRE.md). |
 
 ## `[gateway.rate_limit]`
 
@@ -68,7 +96,8 @@ with `mcpdef egress show`.
 Struct: `AuthConfig`. Applies to the **HTTP listener only**: when `enabled`,
 every `POST /mcp` must carry a valid `Authorization: Bearer <JWT>`, validated
 per request (signature against the JWKS, `aud == resource`, `iss == issuer`,
-`exp`/`nbf`; asymmetric algorithms only — `none`/HMAC are rejected). Running
+`exp`/`nbf`, each a number of seconds or the token is refused; asymmetric
+algorithms only — `none`/HMAC are rejected). Running
 `mcpdef run` *without* `--http` while auth is enabled prints a warning: stdio has
 no per-request transport identity, so auth is not enforced there.
 
@@ -94,24 +123,6 @@ network policy, same as the audit ledger.
 | `enabled` | bool | `false` | Start the admin server alongside the gateway. |
 | `listen` | string `host:port` | `"127.0.0.1:7879"` | Bind address for the admin server. Loopback by default, and a different port than `[gateway] listen`. |
 
-## `[gateway.inspect]` — injection / secret-exfil scanning
-
-Struct: `InspectConfig`. Inline scanning of the two untrusted-content surfaces an
-in-path gateway straddles. Tool **descriptions** are scanned at connect — a
-"line-jumping" / tool-poisoning attempt hides the tool from `tools/list` and denies
-its `tools/call`. Tool-call **results** are scanned per call — a response that
-leaks a credential or carries injected instructions is refused before it reaches
-the model. A finding is audited under an `injection` or `secret-exfil` rule. The
-built-in pack is a curated, high-precision starter set: prompt-injection phrasing
-plus secret patterns (AWS, Slack, GitHub and Stripe keys, PEM private-key blocks).
-It is opt-in — start with `warn` before `enforce`.
-
-| Key | Type | Default | What it does |
-|---|---|---|---|
-| `mode` | `"off"` \| `"warn"` \| `"enforce"` | `"off"` | `off`: no scanning. `warn`: log and audit findings only. `enforce`: hide poisoned tools and refuse results that leak a secret or carry injected instructions. Any other value fails `mcpdef validate`. |
-| `injection_phrases` | array of strings | `[]` | Extra prompt-injection phrases on top of the built-in pack, matched **case-insensitively** (e.g. `"exfiltrate the"`). |
-| `secret_substrings` | array of strings | `[]` | Extra secret substrings, matched **case-sensitively** (e.g. an internal credential prefix such as `"acme_sk_"`). |
-
 ## `[[role]]` — RBAC
 
 Struct: `RoleConfig`. Layered over the allowlist for **authenticated** HTTP
@@ -123,57 +134,6 @@ token's scopes or `roles` claim.
 |---|---|---|
 | `name` | string (non-empty) | The role name matched against token scopes/roles. |
 | `grants` | array of strings | Grants as `"server-glob:tool-glob"`; a bare `"tool-glob"` (no colon) grants it on any server. |
-
-## `[[policy]]` — policy-as-code rules
-
-Struct: `PolicyRuleConfig`. A richer gate than the allowlist, evaluated **after**
-it. Where the allowlist decides on the tool name alone, a rule matches on the
-caller (agent), the server, the tool (all globs) and the tool-call **arguments**
-(per field) — so it can express "deny `delete_*` on `github` when `args.name` is a
-`prod-*` repo", or "only `agent:ci-*` may call `deploy`".
-
-Rules run top to bottom and **the first match wins**, so put a specific `allow`
-before a broad `deny`. No match means allowed (the allowlist already gated). A
-denial is audited under the rule's own `name`.
-
-| Key | Type | Default | What it does |
-|---|---|---|---|
-| `name` | string | required | Identifies the rule; it is the `rule` written to the audit record on a deny. |
-| `effect` | `"allow"` \| `"deny"` | required | Case-insensitive. Anything else fails `mcpdef validate`. |
-| `servers` | array of globs | omitted = any server | Match on the governed server id. |
-| `tools` | array of globs | omitted = any tool | Match on the tool name. |
-| `agents` | array of globs | omitted = any caller | Match on the audit identity (e.g. `agent:ci-*`). |
-| `args` | array of predicates | `[]` | Per-argument predicates, **AND-ed**. See below. |
-
-Match conditions are AND-ed. **Omit** a condition to match anything for that
-dimension; an explicit empty list (`servers = []`) is rejected by `mcpdef
-validate`, because it would silently match nothing — a fail-open for a `deny`.
-
-Each `args` predicate is a table with a dotted `path` into the arguments (e.g.
-`"target.env"`) and **exactly one** operator:
-
-| Operator | Type | Matches when |
-|---|---|---|
-| `equals` | string | the value at `path` equals the string. |
-| `glob` | string | the value at `path` matches the glob. |
-| `contains` | string | the value at `path` contains the substring. |
-| `exists` | bool | the path is present (`true`) or absent (`false`). |
-
-A predicate with no operator, or with more than one, fails `mcpdef validate`
-rather than silently matching nothing.
-
-```toml
-[[policy]]
-name    = "no-delete-prod"
-effect  = "deny"
-servers = ["github"]
-tools   = ["delete_*"]
-args    = [ { path = "name", glob = "prod-*" } ]
-```
-
-The `transform` effect — rewriting arguments or results rather than only allowing
-or denying — is not built. The separate top-level `policy` key under `[gateway]`
-is reserved and unused (see above).
 
 ## `[profile.<name>]`
 
@@ -196,7 +156,6 @@ Struct: `ServerConfig`. At least one is required.
 |---|---|---|---|---|
 | `id` | all | string (unique, non-empty) | — | The server's name in policy, audit records, and `servers list`. |
 | `transport` | all | `"stdio"` \| `"streamable-http"` \| `"sse"` \| `"wasm"` \| `"wasm-component"` | — | How MCPdef reaches the upstream (`SUPPORTED_TRANSPORTS`). `streamable-http` auto-falls back to the legacy SSE bridge on a 400/404/405; `sse` forces it. |
-| `spec` | all | `2025-11-25` \| `2026-07-28` \| `auto` (stdio only) | `2025-11-25` | Which MCP revision this server speaks. `2026-07-28` has no `initialize`, so MCPdef opens it with `server/discover` and puts the version, its identity and its capabilities on every request. `auto` probes the server with `server/discover` and uses what it turns out to speak. Otherwise a fact about the server, not a preference — set it wrong and startup fails naming this knob. See [WIRE.md](./WIRE.md). |
 | `command` | stdio | argv array | — (required) | The child process to spawn. |
 | `env` | stdio | table of string→string | `{}` | Env vars injected into the child — the token-broker path: MCPdef holds the upstream's credential and the client's bearer is never passed through. |
 | `url` | streamable-http, sse | string (URL) | — (required) | The upstream endpoint. Goes through the egress/SSRF guard. |

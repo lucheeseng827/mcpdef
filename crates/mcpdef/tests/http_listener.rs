@@ -6,11 +6,14 @@
 
 use mcpdef::listener::{serve_http_on, HttpConfig};
 use mcpdef::Gateway;
-use mcpdef_audit::Ledger;
-use mcpdef_core::wire::WireMode;
+use mcpdef_audit::{read_all, Ledger, Record};
+use mcpdef_core::Message;
 use mcpdef_policy::{Policy, ServerPolicy};
-use mcpdef_transport::StdioChild;
-use serde_json::Value;
+use mcpdef_transport::{StdioChild, Transport, TransportError};
+use serde_json::{json, Value};
+use std::collections::VecDeque;
+use std::path::Path;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 
 fn allow_echo() -> Policy {
@@ -50,7 +53,6 @@ async fn start(allowed_origins: Vec<String>) -> (String, tempfile::TempDir) {
         listen: addr.to_string(),
         allowed_origins,
         max_inflight: None,
-        wire: WireMode::default(),
     };
     // No OAuth verifier — these tests cover the unauthenticated listener.
     tokio::spawn(serve_http_on(listener, gw, cfg, None));
@@ -142,4 +144,153 @@ async fn explicit_allowed_origin_passes() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
+}
+
+/// An upstream in process: it answers `tools/call` for `slow_tool` after `delay`,
+/// and everything else at once.
+struct SlowUpstream {
+    delay: Duration,
+    replies: VecDeque<(Message, bool)>,
+}
+
+#[async_trait::async_trait]
+impl Transport for SlowUpstream {
+    async fn send(&mut self, msg: Message) -> Result<(), TransportError> {
+        // A notification gets no reply.
+        let Some(id) = msg.id.clone() else {
+            return Ok(());
+        };
+        let (result, slow) = match msg.method.as_deref().unwrap_or_default() {
+            "initialize" => (
+                json!({
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "slow-upstream", "version": "0.0.0" }
+                }),
+                false,
+            ),
+            "tools/list" => (
+                json!({ "tools": [
+                    { "name": "slow_tool", "inputSchema": { "type": "object" } },
+                    { "name": "fast_tool", "inputSchema": { "type": "object" } }
+                ] }),
+                false,
+            ),
+            "tools/call" => {
+                let tool = msg
+                    .params
+                    .as_ref()
+                    .and_then(|p| p["name"].as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let slow = tool == "slow_tool";
+                (
+                    json!({ "content": [{ "type": "text", "text": tool }] }),
+                    slow,
+                )
+            }
+            _ => (json!({}), false),
+        };
+        self.replies.push_back((Message::result(id, result), slow));
+        Ok(())
+    }
+
+    async fn recv(&mut self) -> Result<Option<Message>, TransportError> {
+        let Some((reply, slow)) = self.replies.pop_front() else {
+            return Ok(None);
+        };
+        if slow {
+            tokio::time::sleep(self.delay).await;
+        }
+        Ok(Some(reply))
+    }
+}
+
+/// The ledger's records so far, none before the first is written.
+fn records(path: &Path) -> Vec<Record> {
+    match path.exists() {
+        true => read_all(path).unwrap(),
+        false => Vec::new(),
+    }
+}
+
+/// A client that gives up mid-call must not take the call's audit record with
+/// it, and the call keeps its in-flight slot until it really ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_is_audited_even_when_its_client_disconnects() {
+    let dir = tempfile::tempdir().unwrap();
+    let audit = dir.path().join("audit.log");
+    let mut policy = Policy::new();
+    policy.insert(
+        "slow",
+        ServerPolicy {
+            allow_tools: Some(vec!["slow_tool".into(), "fast_tool".into()]),
+            deny: vec![],
+        },
+    );
+    let mut gw = Gateway::new(policy, Ledger::open(&audit).unwrap(), "agent:test");
+    let upstream = SlowUpstream {
+        delay: Duration::from_millis(1_000),
+        replies: VecDeque::new(),
+    };
+    gw.add_upstream("slow", Box::new(upstream)).await.unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cfg = HttpConfig {
+        listen: addr.to_string(),
+        allowed_origins: vec![],
+        max_inflight: Some(1),
+    };
+    tokio::spawn(serve_http_on(listener, gw, cfg, None));
+    let url = format!("http://{addr}/mcp");
+    let call = |id: u32, tool: &str| {
+        json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": tool, "arguments": {} }
+        })
+        .to_string()
+    };
+    let post = |client: &reqwest::Client, body: String| {
+        client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+    };
+
+    let impatient = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_millis(200))
+        .build()
+        .unwrap();
+    let gave_up = post(&impatient, call(1, "slow_tool")).await;
+    assert!(gave_up.is_err_and(|e| e.is_timeout()));
+    assert!(
+        records(&audit).is_empty(),
+        "the upstream has not answered yet"
+    );
+
+    // The abandoned call still holds the only slot.
+    let shed = post(&client(), call(2, "fast_tool")).await.unwrap();
+    assert_eq!(shed.status(), 503);
+
+    // Once the upstream answers, the call is audited, and its slot comes back.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while records(&audit).is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the abandoned call was never audited"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let recs = records(&audit);
+    assert_eq!(recs.len(), 1);
+    assert_eq!(
+        (recs[0].tool.as_deref(), recs[0].decision.as_str()),
+        (Some("slow_tool"), "allow")
+    );
+    let after = post(&client(), call(3, "fast_tool")).await.unwrap();
+    assert_eq!(after.status(), 200);
+    let v: Value = serde_json::from_str(&after.text().await.unwrap()).unwrap();
+    assert_eq!(v["result"]["content"][0]["text"], "fast_tool");
 }

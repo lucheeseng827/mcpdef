@@ -57,14 +57,19 @@ pub struct Record {
     pub hash: String,
 }
 
+/// The field separator of the hash encoding (U+001F, the ASCII unit separator).
+const US: char = '\u{1f}';
+
 impl Record {
     /// Recompute this record's hash from its fields + `prev_hash`. Deterministic
     /// and independent of JSON field ordering (it hashes an explicit, delimited
     /// field encoding, not the serialized line).
+    ///
+    /// The encoding joins the fields with [`US`], so it is unambiguous only while
+    /// no field contains one. [`Ledger::append`] guarantees that for every record
+    /// it writes; a record from before it did is reported by [`verify`] in
+    /// [`VerifyReport::ambiguous`].
     fn compute_hash(&self) -> String {
-        // Unit separator (0x1f) cannot appear in these fields, so the encoding is
-        // unambiguous.
-        const US: char = '\u{1f}';
         let mut h = Sha256::new();
         h.update(
             format!(
@@ -83,6 +88,29 @@ impl Record {
             .as_bytes(),
         );
         hex::encode(h.finalize())
+    }
+
+    /// Whether a field holds the encoding's separator. The hash of such a record
+    /// does not pin where one field ends and the next begins: a record denying a
+    /// crafted tool name `x<US>allow` hashes the same as one *allowing* tool `x`
+    /// with the rule `deny<US>…`.
+    fn has_separator(&self) -> bool {
+        let optional = [&self.method, &self.tool, &self.rule];
+        self.agent.contains(US)
+            || self.server.contains(US)
+            || optional
+                .iter()
+                .any(|f| f.as_deref().is_some_and(|s| s.contains(US)))
+    }
+}
+
+/// A field as the ledger stores it: [`US`] becomes U+241F (`␟`, its visible
+/// symbol), so a caller-chosen name cannot carry a field boundary into the hash.
+fn without_separator(s: String) -> String {
+    if s.contains(US) {
+        s.replace(US, "\u{241f}")
+    } else {
+        s
     }
 }
 
@@ -164,6 +192,10 @@ impl Ledger {
     /// crash can lose records the OS had not yet written to disk. A durable mode
     /// (`sync_all` per append, at a throughput cost) is a later option; the
     /// hash chain proves *integrity*, not *durability*.
+    ///
+    /// A U+001F in any field is stored as U+241F (`␟`): the hash encoding uses
+    /// U+001F as its separator, and a caller-chosen tool name must not be able to
+    /// move a field boundary (see [`VerifyReport::ambiguous`]).
     pub fn append(&mut self, entry: Entry) -> Result<Record, AuditError> {
         let (rule, decision) = match &entry.decision {
             Decision::Allow => (None, "allow".to_string()),
@@ -172,12 +204,12 @@ impl Ledger {
         let mut rec = Record {
             seq: self.next_seq,
             ts_unix_ms: now_unix_ms(),
-            agent: entry.agent,
-            server: entry.server,
-            method: entry.method,
-            tool: entry.tool,
+            agent: without_separator(entry.agent),
+            server: without_separator(entry.server),
+            method: entry.method.map(without_separator),
+            tool: entry.tool.map(without_separator),
             decision,
-            rule,
+            rule: rule.map(without_separator),
             latency_ms: entry.latency_ms,
             prev_hash: self.head.clone(),
             hash: String::new(),
@@ -238,6 +270,12 @@ pub struct VerifyReport {
     pub head: String,
     /// `None` if the chain is intact; `Some(seq)` of the first broken record.
     pub broken_at: Option<u64>,
+    /// Records whose fields contain U+001F, the hash encoding's separator. The
+    /// chain still covers them, but their hash does not pin where one field ends
+    /// and the next begins, so their fields could have been re-split without
+    /// breaking it. [`Ledger::append`] never writes one; an older gateway did, for
+    /// a crafted tool or method name.
+    pub ambiguous: Vec<u64>,
 }
 
 impl VerifyReport {
@@ -256,6 +294,7 @@ pub fn verify(path: impl AsRef<Path>) -> Result<VerifyReport, AuditError> {
     let mut records: u64 = 0;
     let mut head = GENESIS.to_string();
     let mut broken_at: Option<u64> = None;
+    let mut ambiguous = Vec::new();
 
     for line in BufReader::new(file).lines() {
         let line = line?;
@@ -271,6 +310,9 @@ pub fn verify(path: impl AsRef<Path>) -> Result<VerifyReport, AuditError> {
         let intact = recomputed == rec.hash && rec.prev_hash == prev && rec.seq == expected_seq;
         if !intact && broken_at.is_none() {
             broken_at = Some(rec.seq);
+        }
+        if rec.has_separator() {
+            ambiguous.push(rec.seq);
         }
 
         prev = rec.hash.clone();
@@ -294,6 +336,7 @@ pub fn verify(path: impl AsRef<Path>) -> Result<VerifyReport, AuditError> {
         records,
         head,
         broken_at,
+        ambiguous,
     })
 }
 
@@ -475,7 +518,7 @@ impl Record {
         );
         format!(
             "<{pri}>1 {ts} - mcpdef - {msgid} {sd} {msg}",
-            msgid = one_line(self.method.as_deref().unwrap_or("-")),
+            msgid = syslog_msgid(self.method.as_deref()),
             msg = one_line(&self.summary()),
         )
     }
@@ -504,6 +547,25 @@ impl Record {
 /// able to split it into two and forge a second log entry (CWE-117).
 fn one_line(s: &str) -> String {
     s.replace(['\r', '\n'], " ")
+}
+
+/// A method as an RFC 5424 MSGID: 1 to 32 printable US-ASCII characters, with
+/// anything else (a space, a control or non-ASCII character) as `_`, and `-` (the
+/// nil value) for none. The method is caller-chosen: a space left in it would end
+/// the MSGID early and let the rest pose as structured data. The full method is
+/// still in the message text.
+fn syslog_msgid(method: Option<&str>) -> String {
+    let id: String = method
+        .unwrap_or_default()
+        .chars()
+        .take(32)
+        .map(|c| if c.is_ascii_graphic() { c } else { '_' })
+        .collect();
+    if id.is_empty() {
+        "-".to_string()
+    } else {
+        id
+    }
 }
 
 /// Escape a CEF *header* field: `\` and `|` are reserved (newlines stripped first).
@@ -734,6 +796,39 @@ mod tests {
         let s = rec.export(ExportFormat::Syslog);
         assert!(!s.contains('\n'), "syslog must be single-line: {s:?}");
         assert!(!s.contains('\r'));
+    }
+
+    /// RFC 5424's MSGID is 1 to 32 printable US-ASCII characters, and syslog
+    /// takes it from `method`, which a caller chooses (a forwarded method is
+    /// audited as sent). A space in it would end the MSGID early and let the rest
+    /// pose as the record's structured data.
+    #[test]
+    fn a_crafted_method_cannot_pose_as_syslog_structured_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let mut led = Ledger::open(&path).unwrap();
+        let methods = [
+            (
+                Some("x [mcpdef@0 decision=\"allow\" tool=\"safe\"]"),
+                "x_[mcpdef@0_decision=\"allow\"_too",
+            ),
+            (
+                Some("notifications/resources/list_changed"),
+                "notifications/resources/list_cha",
+            ),
+            (Some("résumé"), "r_sum_"),
+            (Some(""), "-"),
+            (None, "-"),
+        ];
+        for (method, msgid) in methods {
+            let mut e = entry("github", "delete_repo", Decision::Allow);
+            e.method = method.map(String::from);
+            let s = led.append(e).unwrap().export(ExportFormat::Syslog);
+            // PRI+VERSION TIMESTAMP HOSTNAME APP-NAME PROCID MSGID STRUCTURED-DATA MSG
+            let header: Vec<&str> = s.splitn(7, ' ').collect();
+            assert_eq!(header[5], msgid, "{s}");
+            assert!(header[6].starts_with("[mcpdef@0 seq=\""), "{s}");
+        }
     }
 
     #[test]

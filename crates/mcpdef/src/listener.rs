@@ -3,23 +3,13 @@
 //! MCP clients reach mcpdef over HTTP instead of stdio (the shared-gateway shape:
 //! "point every agent at one endpoint, govern centrally").
 //!
-//! Design (ARCHITECTURE.md §4, built **stateless-first**): a `POST` to the single
-//! MCP endpoint carries one JSON-RPC message; the gateway handles it and replies
-//! with a single `application/json` response, or `202 Accepted` for a
-//! notification. The gateway's `handle` is already per-message and keeps no
-//! per-client session state, so a client `Mcp-Session-Id` is simply ignored,
-//! never required or issued — which is what 2026-07-28 requires of a
-//! modern-only server anyway.
-//!
-//! **Two wire models, one endpoint.** `[gateway] wire` picks which eras are
-//! served: `legacy` (2025-11-25, the default — an upgrade changes nothing),
-//! `modern` (2026-07-28), or `dual`. A request's era is read off the message
-//! itself, per the revision's own rule for a dual-era server, and on the modern
-//! wire the mirrored `Mcp-Method` / `Mcp-Name` headers are checked against the
-//! body **before anything routes**. That check is not politeness: the allowlist,
-//! the pin and the rate limit all key on the tool name, so a request whose
-//! header says `safe_tool` and whose body calls `dangerous_tool` is a policy
-//! bypass unless the two are made to agree first.
+//! Design (ARCHITECTURE.md §4, built **stateless-first** for the 2026-07-28 RC):
+//! a `POST` to the single MCP endpoint carries one JSON-RPC message; the gateway
+//! handles it and replies with a single `application/json` response, or `202
+//! Accepted` for a notification. The gateway's `handle` is already per-message
+//! and keeps no per-client session state, so this works for **both** the stateful
+//! 2025-11-25 model and the stateless 2026-07-28 model — a client `Mcp-Session-Id`
+//! is simply ignored, never required or issued.
 //!
 //! Defenses on by default:
 //! * **Origin validation** — a browser cross-site `Origin` is rejected `403`
@@ -51,10 +41,12 @@ use axum::{
     Router,
 };
 use mcpdef_auth::{AuthError, Principal, Verifier};
-use mcpdef_core::wire::{self, validate_headers, WireError, WireMode, WireModel};
-use mcpdef_core::{Id, Message};
+use mcpdef_core::Message;
 use mcpdef_transport::{fetch_text, EgressPolicy};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Semaphore};
 
@@ -67,8 +59,6 @@ pub struct HttpConfig {
     pub allowed_origins: Vec<String>,
     /// Max concurrent in-flight requests (load-shedding); `None` = unlimited.
     pub max_inflight: Option<usize>,
-    /// Which MCP wire models this listener serves (`[gateway] wire`).
-    pub wire: WireMode,
 }
 
 /// Re-fetches the JWKS from a configured `jwks_uri`, through the same egress/SSRF
@@ -166,13 +156,15 @@ struct AppState {
     gw: Mutex<Gateway>,
     allowed_origins: Vec<String>,
     inflight: Option<Arc<Semaphore>>,
-    wire: WireMode,
+    spec_version: &'static str,
     /// OAuth 2.1 bearer auth (verifier + optional JWKS refresher), when
     /// `[gateway.auth]` is enabled. `None` leaves the endpoint unauthenticated
     /// (loopback/dev). Shared via the surrounding `Arc<AppState>`; the verifier's
     /// JWKS is internally lock-guarded so a rotation needs no `&mut`.
     auth: Option<AuthState>,
 }
+
+const SPEC_VERSION: &str = "2025-11-25";
 
 /// Max request body the listener buffers (one JSON-RPC message). An in-path
 /// component must cap this so a client can't force unbounded allocation *before*
@@ -213,7 +205,7 @@ fn router(gw: Gateway, cfg: HttpConfig, auth: Option<AuthState>) -> Router {
         gw: Mutex::new(gw.shared_across_clients()),
         allowed_origins: cfg.allowed_origins,
         inflight: cfg.max_inflight.map(|n| Arc::new(Semaphore::new(n.max(1)))),
-        wire: cfg.wire,
+        spec_version: SPEC_VERSION,
         auth,
     });
     Router::new()
@@ -243,7 +235,8 @@ async fn handle_post(
     }
 
     // 2. Load-shedding: a non-blocking permit. Over the cap → 503 (fail fast).
-    let _permit = match &state.inflight {
+    //    The call holds it until it ends, even if the client leaves first.
+    let permit = match &state.inflight {
         Some(sem) => match Arc::clone(sem).try_acquire_owned() {
             Ok(p) => Some(p),
             Err(_) => {
@@ -288,29 +281,23 @@ async fn handle_post(
         }
     };
 
-    // 5. Wire model. Which era this message belongs to comes off the message,
-    //    and `[gateway] wire` decides whether this listener serves it. On the
-    //    modern wire the mirrored headers are reconciled with the body here,
-    //    before the tool name reaches anything that decides on it.
-    let spec_version = match wire_check(state.wire, &msg, &headers) {
-        Ok(v) => v,
-        Err(e) => return wire_rejected(&e, msg.id.clone()),
-    };
-
-    // 6. Hand to the gateway (serialized), carrying the authenticated principal so
-    //    it sets the audit identity and applies the RBAC gate. Unchanged by the
-    //    wire model: both eras carry the same JSON-RPC and are governed the same.
-    let outcome = {
+    // 5. Hand to the gateway (serialized), carrying the authenticated principal so
+    //    it sets the audit identity and applies the RBAC gate. The call runs to its
+    //    end even if the client disconnects first, so its audit record is written.
+    let spec_version = state.spec_version;
+    let outcome = RunToEnd::new(async move {
+        let _permit = permit;
         let mut gw = state.gw.lock().await;
         gw.handle_authed(msg, principal.as_ref()).await
-    };
+    })
+    .await;
 
     match outcome {
         // A request → a single JSON response.
         Ok(Some(resp)) => (
             [
                 ("content-type", "application/json"),
-                ("mcp-protocol-version", spec_version.as_str()),
+                ("mcp-protocol-version", spec_version),
             ],
             resp.to_json_line(),
         )
@@ -322,6 +309,61 @@ async fn handle_post(
             format!("gateway error: {e}"),
         )
             .into_response(),
+    }
+}
+
+/// Runs a call to its end even if whoever awaits it goes away.
+///
+/// A client that disconnects mid-call makes hyper drop the handler, and dropping
+/// a future cancels what it was doing: here a governed call, whose audit record
+/// would then never be written, though the upstream was already asked to run the
+/// tool. So the call is boxed, where it can move without moving, and dropped
+/// before it finished, this hands the rest of it to a task of its own. A call
+/// that runs to its end, nearly every one, never pays for a task.
+struct RunToEnd<F>(Option<Pin<Box<F>>>)
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static;
+
+impl<F> RunToEnd<F>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    fn new(call: F) -> Self {
+        RunToEnd(Some(Box::pin(call)))
+    }
+}
+
+impl<F> Future for RunToEnd<F>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<F::Output> {
+        let call = self.0.as_mut().expect("polled after it finished");
+        let done = call.as_mut().poll(cx);
+        if done.is_ready() {
+            self.0 = None;
+        }
+        done
+    }
+}
+
+impl<F> Drop for RunToEnd<F>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    fn drop(&mut self) {
+        if let Some(call) = self.0.take() {
+            // Without a runtime (it is shutting down) there is nowhere to finish.
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                runtime.spawn(call);
+            }
+        }
     }
 }
 
@@ -406,64 +448,6 @@ fn origin_allowed(origin: Option<&str>, allowed: &[String]) -> bool {
         }
     }
     false
-}
-
-/// Decide whether this listener serves the message's era, and on the modern wire
-/// reconcile the mirrored headers with the body. Returns the protocol version to
-/// stamp on the response.
-///
-/// The era comes off the message — modern `_meta` means modern, `initialize`
-/// means legacy — which is the revision's own rule for a dual-era server, and it
-/// is why an era-ambiguous request reads as legacy: a modern client always
-/// carries its `_meta`, so a request without one was never modern.
-fn wire_check(mode: WireMode, msg: &Message, headers: &HeaderMap) -> Result<String, WireError> {
-    let served = mode.served();
-    // `HeaderMap::get` already matches names case-insensitively, and `to_str`
-    // refuses a value that is not ASCII — which for a mirrored header is the
-    // same as not having sent one we can compare.
-    let get = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
-
-    match WireModel::of(msg) {
-        Some(WireModel::Modern) if mode.serves_modern() => Ok(validate_headers(msg, get, served)?
-            .protocol_version
-            .to_string()),
-        // A modern request at a legacy-only listener. Naming what *is* served is
-        // the whole point of the error: it is what the client retries against.
-        Some(WireModel::Modern) => Err(WireError::UnsupportedProtocolVersion {
-            requested: wire::protocol_version(msg).unwrap_or_default().to_string(),
-            supported: served.iter().map(|v| v.to_string()).collect(),
-        }),
-        _ if mode.serves_legacy() => Ok(wire::SPEC_2025_11_25.to_string()),
-        // Modern-only, and the client opened with `initialize`. It has no
-        // fall-forward mechanism, so this message may be the only diagnostic it
-        // can show a human — name the revisions and how to speak them.
-        Some(WireModel::Legacy) => Err(WireError::HeaderMismatch(format!(
-            "this gateway serves {served:?}, which have no `initialize` handshake. Send the \
-             request itself, carrying {} in params._meta and the matching {} header.",
-            wire::meta_key::PROTOCOL_VERSION,
-            wire::header::PROTOCOL_VERSION,
-        ))),
-        // Modern-only, and the request named no era at all. Header validation
-        // says precisely which piece is missing, which beats a generic refusal.
-        None => Err(validate_headers(msg, get, served).err().unwrap_or_else(|| {
-            WireError::HeaderMismatch(format!(
-                "a request to this gateway must carry {} in params._meta",
-                wire::meta_key::PROTOCOL_VERSION,
-            ))
-        })),
-    }
-}
-
-/// Render a wire rejection as the revision defines it: the HTTP status it names,
-/// and a JSON-RPC error body carrying the code and, for an unsupported version,
-/// the `data.supported` list a client retries against.
-fn wire_rejected(e: &WireError, id: Option<Id>) -> Response {
-    (
-        StatusCode::from_u16(e.http_status()).unwrap_or(StatusCode::BAD_REQUEST),
-        [("content-type", "application/json")],
-        e.to_message(id).to_json_line(),
-    )
-        .into_response()
 }
 
 #[cfg(test)]

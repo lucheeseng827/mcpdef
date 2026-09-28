@@ -33,8 +33,9 @@ docker compose logs -f mcpdef           # "mcpdef X.Y.Z ready Â· N upstream(s) Â
 - The audit ledger lives in the `mcpdef-audit` named volume (persists across
   restarts). Back it up; it is your tamper-evident record.
 
-Upgrade: bump the `image:` tag in `compose.yaml`, `docker compose pull && docker
-compose up -d`. State (the ledger) survives.
+Upgrade: bump the `image:` tag in `compose.yaml` (a release's tag is its version
+with a `v`: `v0.2.2`), `docker compose pull && docker compose up -d`. State (the
+ledger) survives.
 
 ## On Kubernetes (Helm)
 
