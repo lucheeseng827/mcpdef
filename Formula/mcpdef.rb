@@ -2,28 +2,28 @@
 class Mcpdef < Formula
   desc "Fast, self-hostable, single-binary MCP gateway & governance plane"
   homepage "https://github.com/lucheeseng827/mcpdef"
-  version "0.2.1"
+  version "0.2.2"
   license "Apache-2.0"
 
   on_macos do
     on_arm do
       url "https://github.com/lucheeseng827/mcpdef/releases/download/v#{version}/mcpdef-aarch64-apple-darwin.tar.gz"
-      sha256 "ce7eb73b080894051c87d2a5de09843c3764a9fd67a12b91db3fd14192eba45b"
+      sha256 "c9404505614ab2b9e2992fadf500c165597979973977b8bf8b550b955aeb6f3c"
     end
     on_intel do
       url "https://github.com/lucheeseng827/mcpdef/releases/download/v#{version}/mcpdef-x86_64-apple-darwin.tar.gz"
-      sha256 "491cf12cd3e59a999247b54a560ca6667b093f67218a1619aa9a12460d903719"
+      sha256 "3163e42df60d48b2f48b1ef947ab3f08a1adc4f635830b732801b5a9f8f5ea63"
     end
   end
 
   on_linux do
     on_arm do
       url "https://github.com/lucheeseng827/mcpdef/releases/download/v#{version}/mcpdef-aarch64-unknown-linux-musl.tar.gz"
-      sha256 "662c8a4739cebc15c49d9f0b44176dc14d34e1cc08322ae45122fa276a7420f4"
+      sha256 "7fef16f1c48a1ae1da1a72925291b2b1e3fb0419fa8c121df2e47f49266ea074"
     end
     on_intel do
       url "https://github.com/lucheeseng827/mcpdef/releases/download/v#{version}/mcpdef-x86_64-unknown-linux-musl.tar.gz"
-      sha256 "410ade8b45d3cfc38d096cef28b89ca31bc7d6d2419747ab8ff9d20c9be8288c"
+      sha256 "30261912514e9506509dff1698e9e6699761ea80649825415d22a3e029d0a1c3"
     end
   end
 
