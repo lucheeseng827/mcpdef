@@ -1,0 +1,200 @@
+{
+  "realm": "mcpdef",
+  "displayName": "MCPdef",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "roles": {
+    "client": {
+      "mcpdef-console": [
+        { "name": "console:viewer", "description": "Reads the console" },
+        { "name": "console:operator", "description": "Reloads, restarts and tests upstreams, approves pin drift" },
+        { "name": "console:admin", "description": "Sees the redacted config and the identity view besides" }
+      ]
+    }
+  },
+  "groups": [
+    { "name": "mcpdef-admins", "clientRoles": { "mcpdef-console": ["console:admin"] } },
+    { "name": "mcpdef-operators", "clientRoles": { "mcpdef-console": ["console:operator"] } },
+    { "name": "mcpdef-viewers", "clientRoles": { "mcpdef-console": ["console:viewer"] } }
+  ],
+  "users": [
+    {
+      "username": "ops-admin",
+      "enabled": true,
+      "email": "ops-admin@mcpdef.example",
+      "emailVerified": true,
+      "firstName": "Ada",
+      "lastName": "Admin",
+      "credentials": [{ "type": "password", "value": "ops-admin", "temporary": false }],
+      "groups": ["/mcpdef-admins"]
+    },
+    {
+      "username": "ops-operator",
+      "enabled": true,
+      "email": "ops-operator@mcpdef.example",
+      "emailVerified": true,
+      "firstName": "Otto",
+      "lastName": "Operator",
+      "credentials": [{ "type": "password", "value": "ops-operator", "temporary": false }],
+      "groups": ["/mcpdef-operators"]
+    },
+    {
+      "username": "ops-viewer",
+      "enabled": true,
+      "email": "ops-viewer@mcpdef.example",
+      "emailVerified": true,
+      "firstName": "Val",
+      "lastName": "Viewer",
+      "credentials": [{ "type": "password", "value": "ops-viewer", "temporary": false }],
+      "groups": ["/mcpdef-viewers"]
+    },
+    {
+      "username": "ops-nobody",
+      "enabled": true,
+      "email": "ops-nobody@mcpdef.example",
+      "emailVerified": true,
+      "firstName": "Ned",
+      "lastName": "Nobody",
+      "credentials": [{ "type": "password", "value": "ops-nobody", "temporary": false }]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "mcpdef-console",
+      "name": "MCPdef console",
+      "protocol": "openid-connect",
+      "enabled": true,
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "mcpdef-console-demo-secret",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "fullScopeAllowed": false,
+      "frontchannelLogout": false,
+      "redirectUris": ["http://localhost:7879/callback", "http://127.0.0.1/callback"],
+      "webOrigins": [],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "http://localhost:7879/##http://127.0.0.1/"
+      },
+      "protocolMappers": [
+        {
+          "name": "client roles",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-client-role-mapper",
+          "config": {
+            "usermodel.clientRoleMapping.clientId": "mcpdef-console",
+            "claim.name": "resource_access.mcpdef-console.roles",
+            "multivalued": "true",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        },
+        {
+          "name": "groups",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "config": {
+            "claim.name": "groups",
+            "full.path": "false",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "introspection.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "identityProviders": [
+    {
+      "alias": "corp",
+      "displayName": "Corp (SAML)",
+      "providerId": "saml",
+      "enabled": true,
+      "trustEmail": true,
+      "storeToken": false,
+      "linkOnly": false,
+      "firstBrokerLoginFlowAlias": "first broker login",
+      "config": {
+        "entityId": "http://localhost:8080/realms/mcpdef",
+        "idpEntityId": "http://localhost:8080/realms/corp",
+        "singleSignOnServiceUrl": "http://localhost:8080/realms/corp/protocol/saml",
+        "singleLogoutServiceUrl": "http://localhost:8080/realms/corp/protocol/saml",
+        "useMetadataDescriptorUrl": "true",
+        "metadataDescriptorUrl": "http://localhost:8080/realms/corp/protocol/saml/descriptor",
+        "nameIDPolicyFormat": "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+        "principalType": "SUBJECT",
+        "postBindingResponse": "true",
+        "postBindingAuthnRequest": "true",
+        "postBindingLogout": "true",
+        "wantAuthnRequestsSigned": "false",
+        "wantAssertionsSigned": "true",
+        "wantAssertionsEncrypted": "false",
+        "validateSignature": "true",
+        "signatureAlgorithm": "RSA_SHA256",
+        "syncMode": "FORCE",
+        "allowedClockSkew": "30"
+      }
+    }
+  ],
+  "identityProviderMappers": [
+    {
+      "name": "email",
+      "identityProviderAlias": "corp",
+      "identityProviderMapper": "saml-user-attribute-idp-mapper",
+      "config": { "syncMode": "FORCE", "attribute.name": "email", "user.attribute": "email" }
+    },
+    {
+      "name": "firstName",
+      "identityProviderAlias": "corp",
+      "identityProviderMapper": "saml-user-attribute-idp-mapper",
+      "config": { "syncMode": "FORCE", "attribute.name": "firstName", "user.attribute": "firstName" }
+    },
+    {
+      "name": "lastName",
+      "identityProviderAlias": "corp",
+      "identityProviderMapper": "saml-user-attribute-idp-mapper",
+      "config": { "syncMode": "FORCE", "attribute.name": "lastName", "user.attribute": "lastName" }
+    },
+    {
+      "name": "mcpdef-admins",
+      "identityProviderAlias": "corp",
+      "identityProviderMapper": "saml-advanced-group-idp-mapper",
+      "config": {
+        "syncMode": "FORCE",
+        "attributes": "[{\"key\":\"groups\",\"value\":\"mcpdef-admins\"}]",
+        "are.attribute.values.regex": "false",
+        "group": "/mcpdef-admins"
+      }
+    },
+    {
+      "name": "mcpdef-operators",
+      "identityProviderAlias": "corp",
+      "identityProviderMapper": "saml-advanced-group-idp-mapper",
+      "config": {
+        "syncMode": "FORCE",
+        "attributes": "[{\"key\":\"groups\",\"value\":\"mcpdef-operators\"}]",
+        "are.attribute.values.regex": "false",
+        "group": "/mcpdef-operators"
+      }
+    },
+    {
+      "name": "mcpdef-viewers",
+      "identityProviderAlias": "corp",
+      "identityProviderMapper": "saml-advanced-group-idp-mapper",
+      "config": {
+        "syncMode": "FORCE",
+        "attributes": "[{\"key\":\"groups\",\"value\":\"mcpdef-viewers\"}]",
+        "are.attribute.values.regex": "false",
+        "group": "/mcpdef-viewers"
+      }
+    }
+  ]
+}

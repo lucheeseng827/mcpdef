@@ -1,0 +1,16 @@
+# Claude Desktop: merge into $DIR/home/.config/Claude/claude_desktop_config.json (`mcpdef connect claude-desktop --write` does it)
+{
+  "mcpServers": {
+    "mcpdef": {
+      "args": [
+        "bridge",
+        "https://127.0.0.1:8443/mcp",
+        "--ca",
+        "$DIR/state/tls/ca.crt"
+      ],
+      "command": "$MCPDEF"
+    }
+  }
+}
+
+The bridge trusts the gateway's CA itself ($DIR/state/tls/ca.crt): nothing to add to the system.

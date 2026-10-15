@@ -8,7 +8,7 @@
 //!   names carrying a quote, a backslash, non-ASCII, CR/LF and a raw U+001F (seq 6).
 //! - `fixtures/readme-example.jsonl` is the two-record example in the README.
 
-use mcpdef_audit::{verify, Entry, ExportFormat, Ledger, Record};
+use mcpdef_audit::{read_all, verify, Attrs, Entry, ExportFormat, Ledger, Record};
 use mcpdef_core::Decision;
 use std::path::{Path, PathBuf};
 
@@ -45,6 +45,26 @@ fn its_records_serialize_back_byte_for_byte() {
     }
 }
 
+/// `fixtures/ledger-0.2.1.{ocsf,cef,syslog}` are what the 0.2.1 build's
+/// `mcpdef audit tail` printed for the fixture, with its product version
+/// replaced by `{version}`. A SIEM parser written against them keeps working.
+#[test]
+fn its_records_export_exactly_as_0_2_1_did() {
+    let records = read_all(fixture("ledger-0.2.1.jsonl")).unwrap();
+    let formats = [
+        (ExportFormat::Ocsf, "ocsf"),
+        (ExportFormat::Cef, "cef"),
+        (ExportFormat::Syslog, "syslog"),
+    ];
+    for (format, name) in formats {
+        let golden = std::fs::read_to_string(fixture(&format!("ledger-0.2.1.{name}")))
+            .unwrap()
+            .replace("{version}", env!("CARGO_PKG_VERSION"));
+        let rendered: String = records.iter().map(|r| r.export(format) + "\n").collect();
+        assert_eq!(rendered, golden, "{name} export changed");
+    }
+}
+
 #[test]
 fn the_readme_example_verifies() {
     let report = verify(fixture("readme-example.jsonl")).unwrap();
@@ -66,6 +86,7 @@ fn a_gateway_resumes_the_chain_of_a_0_2_1_ledger() {
             tool: Some("echo".into()),
             decision: Decision::Allow,
             latency_ms: 1,
+            attrs: Attrs::default(),
         })
         .unwrap();
     assert_eq!(rec.prev_hash, HEAD_0_2_1);
@@ -115,6 +136,7 @@ fn a_new_record_never_holds_the_separator() {
                 reason: "x".into(),
             },
             latency_ms: 0,
+            attrs: Attrs::default(),
         })
         .unwrap();
     assert_eq!(rec.tool.as_deref(), Some("x\u{241f}allow"));

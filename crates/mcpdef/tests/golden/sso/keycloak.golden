@@ -1,0 +1,32 @@
+# Signing people in to MCPdef's console at Keycloak.
+#
+# At the provider:
+#   1. Clients > Create client: OpenID Connect, client ID mcpdef-console, client
+#      authentication on, the standard flow alone; its secret goes in
+#      MCPDEF_OIDC_CLIENT_SECRET, where MCPdef runs.
+#   2. Valid redirect URIs: https://mcpdef.example.com:7879/callback. Valid post
+#      logout redirect URIs: https://mcpdef.example.com:7879/.
+#   3. The client's roles: console:viewer, console:operator and console:admin,
+#      given to groups or people.
+#   4. The client's dedicated scope > Add mapper > By configuration > User
+#      Client Role: client ID mcpdef-console, token claim name
+#      resource_access.mcpdef-console.roles, multivalued on, add to ID token on
+#      (Keycloak puts client roles in the access token alone, by default).
+#
+# Then this goes in the config (or run this again with --write),
+# MCPDEF_OIDC_CLIENT_SECRET is set where MCPdef runs, and the gateway is
+# restarted. Someone the provider gives no console role is shown the claims
+# MCPdef received of them: map one to a role with [[identity.role_map]].
+
+[gateway.admin]
+public_url = "https://mcpdef.example.com:7879"
+
+[gateway.admin.oidc]
+issuer = "https://keycloak.example.com/realms/ops"
+client_id = "mcpdef-console"
+client_secret = { env = "MCPDEF_OIDC_CLIENT_SECRET" }
+scopes = ["profile", "email"]
+
+[identity]
+subject_claim = "preferred_username"
+roles_claims = ["resource_access.mcpdef-console.roles"]

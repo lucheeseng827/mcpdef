@@ -6,6 +6,9 @@ This product includes software developed by The MCPdef Authors.
 The OSS engine (the `mcpdef` binary and the `mcpdef-*` engine crates at the module
 root) is licensed under the Apache License, Version 2.0 (see ./LICENSE).
 
+The console (./console/, built into the `mcpdef-console` crate the binary
+embeds) is licensed under the Apache License, Version 2.0, as the engine is.
+
 The paid governance plane under ./ee/ is licensed under the Business Source
 License 1.1 (see ./ee/LICENSE). It is source-available, not open source, and
 converts to Apache-2.0 on its Change Date. ./ee/ is never packaged into the
@@ -29,10 +32,20 @@ authoritative, version-pinned list). Notable runtime dependencies include:
   - thiserror, anyhow          (MIT / Apache-2.0)— error handling
   - toml                       (MIT / Apache-2.0)— config parsing
   - async-trait, futures-util  (MIT / Apache-2.0)— async plumbing
+  - wasmtime, wasmtime-wasi    (Apache-2.0 WITH LLVM-exception)
+                                                 — WASM sandbox for untrusted
+                                                   MCP servers
+  - jsonwebtoken               (MIT)            — OAuth 2.1 JWT/JWKS validation
 
-Planned dependencies for later roadmap phases (not yet vendored): the official
-MCP Rust SDK (`rmcp`), `wasmtime` (WASM sandbox, Phase 4), and an OAuth/JWKS
-stack (Phase 2). When added, their attribution is reflected here and in the SBOM.
+The console embedded in the binary bundles, each under its own license, whose
+text is in crates/mcpdef-console/licenses/:
+
+  - React, React DOM, scheduler (MIT)            — the console's UI runtime
+                                                   Copyright (c) Facebook, Inc.
+                                                   and its affiliates
+  - IBM Plex Sans, IBM Plex Mono (SIL Open Font License 1.1)
+                                                 — the console's typefaces
+                                                   Copyright 2017, 2019 IBM Corp.
 
 A complete, version-pinned dependency manifest with licenses is produced as a
 CycloneDX SBOM at release time (see OSS-ROLLOUT.md §5–§6).

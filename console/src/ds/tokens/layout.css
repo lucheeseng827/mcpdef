@@ -1,0 +1,9 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* MCPdef — layout tokens.
+ * The dashboard is a fixed 230px sidebar + a fluid content column capped at
+ * 1200px, padded 28px/32px. These match the source shell exactly. */
+:root {
+  --sidebar-w: 230px;   /* fixed nav rail */
+  --content-max: 1200px;/* max content column width */
+  --content-pad: 28px 32px;
+}

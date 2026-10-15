@@ -52,6 +52,8 @@ fn no_echo_prod() -> PolicyRules {
         agents: None,
         servers: None,
         tools: Some(vec!["echo".into()]),
+        uris: None,
+        prompts: None,
         args: vec![ArgMatch {
             path: "target".into(),
             op: ArgOp::Glob("prod-*".into()),
@@ -78,7 +80,7 @@ fn echo(target: &str) -> Message {
 async fn policy_denies_matching_arg_and_audits_the_rule_name() {
     let dir = tempfile::tempdir().unwrap();
     let audit = dir.path().join("audit.log");
-    let mut gw = gw(&audit, no_echo_prod()).await;
+    let gw = gw(&audit, no_echo_prod()).await;
 
     let resp = gw.handle(echo("prod-db")).await.unwrap().unwrap();
 
@@ -105,7 +107,7 @@ async fn policy_denies_matching_arg_and_audits_the_rule_name() {
 async fn policy_allows_when_the_arg_does_not_match() {
     let dir = tempfile::tempdir().unwrap();
     let audit = dir.path().join("audit.log");
-    let mut gw = gw(&audit, no_echo_prod()).await;
+    let gw = gw(&audit, no_echo_prod()).await;
 
     // A non-prod target does not match the rule → the call is forwarded to the mock.
     let resp = gw.handle(echo("dev-sandbox")).await.unwrap().unwrap();
@@ -117,7 +119,7 @@ async fn no_policy_rules_is_a_passthrough() {
     let dir = tempfile::tempdir().unwrap();
     let audit = dir.path().join("audit.log");
     // Even a prod-* target is allowed when no rules are configured.
-    let mut gw = gw(&audit, PolicyRules::default()).await;
+    let gw = gw(&audit, PolicyRules::default()).await;
     let resp = gw.handle(echo("prod-db")).await.unwrap().unwrap();
     assert_eq!(resp.result.as_ref().unwrap()["isError"], json!(false));
 }

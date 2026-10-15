@@ -206,11 +206,8 @@ pub fn check_socket_ip(ip: IpAddr, policy: &EgressPolicy) -> Result<(), Transpor
     check_ip("sandbox egress", ip, policy).map(|_| ())
 }
 
-/// Validate `url_str` against `policy`, resolving the host and checking **every**
-/// resolved IP (a split-horizon / multi-record host is only as safe as its worst
-/// address). Returns the validated [`Resolved`] addresses for DNS pinning, or a
-/// [`TransportError::Egress`] describing the block.
-pub async fn validate(url_str: &str, policy: &EgressPolicy) -> Result<Resolved, TransportError> {
+/// A URL's parts the guard judges: its scheme, host and port.
+fn target(url_str: &str) -> Result<(Url, u16), TransportError> {
     let url = Url::parse(url_str)
         .map_err(|e| TransportError::Egress(format!("invalid url '{url_str}': {e}")))?;
     let scheme = url.scheme();
@@ -219,12 +216,23 @@ pub async fn validate(url_str: &str, policy: &EgressPolicy) -> Result<Resolved, 
             "unsupported scheme '{scheme}' (only http/https) in {url_str}"
         )));
     }
-    let host = url
-        .host()
-        .ok_or_else(|| TransportError::Egress(format!("url {url_str} has no host")))?;
+    if url.host().is_none() {
+        return Err(TransportError::Egress(format!("url {url_str} has no host")));
+    }
     let port = url
         .port_or_known_default()
         .unwrap_or(if scheme == "https" { 443 } else { 80 });
+    Ok((url, port))
+}
+
+/// Validate `url_str` against `policy`, resolving the host and checking **every**
+/// resolved IP (a split-horizon / multi-record host is only as safe as its worst
+/// address). Returns the validated [`Resolved`] addresses for DNS pinning, or a
+/// [`TransportError::Egress`] describing the block.
+pub async fn validate(url_str: &str, policy: &EgressPolicy) -> Result<Resolved, TransportError> {
+    let (url, port) = target(url_str)?;
+    let scheme = url.scheme();
+    let host = url.host().expect("`target` requires a host");
 
     let (host_str, is_domain, ips): (String, bool, Vec<IpAddr>) = match host {
         Host::Ipv4(a) => (a.to_string(), false, vec![IpAddr::V4(a)]),
@@ -264,6 +272,47 @@ pub async fn validate(url_str: &str, policy: &EgressPolicy) -> Result<Resolved, 
         addrs,
         is_domain,
     })
+}
+
+/// Validate `url_str` for a connection to `ip` in place of what its host
+/// resolves to (a TLS profile's `connect_to`). The URL's host name stays what
+/// the certificate is checked against, so it has to be a name, not an
+/// address. `ip` has to pass `policy` as a resolved address would: the cloud
+/// metadata address is refused here as anywhere.
+pub fn validate_at(
+    url_str: &str,
+    ip: IpAddr,
+    policy: &EgressPolicy,
+) -> Result<Resolved, TransportError> {
+    let (url, port) = target(url_str)?;
+    let Some(Host::Domain(host)) = url.host() else {
+        return Err(TransportError::Egress(format!(
+            "connect_to needs a url with a host name to check the certificate against, and \
+             {url_str} names an address"
+        )));
+    };
+    let public = check_ip(host, ip, policy)?;
+    if public && url.scheme() == "http" && policy.require_https_public {
+        return Err(TransportError::Egress(format!(
+            "refusing plaintext HTTP to public host '{host}' (egress.require_https = true)"
+        )));
+    }
+    Ok(Resolved {
+        host: host.to_string(),
+        addrs: vec![SocketAddr::new(ip, port)],
+        is_domain: true,
+    })
+}
+
+/// Check a `connect_to` address for `url_str` as [`validate_at`] would when
+/// the connection opens: for a config to be refused up front rather than an
+/// upstream to fail at every attempt.
+pub fn check_connect_to(
+    url_str: &str,
+    ip: IpAddr,
+    policy: &EgressPolicy,
+) -> Result<(), TransportError> {
+    validate_at(url_str, ip, policy).map(drop)
 }
 
 #[cfg(test)]
@@ -416,6 +465,37 @@ mod tests {
         assert!(validate("https://8.8.8.8/x", &EgressPolicy::default())
             .await
             .is_ok());
+    }
+
+    #[test]
+    fn connect_to_pins_the_name_to_an_address_the_policy_allows() {
+        let policy = EgressPolicy::default();
+        let r = validate_at("https://mcp.internal:8443/mcp", ip("10.0.0.5"), &policy).unwrap();
+        assert_eq!(r.host, "mcp.internal");
+        assert_eq!(r.addrs, vec!["10.0.0.5:8443".parse().unwrap()]);
+        assert!(r.is_domain);
+        // The metadata address is refused however it is reached.
+        for addr in [
+            "169.254.169.254",
+            "fe80::1",
+            "::ffff:169.254.169.254",
+            "0.0.0.0",
+        ] {
+            let err = validate_at("https://mcp.internal/mcp", ip(addr), &policy).unwrap_err();
+            assert!(matches!(err, TransportError::Egress(_)), "{addr}");
+        }
+        // Private addresses follow the policy.
+        assert!(validate_at(
+            "https://mcp.internal/",
+            ip("10.0.0.5"),
+            &EgressPolicy::hardened()
+        )
+        .is_err());
+        // A URL that names an address has no name to check a certificate against.
+        let err = validate_at("https://10.0.0.9/mcp", ip("10.0.0.5"), &policy).unwrap_err();
+        assert!(err.to_string().contains("host name"), "{err}");
+        // Plain HTTP to a public address is refused, as it is when resolved.
+        assert!(validate_at("http://example.com/", ip("8.8.8.8"), &policy).is_err());
     }
 
     #[tokio::test]

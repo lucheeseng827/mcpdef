@@ -1,0 +1,152 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* MCPdef — color system.
+ * Two palettes, dark and light, each in two layers:
+ *   1. base palette vars (--bg, --fg, --brand, …) — the raw values.
+ *   2. semantic --eg-* aliases — what every component references, so the base
+ *      layer can change without touching a component.
+ * Dark is the default. Light is taken when the system prefers it, unless the
+ * console's toggle says dark; and whenever the toggle says light
+ * (<html data-theme="light|dark">).
+ *
+ * Every text color meets WCAG 2.1 AA (4.5:1) on the surfaces it is set on.
+ *
+ * Status semantics are load-bearing in a governance tool:
+ *   good  = allow / healthy / intact chain   (green)
+ *   warn  = degraded / drift / rate-limited   (amber)
+ *   danger= deny / poisoned / broken chain    (red)
+ *   brand = interactive / informational       (blue)
+ * Color is never the ONLY signal — always pair with an icon or label.
+ */
+:root {
+  color-scheme: dark;
+  /* ---- base surfaces (darkest → lightest) ---- */
+  --bg: #0b0e14;          /* app canvas */
+  --bg-elev: #11151f;     /* sidebar, table headers, raised rows */
+  --panel: #131826;       /* the card surface everything sits on */
+  --border: #2a3346;      /* default hairline / control border */
+  --border-soft: #1f2738; /* interior dividers, row separators */
+
+  /* ---- text ---- */
+  --fg: #e6e9f0;          /* primary text */
+  --muted: #959eb1;       /* labels, secondary text */
+  --faint: #8790a3;       /* footnotes, placeholders, meta: 4.5:1 on the panel */
+
+  /* ---- brand + accent ---- */
+  --brand: #5b95ff;       /* interactive blue */
+  --brand-hover: #74a6ff;
+  --brand-dim: #2a4a8f;   /* avatar/fill backer */
+  --brand-ink: #0b0e14;   /* text on a solid brand fill */
+  --accent: #8b6cff;      /* violet — only in the brand gradient */
+
+  /* ---- status ---- */
+  --good: #3ccb93;        /* allow / healthy */
+  --warn: #e7bb4f;        /* degraded / drift */
+  --danger: #ff6b80;      /* deny / poisoned / broken */
+
+  /* ---- tints: a border and a fill per status ---- */
+  --good-border: rgba(60, 203, 147, 0.35);
+  --warn-border: rgba(231, 187, 79, 0.35);
+  --brand-border: rgba(91, 149, 255, 0.35);
+  --danger-border: rgba(255, 107, 128, 0.40);
+  --good-fill: rgba(60, 203, 147, 0.12);
+  --warn-fill: rgba(231, 187, 79, 0.12);
+  --brand-fill: rgba(91, 149, 255, 0.12);
+  --danger-fill: rgba(255, 107, 128, 0.12);
+  --scrim: rgba(0, 0, 0, 0.55);
+  --shadow-overlay: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+/* The light palette: the system's preference, unless the toggle says dark;
+ * and the toggle's, whatever the system says. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+    --bg: #f4f6f9;
+    --bg-elev: #eaedf2;
+    --panel: #ffffff;
+    --border: #c9cfd9;
+    --border-soft: #e1e5eb;
+    --fg: #141821;
+    --muted: #4b5466;
+    --faint: #5b6476;
+    --brand: #2155c4;
+    --brand-hover: #1a479f;
+    --brand-dim: #c5d6f6;
+    --brand-ink: #ffffff;
+    --accent: #6a4fd6;
+    --good: #0b7a50;
+    --warn: #8a5a00;
+    --danger: #c21f37;
+    --good-border: rgba(11, 122, 80, 0.40);
+    --warn-border: rgba(138, 90, 0, 0.40);
+    --brand-border: rgba(33, 85, 196, 0.40);
+    --danger-border: rgba(194, 31, 55, 0.40);
+    --good-fill: rgba(11, 122, 80, 0.08);
+    --warn-fill: rgba(138, 90, 0, 0.08);
+    --brand-fill: rgba(33, 85, 196, 0.08);
+    --danger-fill: rgba(194, 31, 55, 0.08);
+    --scrim: rgba(20, 24, 33, 0.45);
+    --shadow-overlay: 0 8px 24px rgba(20, 24, 33, 0.18);
+  }
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f4f6f9;
+  --bg-elev: #eaedf2;
+  --panel: #ffffff;
+  --border: #c9cfd9;
+  --border-soft: #e1e5eb;
+  --fg: #141821;
+  --muted: #4b5466;
+  --faint: #5b6476;
+  --brand: #2155c4;
+  --brand-hover: #1a479f;
+  --brand-dim: #c5d6f6;
+  --brand-ink: #ffffff;
+  --accent: #6a4fd6;
+  --good: #0b7a50;
+  --warn: #8a5a00;
+  --danger: #c21f37;
+  --good-border: rgba(11, 122, 80, 0.40);
+  --warn-border: rgba(138, 90, 0, 0.40);
+  --brand-border: rgba(33, 85, 196, 0.40);
+  --danger-border: rgba(194, 31, 55, 0.40);
+  --good-fill: rgba(11, 122, 80, 0.08);
+  --warn-fill: rgba(138, 90, 0, 0.08);
+  --brand-fill: rgba(33, 85, 196, 0.08);
+  --danger-fill: rgba(194, 31, 55, 0.08);
+  --scrim: rgba(20, 24, 33, 0.45);
+  --shadow-overlay: 0 8px 24px rgba(20, 24, 33, 0.18);
+}
+
+/* ---- semantic aliases (component API), the same in either palette ---- */
+:root {
+  --eg-bg: var(--bg);
+  --eg-bg-elev: var(--bg-elev);
+  --eg-panel: var(--panel);
+  --eg-border: var(--border);
+  --eg-border-soft: var(--border-soft);
+  --eg-fg: var(--fg);
+  --eg-muted: var(--muted);
+  --eg-faint: var(--faint);
+  --eg-brand: var(--brand);
+  --eg-brand-hover: var(--brand-hover);
+  --eg-brand-dim: var(--brand-dim);
+  --eg-brand-ink: var(--brand-ink);
+  --eg-accent: var(--accent);
+  --eg-good: var(--good);
+  --eg-warn: var(--warn);
+  --eg-danger: var(--danger);
+  --eg-good-border: var(--good-border);
+  --eg-warn-border: var(--warn-border);
+  --eg-brand-border: var(--brand-border);
+  --eg-danger-border: var(--danger-border);
+  --eg-good-fill: var(--good-fill);
+  --eg-warn-fill: var(--warn-fill);
+  --eg-brand-fill: var(--brand-fill);
+  --eg-danger-fill: var(--danger-fill);
+  --eg-scrim: var(--scrim);
+
+  /* the ONE gradient — blue→violet, brand lockups only, never on text/surfaces */
+  --eg-gradient: linear-gradient(135deg, var(--brand), var(--accent));
+}

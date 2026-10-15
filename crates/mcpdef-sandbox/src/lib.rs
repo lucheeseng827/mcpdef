@@ -362,6 +362,10 @@ impl Transport for WasmUpstream {
         // Request/response model: the response was produced during `send`.
         Ok(self.inbox.pop_front())
     }
+    /// The module runs each request to completion inside `send`.
+    fn replies_inline(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

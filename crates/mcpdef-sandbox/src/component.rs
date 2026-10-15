@@ -229,6 +229,10 @@ impl Transport for WasmComponentUpstream {
     async fn recv(&mut self) -> Result<Option<Message>, TransportError> {
         Ok(self.inbox.pop_front())
     }
+    /// The module runs each request to completion inside `send`.
+    fn replies_inline(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

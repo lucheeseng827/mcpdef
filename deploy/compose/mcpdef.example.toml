@@ -3,10 +3,35 @@
 [gateway]
 listen = "0.0.0.0:7878"
 audit  = "/var/lib/mcpdef/audit.log"   # persisted via the compose volume
+state_dir = "/var/lib/mcpdef/state"    # the local CA of [gateway.tls], on the same volume
 
 [gateway.admin]
 enabled = true
 listen  = "0.0.0.0:7879"               # published to 127.0.0.1 only by compose
+# Bound to every interface inside the container, with nothing to sign its
+# callers in: compose publishes the port to the host's loopback alone, so
+# whoever reaches it is on this machine. Drop this to require client
+# certificates instead (see docs/CONFIG.md, [gateway.admin]).
+allow_unauthenticated = true
+
+# Reached from other machines, the listener wants TLS and [gateway.auth]: with
+# neither, the gateway warns at startup (and refuses to start under `strict`).
+# TLS from a certificate cert-manager or certbot writes, mounted at
+# /etc/mcpdef-tls (see compose.yaml), and read again when it changes with
+# `watch_config = true` under [gateway]:
+# [gateway.tls]
+# mode = "files"
+# cert = "/etc/mcpdef-tls/tls.crt"
+# key  = { file = "/etc/mcpdef-tls/tls.key" }
+# Or from a local CA of MCPdef's own, for a private network: make it with
+#   docker compose run --rm mcpdef tls init --config /etc/mcpdef/mcpdef.toml
+# and give clients what `tls export-ca` prints.
+# [gateway.tls]
+# mode = "self-signed"
+# hostnames = ["mcpdef.internal"]      # the names clients use besides localhost
+# The admin listener serves the same TLS, unless it has its own:
+# [gateway.admin.tls]
+# mode = "off"
 
 # --- declare your MCP servers (deny-by-default allowlist) ---
 # A remote Streamable-HTTP MCP server:

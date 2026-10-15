@@ -3,10 +3,16 @@ name = "mcpdef-auth"
 description = "MCPdef — OAuth 2.1 Resource Server: per-request JWT/JWKS bearer validation + RFC 9728 Protected Resource Metadata (OSS engine, Phase 2)."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
+# A verified token's payload, read again for every claim it holds.
+base64.workspace = true
 jsonwebtoken.workspace = true
 serde.workspace = true
 serde_json.workspace = true

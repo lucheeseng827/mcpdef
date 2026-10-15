@@ -1,0 +1,13 @@
+# VS Code: merge into .vscode/mcp.json (`mcpdef connect vscode --write` does it)
+{
+  "servers": {
+    "mcpdef": {
+      "type": "http",
+      "url": "https://127.0.0.1:8443/mcp"
+    }
+  }
+}
+
+The gateway's certificate is from its own CA. VS Code trusts the system's store, so add it there:
+  sudo cp $DIR/state/tls/ca.crt /usr/local/share/ca-certificates/mcpdef-local-ca.crt && sudo update-ca-certificates   (Debian, Ubuntu)
+  sudo cp $DIR/state/tls/ca.crt /etc/pki/ca-trust/source/anchors/mcpdef-local-ca.crt && sudo update-ca-trust   (Fedora, RHEL)

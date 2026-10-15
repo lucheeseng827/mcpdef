@@ -1,0 +1,96 @@
+{
+  "schema": 1,
+  "generated_at_unix": 1790305109,
+  "mcpdef_version": "mcpdef 0.2.1  ·  MCP gateway & governance plane",
+  "commit": "e53ecc58a420762078aeee6f1fdf0c234bd71595",
+  "note": "From before calls ran concurrently, at 200 clients, slow-neighbour only: the serialized gateway, one lock held across every upstream call. Measured on a 4-vCPU cloud container; comparable only with runs at 200 clients on the same machine type.",
+  "machine": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpus": 4,
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "mem_total_kb": 16481980
+  },
+  "params": {
+    "quick": false,
+    "warmup": 300,
+    "requests": 3000,
+    "concurrency": [
+      1,
+      16
+    ],
+    "slow_ms": 5000,
+    "neighbour_upstreams": 20,
+    "neighbour_concurrency": 200,
+    "neighbour_alone_ms": 5000,
+    "neighbour_beside_ms": 15000,
+    "idle_upstreams": 10,
+    "idle_load_requests": 1000
+  },
+  "scenarios": {
+    "slow_neighbour": [
+      {
+        "transport": "http",
+        "upstreams": 20,
+        "slow_ms": 5000,
+        "concurrency": 200,
+        "alone": {
+          "n": 22504,
+          "errors": 0,
+          "min_us": 1888,
+          "p50_us": 44096,
+          "p90_us": 49802,
+          "p99_us": 57187,
+          "max_us": 58959,
+          "mean_us": 44600,
+          "rps": 4464.715275521352
+        },
+        "beside_slow": {
+          "n": 624,
+          "errors": 0,
+          "min_us": 4901748,
+          "p50_us": 5044852,
+          "p90_us": 5047360,
+          "p99_us": 5048816,
+          "max_us": 5048861,
+          "mean_us": 5006241,
+          "rps": 31.131646969880507
+        },
+        "slow_calls_completed": 5,
+        "ratio_p50": 114.40611393323657,
+        "ratio_p99": 88.28607900396943
+      },
+      {
+        "transport": "stdio",
+        "upstreams": 20,
+        "slow_ms": 5000,
+        "concurrency": 200,
+        "alone": {
+          "n": 39204,
+          "errors": 0,
+          "min_us": 1053,
+          "p50_us": 25791,
+          "p90_us": 28551,
+          "p99_us": 31255,
+          "max_us": 35703,
+          "mean_us": 25550,
+          "rps": 7808.677973970316
+        },
+        "beside_slow": {
+          "n": 802,
+          "errors": 0,
+          "min_us": 26752,
+          "p50_us": 5027629,
+          "p90_us": 5030645,
+          "p99_us": 5030834,
+          "max_us": 5031089,
+          "mean_us": 4987293,
+          "rps": 40.07727468636276
+        },
+        "slow_calls_completed": 5,
+        "ratio_p50": 194.9373424838122,
+        "ratio_p99": 160.96093425051993
+      }
+    ]
+  }
+}

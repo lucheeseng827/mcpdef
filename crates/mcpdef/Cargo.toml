@@ -3,9 +3,19 @@ name = "mcpdef"
 description = "MCPdef — the MCP gateway & governance plane binary: config, the transport-mux proxy loop, allowlist + audit, CLI (Phase 1)."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 default-run = "mcpdef"
+
+[lints]
+workspace = true
+
+[features]
+default = ["console"]
+# The console: its built files, embedded, served at the admin listener's `/`.
+# Without it, `/` is the built-in status page, a few kilobytes of vanilla JS.
+console = ["dep:mcpdef-console"]
 
 [dependencies]
 mcpdef-core.workspace = true
@@ -17,23 +27,58 @@ mcpdef-pin.workspace = true
 mcpdef-ratelimit.workspace = true
 mcpdef-auth.workspace = true
 mcpdef-sandbox.workspace = true
-tokio.workspace = true
+mcpdef-secrets.workspace = true
+mcpdef-console = { workspace = true, optional = true }
+# `signal`: a reload on SIGHUP.
+tokio = { workspace = true, features = ["signal"] }
 clap.workspace = true
 toml.workspace = true
+toml_edit.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 # downstream Streamable HTTP listener (the `mcpdef run --http` server) + Origin parsing
 axum.workspace = true
+# The admin API's audit stream and export, sent as they are read.
+tokio-stream.workspace = true
+# The console's session cookie: AES-256-GCM, and the random its nonces and
+# keys take.
+ring.workspace = true
+arc-swap.workspace = true
 url.workspace = true
+# The digest of a config, which a reload records and the config watch compares.
+sha2.workspace = true
+hex.workspace = true
+# TLS on the gateway's own listeners (`[gateway.tls]`): rustls on ring, as the
+# transport links it, served through tokio-rustls, and the local CA made with
+# rcgen, which dates what it signs with `time`. A key is wiped once written.
+rustls.workspace = true
+tokio-rustls.workspace = true
+rcgen.workspace = true
+time.workspace = true
+zeroize.workspace = true
+# A client's certificate as a trusted proxy forwards it in an RFC 9440
+# `Client-Cert` header: base64, as RFC 8941 writes a Byte Sequence.
+base64.workspace = true
+# `mcpdef doctor` opens the upstreams with a ledger and a pin store it then
+# throws away, in a directory of its own.
+tempfile.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
-# an in-process upstream for the listener's tests (the `Transport` trait is async-trait)
-async-trait.workspace = true
+# An identity provider whose clock is off, for `mcpdef doctor`: the `Date` it
+# answers with.
+httpdate.workspace = true
+# Fuzzing the parsers of what a trusted proxy forwards.
+proptest.workspace = true
+# HTTPS upstreams on a private CA, made when a test runs
+mcpdef-testkit.workspace = true
 reqwest.workspace = true
 tokio = { workspace = true, features = ["net"] }
 # sign test bearer tokens for the OAuth listener integration tests
 jsonwebtoken.workspace = true
 # compile WAT fixtures for the in-path wasm-sandbox gateway test
 wat.workspace = true
+# stand in for a 2024-11-05 HTTP+SSE upstream, whose reply arrives on a stream
+# that must stay open — `spec = "auto"` has to reach one over HTTP
+futures-util.workspace = true
+tokio-stream.workspace = true

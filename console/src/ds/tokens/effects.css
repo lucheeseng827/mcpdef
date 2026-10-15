@@ -1,0 +1,14 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* MCPdef — effects + motion.
+ * The system is nearly flat: one shadow, reserved for floating surfaces (modal,
+ * toast) only. Cards and tiles use a 1px border, never a shadow. Motion is
+ * quick and calm — a single standard easing, three durations, no bounce, no
+ * spring. Transitions cover color/border/background and the switch knob; content
+ * doesn't slide around. Reduced-motion collapses everything to ~instant. */
+:root {
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1); /* @kind other */
+
+  --dur-fast: 120ms; /* @kind other */   /* hover/border color */
+  --dur-base: 180ms; /* @kind other */   /* switch, background */
+  --dur-slow: 240ms; /* @kind other */   /* modal rise, meter fill */
+}

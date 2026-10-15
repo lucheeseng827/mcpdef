@@ -1,0 +1,8 @@
+# Any MCP client
+Streamable HTTP: https://127.0.0.1:8443/mcp
+
+# for a client that can only run a command:
+$MCPDEF bridge https://127.0.0.1:8443/mcp --ca $DIR/state/tls/ca.crt
+
+The gateway's certificate is from its own CA: trust $DIR/state/tls/ca.crt.
+  curl --cacert $DIR/state/tls/ca.crt https://127.0.0.1:8443/mcp

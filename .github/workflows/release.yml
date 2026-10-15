@@ -49,6 +49,11 @@ permissions: {}
 env:
   BIN: mcpdef
   IMAGE: docker.io/mancube/mcpdef
+  # The image as its build-provenance attestation names it. push-to-registry sends the
+  # attestation to https://<registry>/v2/…, and Docker Hub's registry is index.docker.io:
+  # docker.io redirects to www.docker.com. actions/attest-build-provenance asks for
+  # index.docker.io for this reason. Tags, `docker run` and cosign keep IMAGE.
+  ATTEST_SUBJECT: index.docker.io/mancube/mcpdef
   TAG: ${{ github.event.inputs.tag || github.ref_name }}
 
 jobs:
@@ -70,16 +75,22 @@ jobs:
           # version, would let `cargo publish` (which uses the manifest version) push an
           # irreversible crates.io release while `wait_indexed` polls ${TAG#v} and then
           # times out. Fail closed BEFORE any build or publish runs.
-          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]] \
-            || { echo "::error::TAG '$TAG' is not a v<semver> release tag"; exit 1; }
+          # No build metadata (+...): crates.io drops it, so v0.4.0+b1 would publish 0.4.0 and
+          # then wait for a version that never appears.
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]] \
+            || { echo "::error::TAG '$TAG' is not a v<semver> release tag, without build metadata"; exit 1; }
           ver="$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
-          # Compare the tag's BASE version (strip any -prerelease/+build suffix) to the crate
-          # version, so an rc tag (v0.1.0-rc.1) can exercise the pipeline against the same
-          # version. The crates.io + brew jobs still skip any tag containing '-', so only a
-          # clean vX.Y.Z ever publishes — the "irreversible publish" guard is unchanged.
-          base="${TAG#v}"; base="${base%%[-+]*}"
-          [ "$base" = "$ver" ] \
-            || { echo "::error::tag '$TAG' base version '$base' != workspace version '$ver' (Cargo.toml)"; exit 1; }
+          # The tag names the crate version itself, or a pre-release of it:
+          #   - v0.4.0-alpha.1 for version 0.4.0-alpha.1, a pre-release whose binary and
+          #     image report the version they are;
+          #   - v0.1.0-rc.1 for version 0.1.0: the tag's BASE version (its -prerelease suffix
+          #     stripped) is the crate's, so it rehearses the release on its version.
+          # A tag with no '-' names the version exactly: it is the one the crates.io + brew
+          # jobs publish, as they skip any tag containing '-' — the "irreversible publish"
+          # guard.
+          base="${TAG#v}"; base="${base%%-*}"
+          [ "${TAG#v}" = "$ver" ] || { [[ "$TAG" == *-* ]] && [ "$base" = "$ver" ]; } \
+            || { echo "::error::tag '$TAG' is neither v$ver nor a pre-release of it (workspace version '$ver', Cargo.toml)"; exit 1; }
           echo "validated: $TAG (release version $ver)"
 
   build:
@@ -278,6 +289,7 @@ jobs:
           # Dependency order: core first; the leaves that depend only on core next; mcpdef last.
           # `ee/` is a separate workspace and is never a member here, so it is never published.
           publish_one mcpdef-core
+          publish_one mcpdef-secrets
           publish_one mcpdef-pin
           publish_one mcpdef-ratelimit
           publish_one mcpdef-audit
@@ -287,6 +299,8 @@ jobs:
           publish_one mcpdef-transport
           # mcpdef-sandbox depends on mcpdef-core + mcpdef-transport, so it follows them.
           publish_one mcpdef-sandbox
+          # The console's built files, which mcpdef embeds by default: no dependency.
+          publish_one mcpdef-console
           publish_one mcpdef
 
   brew:
@@ -432,7 +446,7 @@ jobs:
       - name: SLSA provenance for the image
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
         with:
-          subject-name: ${{ env.IMAGE }}
+          subject-name: ${{ env.ATTEST_SUBJECT }}
           subject-digest: ${{ steps.build.outputs.digest }}
           push-to-registry: true
       - name: Update Docker Hub description

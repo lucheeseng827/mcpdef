@@ -1,0 +1,31 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* MCPdef — base element resets.
+ * Minimal, global. Sets the dark canvas, the sans body, mono for code, and
+ * link colors from the palette (links default to brand, hover to brand-hover)
+ * so any anchor a consumer drops in is on-brand rather than browser-blue. */
+* { box-sizing: border-box; }
+html, body { padding: 0; margin: 0; }
+body {
+  background: var(--eg-bg);
+  color: var(--eg-fg);
+  font-family: var(--font-sans);
+  font-size: var(--text-body, 14px);
+  line-height: var(--leading-body, 1.6);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+a { color: var(--eg-brand); text-decoration: none; }
+a:hover { color: var(--eg-brand-hover); }
+code, pre, .mono { font-family: var(--font-mono); }
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
+}
+
+/* Where the keyboard is, always visible: a brand ring, set off from what it
+ * surrounds. A pointer's focus shows none. */
+:focus-visible {
+  outline: 2px solid var(--eg-brand);
+  outline-offset: 2px;
+}
+[role="row"]:focus-visible { outline-offset: -2px; }

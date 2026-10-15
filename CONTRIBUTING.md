@@ -46,6 +46,25 @@ so contributions are held to a high bar for clarity, test coverage, and security
    or records what happened belongs in the OSS engine, not `ee/`
    (see OSS-ROLLOUT.md §2).
 
+5. **Keep to one TLS stack and to Rust 1.88.** MCPdef speaks TLS through rustls
+   on ring, and installs ring as rustls' provider when it starts. A dependency
+   that brings `aws-lc-rs`, OpenSSL or `native-tls`, or a second version of
+   `rustls`, is refused by CI. Add a rustls-based crate with its default
+   features off and its `ring` feature on. A test that builds its own `reqwest`
+   client calls `mcpdef_transport::install_crypto_provider()` first: `reqwest`
+   panics without a provider. A test that needs certificates makes them with
+   `mcpdef-testkit` when it runs: never commit a certificate or a key. The
+   workspace builds on Rust 1.88 (`rust-version`), and `cargo update` keeps to
+   dependency releases that do.
+
+6. **Rebuild the console when you change it.** The console's source is
+   `console/` (React + Vite, Node 22); its build is committed in
+   `crates/mcpdef-console`, so building the gateway never needs Node. After a
+   change there, run `make console` and commit what it writes. CI builds it
+   again from the lockfile and fails on any difference. The admin listener's
+   content security policy loads scripts and styles from files alone: no
+   inline `<script>` or `<style>`, and no `data:` URI for a font or a script.
+
 ## Spec-conformance is a first-class lane
 
 MCPdef tracks a moving protocol (the stateless **2026-07-28** RC removes the

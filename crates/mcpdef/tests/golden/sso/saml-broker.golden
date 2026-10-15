@@ -1,0 +1,51 @@
+# Signing people in to MCPdef's console at a SAML identity provider, through
+# Keycloak as its broker.
+#
+# At the provider:
+#   1. In Keycloak, the broker: Identity providers > SAML v2.0, from the SAML
+#      identity provider's metadata, its NameID persistent or the e-mail
+#      address.
+#   2. Its mappers: the SAML attribute that holds groups (memberOf, groups) to a
+#      Keycloak group, one each for mcpdef-viewers, mcpdef-operators and
+#      mcpdef-admins.
+#   3. Clients > Create client: OpenID Connect, client ID mcpdef-console, client
+#      authentication on; redirect URI https://mcpdef.example.com:7879/callback,
+#      post logout redirect URI https://mcpdef.example.com:7879/; its secret
+#      goes in MCPDEF_OIDC_CLIENT_SECRET, where MCPdef runs.
+#   4. The client's dedicated scope > Add mapper > Group Membership: token claim
+#      groups, full group path off, add to ID token on.
+#   5. Optionally, Authentication > browser > Identity Provider Redirector, set
+#      to the SAML provider, so people go straight to it.
+#
+# Then this goes in the config (or run this again with --write),
+# MCPDEF_OIDC_CLIENT_SECRET is set where MCPdef runs, and the gateway is
+# restarted. Someone the provider gives no console role is shown the claims
+# MCPdef received of them: map one to a role with [[identity.role_map]].
+
+[gateway.admin]
+public_url = "https://mcpdef.example.com:7879"
+
+[gateway.admin.oidc]
+issuer = "https://keycloak.example.com/realms/ops"
+client_id = "mcpdef-console"
+client_secret = { env = "MCPDEF_OIDC_CLIENT_SECRET" }
+scopes = ["profile", "email"]
+
+[identity]
+subject_claim = "preferred_username"
+roles_claims = []
+
+[[identity.role_map]]
+claim = "groups"
+value = "mcpdef-viewers"
+roles = ["console:viewer"]
+
+[[identity.role_map]]
+claim = "groups"
+value = "mcpdef-operators"
+roles = ["console:operator"]
+
+[[identity.role_map]]
+claim = "groups"
+value = "mcpdef-admins"
+roles = ["console:admin"]

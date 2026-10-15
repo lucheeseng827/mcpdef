@@ -1,0 +1,42 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* The built-in status UI's styles: see admin_ui.html. */
+:root {
+  --bg: #0d1117; --panel: #161b22; --border: #30363d; --fg: #e6edf3;
+  --muted: #8b949e; --allow: #2ea043; --deny: #f85149; --accent: #58a6ff;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg);
+  font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+header { padding: 16px 20px; border-bottom: 1px solid var(--border);
+  display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+header h1 { margin: 0; font-size: 18px; letter-spacing: .5px; }
+header .sub { color: var(--muted); font-size: 12px; }
+main { padding: 20px; max-width: 1100px; margin: 0 auto; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px; margin-bottom: 24px; }
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px 14px; }
+.card .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .6px; }
+.card .v { font-size: 24px; margin-top: 4px; }
+h2 { font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: .6px;
+  margin: 24px 0 8px; }
+table { width: 100%; border-collapse: collapse; background: var(--panel);
+  border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border);
+  font-size: 12px; vertical-align: top; }
+th { color: var(--muted); font-weight: 600; }
+tr:last-child td { border-bottom: none; }
+.badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; }
+.badge.allow { background: rgba(46,160,67,.15); color: var(--allow); }
+.badge.deny { background: rgba(248,81,73,.15); color: var(--deny); }
+.badge.degraded { background: rgba(210,153,34,.15); color: #d29922; }
+.badge.starting { background: rgba(139,148,158,.15); color: var(--muted); }
+.pill { display: inline-block; background: #21262d; border: 1px solid var(--border);
+  border-radius: 4px; padding: 0 5px; margin: 1px 2px 1px 0; font-size: 11px; }
+.pill.deny { color: var(--deny); border-color: rgba(248,81,73,.4); }
+.muted { color: var(--muted); }
+a { color: var(--accent); }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--allow); margin-right: 6px; }
+footer { color: var(--muted); font-size: 11px; padding: 16px 20px; text-align: center; }
+.right { margin-left: auto; }

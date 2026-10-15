@@ -29,6 +29,6 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end -}}
 
 {{- define "mcpdef.image" -}}
-{{- /* A release's image is tagged as the release is: v0.2.2. */ -}}
+{{- /* A release's image is tagged as the release is: v0.4.0-alpha.1. */ -}}
 {{- printf "%s:%s" .Values.image.repository (default (printf "v%s" .Chart.AppVersion) .Values.image.tag) -}}
 {{- end -}}

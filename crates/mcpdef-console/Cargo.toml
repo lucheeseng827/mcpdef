@@ -1,0 +1,16 @@
+[package]
+name = "mcpdef-console"
+description = "MCPdef — the console's built files (HTML, scripts, styles, fonts), each with its brotli and gzip forms, embedded for the gateway's admin listener to serve. Built from console/ with Node; building this crate needs none."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+# What it bundles carries its own licenses: IBM Plex under the SIL Open Font
+# License 1.1, React under MIT. They are in licenses/, and in the NOTICE.
+include = ["src/**", "assets/**", "licenses/**", "README.md"]
+
+[lints]
+workspace = true
+
+[dependencies]

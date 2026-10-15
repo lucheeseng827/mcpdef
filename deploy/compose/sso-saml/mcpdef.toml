@@ -1,0 +1,55 @@
+# MCPdef for the SAML kit (compose.yaml): its console signs people in at the
+# Keycloak realm `mcpdef`, which brokers the SAML realm `corp`. The tables
+# from [gateway.admin] on are what
+#
+#   mcpdef sso init --provider saml-broker \
+#     --issuer http://localhost:8080/realms/mcpdef \
+#     --public-url http://localhost:7879 --write
+#
+# adds to a config. Full reference: docs/CONFIG.md.
+[gateway]
+listen = "0.0.0.0:7878"                # published to 127.0.0.1 alone, by compose.yaml
+audit = "/home/nonroot/audit.log"      # who signed in and out, and what they did
+state_dir = "/home/nonroot/state"      # the console's session key, among others
+
+[gateway.admin]
+enabled = true
+listen = "0.0.0.0:7879"                # published to 127.0.0.1 alone, by compose.yaml
+public_url = "http://localhost:7879"
+
+[gateway.admin.oidc]
+issuer = "http://localhost:8080/realms/mcpdef"
+client_id = "mcpdef-console"
+client_secret = { env = "MCPDEF_OIDC_CLIENT_SECRET" }
+scopes = ["profile", "email"]
+
+[identity]
+subject_claim = "preferred_username"
+roles_claims = []
+
+# The broker's groups, as the console's roles. The broker puts corp's people in
+# them by the groups their assertions carry, and its own people by membership.
+[[identity.role_map]]
+claim = "groups"
+value = "mcpdef-viewers"
+roles = ["console:viewer"]
+
+[[identity.role_map]]
+claim = "groups"
+value = "mcpdef-operators"
+roles = ["console:operator"]
+
+[[identity.role_map]]
+claim = "groups"
+value = "mcpdef-admins"
+roles = ["console:admin"]
+
+# --- the MCP servers MCPdef fronts, as in deploy/compose/mcpdef.example.toml ---
+# A gateway fronts one at least. This one is yours to replace: until something
+# answers at its URL, MCPdef runs on, says it is down (the console's Servers
+# screen too), and tries it again, less and less often.
+[[server]]
+id        = "your-server"
+transport = "streamable-http"
+url       = "http://localhost:3000/mcp"
+tools     = ["*"]

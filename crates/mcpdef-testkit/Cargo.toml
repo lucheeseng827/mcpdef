@@ -1,0 +1,29 @@
+[package]
+name = "mcpdef-testkit"
+description = "MCPdef — test support: a PKI made at test time, and an MCP upstream served over HTTPS. Never published."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Everything here is in the workspace's lockfile already, rcgen and its own
+# dependencies aside. Only tests depend on this crate; the gateway never does.
+rcgen.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+axum.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+webpki.workspace = true

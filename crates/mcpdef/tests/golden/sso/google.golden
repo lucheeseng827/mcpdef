@@ -1,0 +1,38 @@
+# Signing people in to MCPdef's console at Google.
+#
+# At the provider:
+#   1. Google Cloud console > APIs & Services > Credentials > Create OAuth
+#      client ID: a Web application, its authorized redirect URI
+#      https://mcpdef.example.com:7879/callback; its secret goes in
+#      MCPDEF_OIDC_CLIENT_SECRET, where MCPdef runs.
+#   2. OAuth consent screen: Internal, so that only your Workspace's people sign
+#      in.
+#   3. Google's ID tokens carry no groups: hd, the Workspace domain (set yours
+#      below), gives console:viewer. Operators and admins sign in by a client
+#      certificate, or through a broker that reads Google's groups
+#      (saml-broker's Keycloak).
+#   4. Google has no end-session endpoint: signing out ends the console's
+#      session alone.
+#
+# Then this goes in the config (or run this again with --write),
+# MCPDEF_OIDC_CLIENT_SECRET is set where MCPdef runs, and the gateway is
+# restarted. Someone the provider gives no console role is shown the claims
+# MCPdef received of them: map one to a role with [[identity.role_map]].
+
+[gateway.admin]
+public_url = "https://mcpdef.example.com:7879"
+
+[gateway.admin.oidc]
+issuer = "https://accounts.google.com"
+client_id = "mcpdef-console"
+client_secret = { env = "MCPDEF_OIDC_CLIENT_SECRET" }
+scopes = ["profile", "email"]
+
+[identity]
+subject_claim = "email"
+roles_claims = []
+
+[[identity.role_map]]
+claim = "hd"
+value = "example.com"
+roles = ["console:viewer"]

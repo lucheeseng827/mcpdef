@@ -1,0 +1,45 @@
+# Signing people in to MCPdef's console at authentik.
+#
+# At the provider:
+#   1. Applications > Providers > Create: OAuth2/OpenID Provider, a confidential
+#      client, redirect URI https://mcpdef.example.com:7879/callback, a signing
+#      key (RS256, never none); its secret goes in MCPDEF_OIDC_CLIENT_SECRET,
+#      where MCPdef runs.
+#   2. Applications > Create: one named mcpdef, with that provider: its slug is
+#      in the issuer, which ends in a slash.
+#   3. Directory > Groups: the groups mcpdef-viewers, mcpdef-operators and
+#      mcpdef-admins, each giving the console role role_map says; bind them to
+#      the application.
+#
+# Then this goes in the config (or run this again with --write),
+# MCPDEF_OIDC_CLIENT_SECRET is set where MCPdef runs, and the gateway is
+# restarted. Someone the provider gives no console role is shown the claims
+# MCPdef received of them: map one to a role with [[identity.role_map]].
+
+[gateway.admin]
+public_url = "https://mcpdef.example.com:7879"
+
+[gateway.admin.oidc]
+issuer = "https://authentik.example.com/application/o/mcpdef/"
+client_id = "mcpdef-console"
+client_secret = { env = "MCPDEF_OIDC_CLIENT_SECRET" }
+scopes = ["profile", "email"]
+
+[identity]
+subject_claim = "preferred_username"
+roles_claims = []
+
+[[identity.role_map]]
+claim = "groups"
+value = "mcpdef-viewers"
+roles = ["console:viewer"]
+
+[[identity.role_map]]
+claim = "groups"
+value = "mcpdef-operators"
+roles = ["console:operator"]
+
+[[identity.role_map]]
+claim = "groups"
+value = "mcpdef-admins"
+roles = ["console:admin"]

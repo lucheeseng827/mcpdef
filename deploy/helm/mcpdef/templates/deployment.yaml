@@ -23,12 +23,16 @@ spec:
     metadata:
       labels:
         {{- include "mcpdef.selectorLabels" . | nindent 8 }}
+      {{- if or .Values.rolloutOnConfigChange .Values.podAnnotations }}
       annotations:
+        {{- if .Values.rolloutOnConfigChange }}
         # roll the pod when the config changes
         checksum/config: {{ .Values.config | sha256sum }}
+        {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
+      {{- end }}
     spec:
       serviceAccountName: {{ include "mcpdef.fullname" . }}
       securityContext:
@@ -38,6 +42,14 @@ spec:
           image: {{ include "mcpdef.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["run", "--http", "--config", "/etc/mcpdef/mcpdef.toml"]
+          {{- with .Values.env }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.envFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           ports:
             - { name: mcp, containerPort: {{ .Values.service.mcpPort }} }
             {{- if .Values.admin.enabled }}
@@ -58,6 +70,9 @@ spec:
           volumeMounts:
             - { name: config, mountPath: /etc/mcpdef, readOnly: true }
             - { name: audit, mountPath: /var/lib/mcpdef }
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
       volumes:
         - name: config
           configMap:
@@ -68,6 +83,9 @@ spec:
             claimName: {{ include "mcpdef.fullname" . }}
         {{- else }}
           emptyDir: {}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

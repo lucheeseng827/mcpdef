@@ -124,3 +124,58 @@ async fn wasm_upstream_handshakes_lists_and_calls_through_the_gateway() {
         serde_json::json!("echoed")
     );
 }
+
+/// A sandbox trap fails the one call, as a tool error the ledger records as
+/// `upstream-error`, and the sandbox stays up for the next.
+#[tokio::test]
+async fn a_trapping_call_is_a_tool_error_audited_as_upstream_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let audit_path = dir.path().join("audit.log");
+    let mut policy = Policy::new();
+    policy.insert(
+        "wasm",
+        ServerPolicy {
+            allow_tools: Some(vec!["echo".into()]),
+            deny: vec![],
+        },
+    );
+    let mut gw = Gateway::new(policy, Ledger::open(&audit_path).unwrap(), "agent:test");
+    // The same server, except that a tool call spins until its fuel runs out.
+    let answer = "(else (call $pack (i32.const 5000) (call $strlen (i32.const 5000))))";
+    let spin = "(else (loop $spin (br $spin)) (unreachable))";
+    assert!(MCP_SERVER.contains(answer));
+    let wasm = wat::parse_str(MCP_SERVER.replace(answer, spin)).expect("valid WAT fixture");
+    let limits = SandboxLimits {
+        fuel_per_call: 5_000_000,
+        ..SandboxLimits::default()
+    };
+    let upstream = WasmUpstream::from_wasm(&wasm, limits).unwrap();
+    gw.add_upstream("wasm", Box::new(upstream)).await.unwrap();
+
+    for n in 0..2 {
+        let call = gw
+            .handle(req(
+                n,
+                method::TOOLS_CALL,
+                Some(serde_json::json!({ "name": "echo", "arguments": {} })),
+            ))
+            .await
+            .unwrap()
+            .unwrap();
+        let result = call.result.unwrap();
+        assert_eq!(result["isError"], serde_json::json!(true));
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("MCPdef error: upstream 'wasm' failed the call: sandbox: "),
+            "{text}"
+        );
+    }
+    let rules: Vec<(Option<String>, String)> = std::fs::read_to_string(&audit_path)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<mcpdef_audit::Record>(l).unwrap())
+        .map(|r| (r.rule, r.decision))
+        .collect();
+    let failed = (Some("upstream-error".to_string()), "deny".to_string());
+    assert_eq!(rules, [failed.clone(), failed]);
+}

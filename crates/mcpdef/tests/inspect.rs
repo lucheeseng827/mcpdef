@@ -71,7 +71,7 @@ fn echo_leaking(id: i64) -> Message {
 async fn secret_in_result_is_blocked_and_audited_in_enforce() {
     let dir = tempfile::tempdir().unwrap();
     let audit = dir.path().join("audit.log");
-    let mut gw = gw_with_inspect(&audit, Mode::Enforce).await;
+    let gw = gw_with_inspect(&audit, Mode::Enforce).await;
 
     let resp = gw.handle(echo_leaking(3)).await.unwrap().unwrap();
 
@@ -104,7 +104,7 @@ async fn secret_in_result_is_blocked_and_audited_in_enforce() {
 async fn secret_in_result_passes_through_in_warn() {
     let dir = tempfile::tempdir().unwrap();
     let audit = dir.path().join("audit.log");
-    let mut gw = gw_with_inspect(&audit, Mode::Warn).await;
+    let gw = gw_with_inspect(&audit, Mode::Warn).await;
 
     let resp = gw.handle(echo_leaking(3)).await.unwrap().unwrap();
 
@@ -129,7 +129,7 @@ async fn secret_in_result_passes_through_in_warn() {
 async fn clean_result_is_unaffected_in_enforce() {
     let dir = tempfile::tempdir().unwrap();
     let audit = dir.path().join("audit.log");
-    let mut gw = gw_with_inspect(&audit, Mode::Enforce).await;
+    let gw = gw_with_inspect(&audit, Mode::Enforce).await;
 
     // An ordinary echo (no secret / injection) is allowed straight through.
     let resp = gw

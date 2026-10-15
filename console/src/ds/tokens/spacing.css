@@ -1,0 +1,28 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* MCPdef — spacing + radii.
+ * The source dashboard uses literal px throughout rather than a named scale;
+ * these tokens name the values it actually uses (4/6/8/10/12/14/16/18/22/28/32)
+ * so new work stays on the same rhythm. Radii ARE tokenized in the source and
+ * are reproduced verbatim. [Intentional addition: the --sp-* scale — the source
+ * had no named spacing scale; values are lifted from observed usage, not snapped
+ * to a 4/8 grid.] */
+:root {
+  /* spacing scale */
+  --sp-1: 4px;
+  --sp-2: 6px;
+  --sp-3: 8px;
+  --sp-4: 10px;
+  --sp-5: 12px;
+  --sp-6: 14px;   /* default card/grid gap */
+  --sp-7: 16px;
+  --sp-8: 18px;   /* card padding */
+  --sp-9: 22px;
+  --sp-10: 28px;
+  --sp-11: 32px;  /* main content padding */
+
+  /* radii (from source) */
+  --radius: 10px;        /* cards, tables, tiles */
+  --radius-ctrl: 8px;    /* buttons, inputs, tags */
+  --radius-mark: 7px;    /* brand mark / avatar squircle */
+  --radius-pill: 999px;  /* badges, switches, meter fills */
+}

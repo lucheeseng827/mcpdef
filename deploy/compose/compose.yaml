@@ -2,23 +2,38 @@
 #
 #   1. cp mcpdef.example.toml mcpdef.toml   # then declare your MCP servers in it
 #   2. docker compose up -d                 # or: podman-compose up -d
-#   3. point MCP clients at  http://<vm>:7878/mcp
+#   3. point MCP clients at  http://<vm>:7878/mcp   (https:// with [gateway.tls])
 #      view the status UI at http://127.0.0.1:7879  (SSH-tunnel it; no auth)
 #
 # The admin port is bound to loopback (127.0.0.1) — it has no auth, so it is not
-# exposed off-box. Put a TLS-terminating reverse proxy + [gateway.auth] in front
-# of :7878 for real internet exposure (the binary has no in-process TLS).
+# exposed off-box. For real internet exposure, serve :7878 over TLS, with
+# [gateway.tls] in mcpdef.toml or a TLS-terminating reverse proxy in front, and
+# turn on [gateway.auth].
 services:
   mcpdef:
-    image: mancube/mcpdef:v0.2.2
+    image: mancube/mcpdef:v0.4.0
     command: ["run", "--http", "--config", "/etc/mcpdef/mcpdef.toml"]
     ports:
-      - "7878:7878"              # MCP Streamable HTTP (bring your own TLS proxy)
+      - "7878:7878"              # MCP Streamable HTTP ([gateway.tls], or your own TLS proxy)
       - "127.0.0.1:7879:7879"    # admin /metrics + status UI — loopback only
     volumes:
       - ./mcpdef.toml:/etc/mcpdef/mcpdef.toml:ro
       - mcpdef-audit:/var/lib/mcpdef   # tamper-evident audit ledger (persisted)
+      # A CA bundle, client certificate and key for [gateway.upstream_tls] and
+      # [server.tls], or the listener's own for [gateway.tls] mode = "files";
+      # name them there by their paths under /etc/mcpdef-tls.
+      # - ./tls:/etc/mcpdef-tls:ro
+    # Secrets, each at /run/secrets/<name>, which mcpdef.toml reads with
+    # `{ file = "/run/secrets/github-token" }`. The image runs as user 65532:
+    # give each file to it, readable by it alone, on the host:
+    #   sudo chown 65532:65532 secrets/github-token && sudo chmod 600 secrets/github-token
+    # secrets:
+    #   - github-token
     restart: unless-stopped
 
 volumes:
   mcpdef-audit:
+
+# secrets:
+#   github-token:
+#     file: ./secrets/github-token

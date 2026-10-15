@@ -11,8 +11,8 @@
 //! of a `429`).
 //!
 //! Two scopes compose: an optional **global** bucket (protects the whole
-//! gateway) and an optional **per-tool** bucket (one runaway tool can't starve
-//! the rest). Per-agent / per-principal limiting layers on with Phase-2 auth,
+//! gateway) and an optional **per-tool** bucket for each server's each tool
+//! (one runaway tool can't starve the rest). Per-agent / per-principal limiting layers on with Phase-2 auth,
 //! once calls carry a real authenticated identity.
 //!
 //! The clock is **injected** (`now: Instant`) so behavior is deterministic and
@@ -20,6 +20,7 @@
 //! instant plus offsets.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 use std::time::Instant;
 
 /// A classic token bucket: `capacity` tokens max, refilling at `refill_per_sec`.
@@ -64,8 +65,14 @@ impl TokenBucket {
 pub enum LimitScope {
     /// The gateway-wide bucket.
     Global,
-    /// The bucket for one specific tool.
+    /// The bucket for one server's tool.
     Tool,
+    /// The bucket for one server's resource reads.
+    Reads,
+    /// The bucket for one server's prompt gets.
+    Prompts,
+    /// The bucket for one server's completions.
+    Completions,
 }
 
 impl LimitScope {
@@ -73,6 +80,9 @@ impl LimitScope {
         match self {
             LimitScope::Global => "global",
             LimitScope::Tool => "tool",
+            LimitScope::Reads => "resource read",
+            LimitScope::Prompts => "prompt",
+            LimitScope::Completions => "completion",
         }
     }
 }
@@ -90,12 +100,25 @@ impl RateDecision {
     }
 }
 
-/// A per-tool + global token-bucket rate limiter.
+/// A per-tool + global token-bucket rate limiter. A server's resource reads
+/// share one bucket of their own, and its prompt gets another, each at the
+/// per-tool rate.
 #[derive(Debug, Clone)]
 pub struct RateLimiter {
     /// `(capacity, refill_per_sec)` template for lazily-created per-tool buckets.
     tool_template: Option<(f64, f64)>,
-    per_tool: HashMap<String, TokenBucket>,
+    /// One bucket per `(server, tool)`: two servers' tools of one name are two
+    /// tools, and spend apart.
+    per_tool: HashMap<(String, String), TokenBucket>,
+    /// One bucket per server for its resource reads, apart from the tools', so
+    /// no tool name can share one.
+    reads: HashMap<String, TokenBucket>,
+    /// One bucket per server for its prompt gets, apart from both.
+    prompts: HashMap<String, TokenBucket>,
+    /// One bucket per server for its completions, which a client asks for as
+    /// a user types: apart from the gets and reads they would otherwise
+    /// starve.
+    completions: HashMap<String, TokenBucket>,
     global: Option<TokenBucket>,
 }
 
@@ -115,27 +138,93 @@ impl RateLimiter {
             // store as (capacity, refill_per_sec) for TokenBucket::new
             tool_template: per_tool.map(|(rate, burst)| (burst, rate)),
             per_tool: HashMap::new(),
+            reads: HashMap::new(),
+            prompts: HashMap::new(),
+            completions: HashMap::new(),
             global: global.map(|(rate, burst)| TokenBucket::new(burst, rate, now)),
         })
     }
 
-    /// Check + spend one token for `tool`. The **global** bucket is checked first
-    /// (it guards the whole gateway); if it sheds the call, the per-tool bucket is
-    /// left untouched. A global token spent on a call the per-tool bucket then
-    /// rejects is an accepted approximation for a load-shedding heuristic.
-    pub fn check(&mut self, tool: &str, now: Instant) -> RateDecision {
-        if let Some(global) = &mut self.global {
+    /// Check + spend one token for `server`'s `tool`. The **global** bucket is
+    /// checked first (it guards the whole gateway); if it sheds the call, the
+    /// per-tool bucket is left untouched. A global token spent on a call the
+    /// per-tool bucket then rejects is an accepted approximation for a
+    /// load-shedding heuristic.
+    pub fn check(&mut self, server: &str, tool: &str, now: Instant) -> RateDecision {
+        let template = self.tool_template;
+        Self::spend(
+            &mut self.global,
+            &mut self.per_tool,
+            template,
+            (server.to_string(), tool.to_string()),
+            LimitScope::Tool,
+            now,
+        )
+    }
+
+    /// Check + spend one token for a `resources/read` on `server`: the global
+    /// bucket first, as for a tool, then the server's reads bucket, which takes
+    /// the per-tool rate.
+    pub fn check_read(&mut self, server: &str, now: Instant) -> RateDecision {
+        let template = self.tool_template;
+        Self::spend(
+            &mut self.global,
+            &mut self.reads,
+            template,
+            server.to_string(),
+            LimitScope::Reads,
+            now,
+        )
+    }
+
+    /// Check + spend one token for a `prompts/get` on `server`: the global
+    /// bucket first, then the server's prompts bucket, at the per-tool rate.
+    pub fn check_prompt(&mut self, server: &str, now: Instant) -> RateDecision {
+        let template = self.tool_template;
+        Self::spend(
+            &mut self.global,
+            &mut self.prompts,
+            template,
+            server.to_string(),
+            LimitScope::Prompts,
+            now,
+        )
+    }
+
+    /// Check + spend one token for a `completion/complete` on `server`: the
+    /// global bucket first, then the server's completions bucket, at the
+    /// per-tool rate.
+    pub fn check_completion(&mut self, server: &str, now: Instant) -> RateDecision {
+        let template = self.tool_template;
+        Self::spend(
+            &mut self.global,
+            &mut self.completions,
+            template,
+            server.to_string(),
+            LimitScope::Completions,
+            now,
+        )
+    }
+
+    fn spend<K: Eq + Hash>(
+        global: &mut Option<TokenBucket>,
+        buckets: &mut HashMap<K, TokenBucket>,
+        template: Option<(f64, f64)>,
+        key: K,
+        scope: LimitScope,
+        now: Instant,
+    ) -> RateDecision {
+        if let Some(global) = global {
             if !global.try_acquire(now) {
                 return RateDecision::Limited(LimitScope::Global);
             }
         }
-        if let Some((capacity, refill)) = self.tool_template {
-            let bucket = self
-                .per_tool
-                .entry(tool.to_string())
+        if let Some((capacity, refill)) = template {
+            let bucket = buckets
+                .entry(key)
                 .or_insert_with(|| TokenBucket::new(capacity, refill, now));
             if !bucket.try_acquire(now) {
-                return RateDecision::Limited(LimitScope::Tool);
+                return RateDecision::Limited(scope);
             }
         }
         RateDecision::Allow
@@ -180,13 +269,96 @@ mod tests {
         let t0 = Instant::now();
         // per-tool: 1 token/sec, burst 2. No global.
         let mut rl = RateLimiter::new(Some((1.0, 2.0)), None, t0).unwrap();
-        assert!(rl.check("a", t0).is_allow()); // a: 2 -> 1
-        assert!(rl.check("a", t0).is_allow()); // a: 1 -> 0
-        assert_eq!(rl.check("a", t0), RateDecision::Limited(LimitScope::Tool));
+        assert!(rl.check("s", "a", t0).is_allow()); // a: 2 -> 1
+        assert!(rl.check("s", "a", t0).is_allow()); // a: 1 -> 0
+        assert_eq!(
+            rl.check("s", "a", t0),
+            RateDecision::Limited(LimitScope::Tool)
+        );
         // A different tool has its own budget.
-        assert!(rl.check("b", t0).is_allow());
-        assert!(rl.check("b", t0).is_allow());
-        assert_eq!(rl.check("b", t0), RateDecision::Limited(LimitScope::Tool));
+        assert!(rl.check("s", "b", t0).is_allow());
+        assert!(rl.check("s", "b", t0).is_allow());
+        assert_eq!(
+            rl.check("s", "b", t0),
+            RateDecision::Limited(LimitScope::Tool)
+        );
+    }
+
+    #[test]
+    fn one_tool_name_on_two_servers_has_two_buckets() {
+        let t0 = Instant::now();
+        let mut rl = RateLimiter::new(Some((1.0, 1.0)), None, t0).unwrap();
+        assert!(rl.check("gh", "search", t0).is_allow());
+        assert_eq!(
+            rl.check("gh", "search", t0),
+            RateDecision::Limited(LimitScope::Tool)
+        );
+        // Another server's `search` is another tool, whatever its name.
+        assert!(rl.check("fs", "search", t0).is_allow());
+    }
+
+    #[test]
+    fn a_servers_reads_have_their_own_bucket_behind_the_global_one() {
+        let t0 = Instant::now();
+        // per-tool (and per-server reads): 1 token/sec, burst 2; global burst 5.
+        let mut rl = RateLimiter::new(Some((1.0, 2.0)), Some((1.0, 5.0)), t0).unwrap();
+        assert!(rl.check_read("fs", t0).is_allow());
+        assert!(rl.check_read("fs", t0).is_allow());
+        assert_eq!(
+            rl.check_read("fs", t0),
+            RateDecision::Limited(LimitScope::Reads)
+        );
+        // A tool named like the server does not share its bucket, and another
+        // server's reads have their own.
+        assert!(rl.check("fs", "fs", t0).is_allow());
+        assert!(rl.check_read("db", t0).is_allow());
+        // The global bucket counts reads and tool calls alike: 5 are spent.
+        assert_eq!(
+            rl.check("s", "other", t0),
+            RateDecision::Limited(LimitScope::Global)
+        );
+        assert_eq!(LimitScope::Reads.as_str(), "resource read");
+    }
+
+    #[test]
+    fn a_servers_prompt_gets_have_their_own_bucket_behind_the_global_one() {
+        let t0 = Instant::now();
+        // Per tool, per server's reads and per server's prompts: 1 token/sec,
+        // burst 1; global burst 4.
+        let mut rl = RateLimiter::new(Some((1.0, 1.0)), Some((1.0, 4.0)), t0).unwrap();
+        assert!(rl.check_prompt("docs", t0).is_allow());
+        assert_eq!(
+            rl.check_prompt("docs", t0),
+            RateDecision::Limited(LimitScope::Prompts)
+        );
+        // A read and a tool named like the server keep their own buckets.
+        assert!(rl.check_read("docs", t0).is_allow());
+        assert!(rl.check("docs", "docs", t0).is_allow());
+        // The global bucket counts every kind: 4 are spent, one of them by the
+        // prompt get the prompts bucket refused.
+        assert_eq!(
+            rl.check_prompt("wiki", t0),
+            RateDecision::Limited(LimitScope::Global)
+        );
+        assert_eq!(LimitScope::Prompts.as_str(), "prompt");
+    }
+
+    #[test]
+    fn a_servers_completions_have_their_own_bucket_behind_the_global_one() {
+        let t0 = Instant::now();
+        let mut rl = RateLimiter::new(Some((1.0, 1.0)), Some((1.0, 3.0)), t0).unwrap();
+        assert!(rl.check_completion("docs", t0).is_allow());
+        assert_eq!(
+            rl.check_completion("docs", t0),
+            RateDecision::Limited(LimitScope::Completions)
+        );
+        // Typing out a completion leaves the server's gets their bucket.
+        assert!(rl.check_prompt("docs", t0).is_allow());
+        assert_eq!(
+            rl.check_completion("wiki", t0),
+            RateDecision::Limited(LimitScope::Global)
+        );
+        assert_eq!(LimitScope::Completions.as_str(), "completion");
     }
 
     #[test]
@@ -194,9 +366,12 @@ mod tests {
         let t0 = Instant::now();
         // global: 1 token/sec, burst 2. No per-tool.
         let mut rl = RateLimiter::new(None, Some((1.0, 2.0)), t0).unwrap();
-        assert!(rl.check("a", t0).is_allow()); // global 2 -> 1
-        assert!(rl.check("b", t0).is_allow()); // global 1 -> 0 (different tool, same global)
-        assert_eq!(rl.check("c", t0), RateDecision::Limited(LimitScope::Global));
+        assert!(rl.check("s", "a", t0).is_allow()); // global 2 -> 1
+        assert!(rl.check("s", "b", t0).is_allow()); // global 1 -> 0 (different tool, same global)
+        assert_eq!(
+            rl.check("s", "c", t0),
+            RateDecision::Limited(LimitScope::Global)
+        );
     }
 
     #[test]
@@ -204,7 +379,10 @@ mod tests {
         let t0 = Instant::now();
         // global burst 1; per-tool burst 5. Global is the binding constraint.
         let mut rl = RateLimiter::new(Some((1.0, 5.0)), Some((1.0, 1.0)), t0).unwrap();
-        assert!(rl.check("a", t0).is_allow());
-        assert_eq!(rl.check("a", t0), RateDecision::Limited(LimitScope::Global));
+        assert!(rl.check("s", "a", t0).is_allow());
+        assert_eq!(
+            rl.check("s", "a", t0),
+            RateDecision::Limited(LimitScope::Global)
+        );
     }
 }

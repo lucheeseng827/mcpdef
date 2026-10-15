@@ -1,0 +1,8 @@
+# Codex: merge into $DIR/home/.codex/config.toml (`mcpdef connect codex --write` does it)
+[mcp_servers.mcpdef]
+url = "https://127.0.0.1:8443/mcp"
+
+# or:
+codex mcp add mcpdef --url https://127.0.0.1:8443/mcp
+
+The gateway's certificate is from its own CA. Before starting Codex: export CODEX_CA_CERTIFICATE=$DIR/state/tls/ca.crt

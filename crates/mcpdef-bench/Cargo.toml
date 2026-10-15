@@ -1,0 +1,31 @@
+[package]
+name = "mcpdef-bench"
+description = "MCPdef — load harness for the gateway: added overhead, denied-call cost, slow-neighbour isolation and idle memory. A measurement tool, never published."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+# A measurement tool, not part of the engine: `ops/release.yml` publishes an explicit crate
+# list, and this keeps `cargo publish` from ever taking it by accident.
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Everything here is already in the workspace's lockfile through the engine crates; the
+# harness adds no new third-party crate to the tree.
+anyhow.workspace = true
+# In-process mock MCP upstreams speaking Streamable HTTP.
+axum.workspace = true
+clap.workspace = true
+# The load generator's client. Same TLS/feature set as the engine.
+reqwest.workspace = true
+# The crypto provider that client needs installed: ring, as in the engine.
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# A scratch directory per scenario: generated config, the gateway's ledger, its log.
+tempfile.workspace = true
+tokio.workspace = true

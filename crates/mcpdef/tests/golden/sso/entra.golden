@@ -1,0 +1,47 @@
+# Signing people in to MCPdef's console at Microsoft Entra ID.
+#
+# At the provider:
+#   1. App registrations > New registration: a Web redirect URI,
+#      https://mcpdef.example.com:7879/callback, and
+#      https://mcpdef.example.com:7879/ beside it, for signing out. Its
+#      Application (client) ID is client_id, and its Directory (tenant) ID is in
+#      the issuer.
+#   2. Certificates & secrets > New client secret: its secret goes in
+#      MCPDEF_OIDC_CLIENT_SECRET, where MCPdef runs.
+#   3. App roles: MCPdef.Viewer, MCPdef.Operator and MCPdef.Admin, for users and
+#      groups, which role_map gives their console roles.
+#   4. Enterprise applications > the app > Users and groups: assign people, or
+#      groups, to the roles.
+#
+# Then this goes in the config (or run this again with --write),
+# MCPDEF_OIDC_CLIENT_SECRET is set where MCPdef runs, and the gateway is
+# restarted. Someone the provider gives no console role is shown the claims
+# MCPdef received of them: map one to a role with [[identity.role_map]].
+
+[gateway.admin]
+public_url = "https://mcpdef.example.com:7879"
+
+[gateway.admin.oidc]
+issuer = "https://login.microsoftonline.com/00000000-0000-0000-0000-000000000000/v2.0"
+client_id = "mcpdef-console"
+client_secret = { env = "MCPDEF_OIDC_CLIENT_SECRET" }
+scopes = ["profile", "email"]
+
+[identity]
+subject_claim = "oid"
+roles_claims = []
+
+[[identity.role_map]]
+claim = "roles"
+value = "MCPdef.Viewer"
+roles = ["console:viewer"]
+
+[[identity.role_map]]
+claim = "roles"
+value = "MCPdef.Operator"
+roles = ["console:operator"]
+
+[[identity.role_map]]
+claim = "roles"
+value = "MCPdef.Admin"
+roles = ["console:admin"]

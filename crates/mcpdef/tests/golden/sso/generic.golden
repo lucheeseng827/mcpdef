@@ -1,0 +1,43 @@
+# Signing people in to MCPdef's console at an OpenID Connect provider.
+#
+# At the provider:
+#   1. Register a confidential client, client ID mcpdef-console, for the
+#      authorization code flow with PKCE (S256); its secret goes in
+#      MCPDEF_OIDC_CLIENT_SECRET, where MCPdef runs.
+#   2. Its redirect URI: https://mcpdef.example.com:7879/callback; its
+#      post-logout redirect URI: https://mcpdef.example.com:7879/.
+#   3. ID tokens signed with RS256, RS384, RS512, PS256, ES256 or ES384,
+#      carrying the person's roles in a roles claim, or their groups in a groups
+#      claim (add the scope that asks for it to scopes), mapped below.
+#
+# Then this goes in the config (or run this again with --write),
+# MCPDEF_OIDC_CLIENT_SECRET is set where MCPdef runs, and the gateway is
+# restarted. Someone the provider gives no console role is shown the claims
+# MCPdef received of them: map one to a role with [[identity.role_map]].
+
+[gateway.admin]
+public_url = "https://mcpdef.example.com:7879"
+
+[gateway.admin.oidc]
+issuer = "https://idp.example.com"
+client_id = "mcpdef-console"
+client_secret = { env = "MCPDEF_OIDC_CLIENT_SECRET" }
+scopes = ["profile", "email"]
+
+[identity]
+roles_claims = ["roles"]
+
+[[identity.role_map]]
+claim = "groups"
+value = "mcpdef-viewers"
+roles = ["console:viewer"]
+
+[[identity.role_map]]
+claim = "groups"
+value = "mcpdef-operators"
+roles = ["console:operator"]
+
+[[identity.role_map]]
+claim = "groups"
+value = "mcpdef-admins"
+roles = ["console:admin"]

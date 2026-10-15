@@ -1,0 +1,8 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* MCPdef — keyframes. In a stylesheet of their own, not a <style> element, so
+ * the console's content security policy (style-src 'self') lets them apply. */
+@keyframes egFade { from { opacity: 0 } to { opacity: 1 } }
+@keyframes egRise { from { opacity: 0; transform: translateY(8px) } to { opacity: 1; transform: none } }
+@media (prefers-reduced-motion: reduce) {
+  @keyframes egRise { from { opacity: 0 } to { opacity: 1 } }
+}

@@ -10,21 +10,43 @@
 //! Dependency direction is one-way: the other `mcpdef-*` crates depend on this
 //! one, never the reverse.
 
+pub mod wire;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// MCP / JSON-RPC method names the gateway recognizes (a non-exhaustive subset;
-/// any other method is still forwarded — it is just not specially governed yet).
+/// MCP / JSON-RPC method names the gateway recognizes. It answers or routes
+/// these, and refuses any other request.
 pub mod method {
     pub const INITIALIZE: &str = "initialize";
     pub const INITIALIZED: &str = "notifications/initialized";
     pub const TOOLS_LIST: &str = "tools/list";
     pub const TOOLS_CALL: &str = "tools/call";
+    /// A server's word that its tools changed. An upstream sends it to the
+    /// gateway, which lists that upstream's tools again, and the gateway sends
+    /// it on to a client that can hear it.
+    pub const TOOLS_LIST_CHANGED: &str = "notifications/tools/list_changed";
     pub const RESOURCES_LIST: &str = "resources/list";
+    pub const RESOURCES_TEMPLATES_LIST: &str = "resources/templates/list";
     pub const RESOURCES_READ: &str = "resources/read";
+    pub const RESOURCES_SUBSCRIBE: &str = "resources/subscribe";
+    pub const RESOURCES_UNSUBSCRIBE: &str = "resources/unsubscribe";
     pub const PROMPTS_LIST: &str = "prompts/list";
     pub const PROMPTS_GET: &str = "prompts/get";
+    /// Suggestions for a prompt's or a resource template's arguments.
+    pub const COMPLETION_COMPLETE: &str = "completion/complete";
     pub const PING: &str = "ping";
+    /// 2026-07-28: what a client asks to learn the versions and capabilities a
+    /// server speaks, replacing `initialize` as the way to find that out.
+    /// Servers **MUST** implement it.
+    pub const SERVER_DISCOVER: &str = "server/discover";
+    /// What a server asks a client for: something from the user, a completion
+    /// from the client's model, the client's roots. A 2025-11-25 server sends
+    /// each as a request of its own; a 2026-07-28 one names it in an
+    /// `InputRequiredResult` ([`crate::wire::unanswerable_input`]).
+    pub const ELICITATION_CREATE: &str = "elicitation/create";
+    pub const SAMPLING_CREATE_MESSAGE: &str = "sampling/createMessage";
+    pub const ROOTS_LIST: &str = "roots/list";
 }
 
 /// The JSON-RPC protocol version string MCP uses.

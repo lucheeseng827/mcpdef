@@ -25,12 +25,31 @@ audit  = "./mcpdef-audit/audit.log"  # append-only, hash-linked ledger
                                    #   <name>` overrides this. Must live HERE, under [gateway].
 # allowed_origins = ["https://app.example.com"]  # extra Origins beyond loopback (DNS-rebind defense)
 # max_inflight = 512               # cap concurrent HTTP requests; excess → 503 + Retry-After
+# Which MCP revisions the listener serves. Default `legacy` (2025-11-25 only), so
+# upgrading never changes what an existing deployment accepts. `dual` adds the
+# stateless 2026-07-28 wire on the same endpoint; `modern` serves only it.
+# wire = "dual"
+# state_dir = "./mcpdef-state"     # what MCPdef makes for itself: the local CA of [gateway.tls]
 # pins = "./mcpdef-pins.toml"        # enable tool-def pinning + rug-pull detection:
                                    #   on connect MCPdef pins each tool's definition (TOFU); if a
                                    #   server later changes a tool, the call is denied + audited
                                    #   as `rug-pull`. Manage with `mcpdef pin` / `mcpdef diff-tools`.
 # upstream_timeout_ms = 30000      # fail a tools/call whose upstream doesn't reply in time
                                    #   (audited as `upstream-timeout`) instead of hanging the gateway.
+                                   #   Also bounds each upstream's opening, at startup and on every
+                                   #   restart: one that does not open in time starts down and is retried.
+# watch_config = true              # reload when this file, or a file it names, changes (checked
+                                   #   every 30 s). `kill -HUP` reloads either way. A reload applies
+                                   #   whole or not at all, and never drops a call in flight.
+# strict = true                    # every warning is an error: a secret written in this file, a
+                                   #   secret file others can read, insecure_skip_verify, credentials
+                                   #   in the clear. Refused at `validate`, at start and at a reload;
+                                   #   and an upstream that does not open fails the start.
+                                   #   `mcpdef validate --strict` makes the same check, for CI.
+# tool_namespace = "prefix"        # list each tool as `<prefix>__<name>` (`github__list_issues`),
+                                   #   the prefix a server's `prefix` or else its id. Off by default:
+                                   #   each tool as its server names it, and a name two servers offer
+                                   #   listed once, from the first, with a warning (an error if strict).
 
 # Availability: token-bucket rate limits on tools/call (ARCHITECTURE §5b). Over-limit
 # calls get a tool-error result + a `rate-limited` audit event (the stdio analog of a 429).
@@ -49,15 +68,31 @@ global_burst     = 200
 allow_private = true               # default: MCPdef commonly fronts internal/localhost MCP servers
 require_https = true               # default: public destinations must use HTTPS (private/loopback may be http)
 
+# TLS towards HTTPS upstreams, and towards the IdP a `jwks_uri` names. With no
+# table, an upstream is verified against Mozilla's roots, bundled into the
+# binary. A server's own [server.tls] goes over this one key by key (see
+# `remote-tools` below). Files are PEM, read at each connection, so a
+# certificate renewed in place is used from the next one; a reload reconnects
+# the upstreams whose files changed. `mcpdef egress show` prints the profile
+# each HTTPS upstream ends up with.
+# [gateway.upstream_tls]
+# roots       = "bundled"                           # bundled (default) · system (the host's store; honours SSL_CERT_FILE) · both
+# ca          = ["/etc/mcpdef/ca/corp-root.pem"]    # more roots: a private CA
+# crl         = ["/etc/mcpdef/ca/corp-root.crl"]    # every CA on a server's chain needs its CRL here
+# min_version = "1.2"                               # or "1.3"
+
 # Inline injection / secret-exfil scanning of untrusted content. Tool DESCRIPTIONS
 # are scanned at connect (a "line-jumping" / tool-poisoning attempt hides the tool)
 # and tool-call RESULTS are scanned per call (a leaked credential or injected
 # instruction is refused before it reaches the model). A curated, high-precision
 # starter rule pack (prompt-injection phrases + secret patterns: AWS/Slack/GitHub/
 # Stripe keys, PEM private keys). Opt-in — start with `warn` (log only) before
-# `enforce` (block).
+# `enforce` (block), or `redact` (block as enforce does, but rewrite a secret in a
+# result as [REDACTED:<rule>] and pass the result on, only once the whole result,
+# read again, holds nothing the pack finds; an injection, or a secret redaction
+# cannot reach, is blocked as enforce blocks it).
 [gateway.inspect]
-mode = "off"                       # off (default) · warn (log findings) · enforce (hide/deny)
+mode = "off"                       # off (default) · warn (log findings) · enforce (hide/deny) · redact
 # Extend the built-in rule pack with your own patterns (both default empty):
 injection_phrases = []             # extra injection phrases, matched case-INsensitively (e.g. "exfiltrate the")
 secret_substrings = []             # extra secret substrings, matched case-sensitively (e.g. an internal token prefix "acme_sk_")
@@ -66,10 +101,68 @@ secret_substrings = []             # extra secret substrings, matched case-sensi
 # API (/api/v1/status|servers|stats|audit), and a built-in status UI at `/`. Runs
 # on a SEPARATE port from the MCP data path, and carries NO auth of its own — bind
 # it to loopback or keep it behind your own network policy / an authenticating
-# proxy. Off by default.
+# proxy. Off by default. For each HTTPS upstream, /api/v1/servers shows the
+# certificate it presented, and /metrics when that certificate expires
+# (mcpdef_upstream_cert_expiry_seconds, a Unix time). For each upstream sent
+# credentials, it shows when they were last taken and last failed, and when
+# they expire (mcpdef_credential_expiry_seconds: an oauth2 token, and a
+# client_cert). Neither shows a secret, nor one a url holds.
 [gateway.admin]
 enabled = false                    # set true to serve /metrics + the status UI
 listen  = "127.0.0.1:7879"         # bind wider (e.g. "0.0.0.0:7879") only behind a network boundary
+# The admin listener serves [gateway.tls]'s TLS, unless it has its own:
+# [gateway.admin.tls]
+# mode = "off"                     # e.g. plain HTTP on loopback, for a Prometheus scrape
+
+# TLS on the gateway's own listener (`mcpdef run --http` / `mcpdef up`). Off by
+# default. `self-signed` serves a certificate a local CA of MCPdef's own issues
+# for 30 days at a time, and issues again before it runs out; the CA is made
+# once, under `state_dir`, and can vouch for these names and no others, so
+# name them first. `mcpdef tls init` makes it and prints how each client
+# trusts it; `mcpdef tls show` shows what is served. A listen address other
+# than loopback with neither TLS nor [gateway.auth] on is warned about, and
+# refused under `strict`.
+# [gateway.tls]
+# mode = "self-signed"             # off (default) | files | self-signed
+# hostnames = ["mcpdef.internal"]  # besides localhost, 127.0.0.1, ::1 and the listen address
+# `files`: a certificate cert-manager or certbot writes, read again at each reload
+# (with `watch_config`, when it changes):
+# mode = "files"
+# cert = "/etc/mcpdef/tls/tls.crt"            # the certificate, then its intermediates
+# key  = { file = "/etc/mcpdef/tls/tls.key" }  # unencrypted PEM, readable by MCPdef alone
+
+# mTLS: ask each client for a certificate from the agents' CAs, and take one of
+# its names as who it is. `optional` serves a client without one as no one;
+# `required` refuses it at the handshake. A reload reads `ca` and `crl` again
+# (with `watch_config`, when they change), and a certificate a new CRL revokes
+# is refused from its next request, on a connection already open too. The
+# identity is the audit identity, `cert:<identity>`, or the `actor` behind a
+# token's subject. With no PKI of your own, `mcpdef tls issue --client <name>`
+# issues a workload one from the local CA, and prints the `ca` and `crl` that
+# take it: `<state_dir>/tls/ca.crt` and `<state_dir>/tls/ca.crl`.
+# [gateway.tls.client_auth]
+# mode = "required"                       # off (default) | optional | required
+# ca = ["/etc/mcpdef/tls/agents-ca.pem"]  # what a client's certificate chains to: a SPIFFE trust bundle, say
+# crl = ["/etc/mcpdef/tls/agents.crl"]    # optional: every CA in a client's chain needs its CRL here
+# identity = "spiffe"                     # spiffe | san-dns | san-email | subject-cn
+# trust_domains = ["prod.acme.internal"]  # spiffe only
+#
+# The roles a certificate holds: every entry whose `identity`, exact or a glob,
+# matches gives its roles. One no entry maps holds none.
+# [[identity.cert_map]]
+# identity = "spiffe://prod.acme.internal/ns/ci/*"
+# roles = ["reader"]
+
+# Behind a proxy that terminates TLS in front of MCPdef (Envoy, Istio):
+# the certificate it forwards for each client is read from the proxy's
+# addresses alone, never from anyone else's, and checked and read as
+# [gateway.tls.client_auth] says, which then needs no TLS of its own. For
+# Envoy's XFCC, set it on the route to MCPdef (forward_client_cert_details:
+# SANITIZE_SET), with the certificate in it (set_current_client_cert_details:
+# cert: true, and chain: true for one an intermediate CA issues).
+# [gateway.trusted_proxy]
+# cidrs = ["10.0.0.0/8"]                          # the addresses the proxy connects from
+# client_cert_header = "x-forwarded-client-cert"  # or "client-cert" (RFC 9440, the default)
 
 # OAuth 2.1 termination (HTTP listener only). When enabled, every POST to /mcp
 # must carry a valid `Authorization: Bearer <JWT>`; MCPdef validates it per request
@@ -85,10 +178,13 @@ listen  = "127.0.0.1:7879"         # bind wider (e.g. "0.0.0.0:7879") only behin
 # resource = "https://mcpdef.acme.internal/mcp"         # this gateway's canonical URI (the token audience)
 # jwks     = "./jwks.json"                            # pinned keys: a JWKS file (or inline JSON starting with `{`)
 # jwks_uri = "https://auth.example.com/.well-known/jwks.json"  # …or fetch at startup (egress-guarded). Prefer `jwks`.
+# methods  = ["bearer", "mtls"]                       # bearer (default) | mtls | both; mtls needs [gateway.tls.client_auth]
+# require  = "all"                                    # with both: any (default) or all; with all, the certificate is the actor
 
 # RBAC roles layered over the allowlist for authenticated callers (HTTP + auth).
 # A caller "holds" a role when its `name` appears among the token's scopes or
-# `roles` claim. A tools/call is allowed only if some held role grants it; grants
+# `roles` claim, or among the roles [[identity.cert_map]] gives its client
+# certificate. A tools/call is allowed only if some held role grants it; grants
 # are `"server-glob:tool-glob"` (a bare `"tool"` grants it on any server). With no
 # [[role]] defined the gate is off (the allowlist alone decides).
 # [[role]]
@@ -112,6 +208,21 @@ listen  = "127.0.0.1:7879"         # bind wider (e.g. "0.0.0.0:7879") only behin
 # tools   = ["delete_*"]             # optional; globs. omit = any tool
 # agents  = ["agent:ci-*"]           # optional; globs on the audit identity. omit = any caller
 # args    = [ { path = "name", glob = "prod-*" } ]   # AND-ed; dotted paths (e.g. "target.env")
+#
+# A `transform` rule rewrites a tool call's arguments before the allow/deny
+# rules judge them, and edits what comes back before inspect sees it. Every
+# transform rule that matches applies, in order.
+# [[policy]]
+# name     = "cap-page-size"
+# effect   = "transform"
+# tools    = ["list_*"]
+# set_args = [ { path = "per_page", clamp = { max = 100 } } ]  # set / default / remove = true / clamp
+# on_error = "deny"                  # deny (default) | skip: when an edit cannot apply
+#
+# [[policy]]
+# name   = "no-secrets-out"
+# effect = "transform"
+# result = [ { redact = "secrets" }, { mask = "user.email" }, { truncate = 65536 } ]  # redact / mask / remove / truncate
 
 # Named, reusable allow/deny PROFILES. Define an allow/deny set once and apply it
 # across servers (DRY), or scope the whole gateway with one as the active profile.
@@ -137,13 +248,24 @@ transport = "stdio"
 command   = ["mcp-server-github"]
 tools     = ["list_issues", "get_file_contents"]
 deny      = ["delete_*"]
+# Which MCP revision this server speaks. Default 2025-11-25 (the `initialize`
+# handshake). Set "2026-07-28" for a stateless server: MCPdef then opens it with
+# server/discover and stamps every request with the version, its identity and its
+# capabilities. "auto" asks the server for `initialize` and uses what the answer
+# proves: a result means 2025-11-25 (and the handshake is already done), a refusal
+# only a modern server gives means 2026-07-28. Works on every transport — that
+# probe is the opening request, not an extra one ahead of it.
+# spec      = "auto"
 # Token broker (stdio): MCPdef injects this upstream's brokered credential into the
-# child's environment (the spec's mechanism for stdio servers). The credential
-# lives in MCPdef's config, not the server's — and a downstream client's bearer is
-# never passed through to the upstream. Use real secret management in production;
-# the inert placeholder below is deliberately NOT a real-looking token.
+# child's environment (the spec's mechanism for stdio servers). The credential is
+# MCPdef's to hold, not the server's — and a downstream client's bearer is never
+# passed through to the upstream. Each value is a secret (docs/CONFIG.md § Secrets),
+# read at every start of the server, so a restart picks up a rotated one:
 [server.env]
-GITHUB_TOKEN = "set-me-from-your-secret-store"
+GITHUB_TOKEN = { file = "/run/secrets/github-token" }  # a secret mount, readable by mcpdef alone
+# GITHUB_TOKEN = { env = "GITHUB_TOKEN" }             # or mcpdef's own; no other stdio server inherits it
+# GITHUB_TOKEN = { exec = ["op", "read", "op://Infra/github/token"] }  # or what a command writes (no shell)
+LOG_LEVEL = "info"                                     # a string is the value itself: fine for what is no secret
 
 # A second stdio upstream that inherits the `readonly` profile (get_*/list_*/…),
 # and appends one more deny on top of the profile's `*_secret`.
@@ -153,6 +275,13 @@ transport = "stdio"
 command   = ["mcp-server-filesystem", "--root", "./data"]
 profile   = "readonly"
 deny      = ["write_*"]             # appended to the profile's deny set
+# Its resources are exposed only as listed: unset exposes none. In a URI pattern
+# `*` stays within one path segment and a `**` segment crosses any number, and
+# a URI is judged, and sent, with its `..` resolved. See docs/CONFIG.md.
+# resources          = ["file:///srv/data/docs/**"]
+# resource_templates = ["file:///{*}"]
+# Its prompts too, by name: unset exposes none.
+# prompts            = ["summarize_*"]
 
 # A Streamable HTTP upstream. mcpdef POSTs to this endpoint and, if the server
 # only speaks the legacy 2024-11-05 transport (405 on POST), automatically falls
@@ -161,7 +290,39 @@ deny      = ["write_*"]             # appended to the profile's deny set
 id        = "remote-tools"
 transport = "streamable-http"
 url       = "https://mcp.internal.example/mcp"
-tools     = ["search", "fetch"]
+tools     = ["web_search", "fetch"]   # not `search`: `files` above offers that name
+# prefix    = "remote"             # its tools' prefix with tool_namespace = "prefix"
+# max_inflight = 16                # calls that may wait on this upstream at once (1 for wasm)
+# Its own TLS profile, over [gateway.upstream_tls]:
+# [server.tls]
+# ca          = ["/etc/mcpdef/ca/team-a.pem"]       # replaces the gateway's `ca`
+# client_cert = "/run/secrets/to-remote.crt"       # mTLS: the certificate, then any intermediates
+# client_key  = { file = "/run/secrets/to-remote.key" }  # unencrypted PEM, readable by mcpdef alone
+# client_key  = { env = "MCPDEF_TO_REMOTE_KEY" }   # or from mcpdef's environment; no stdio server inherits it
+# client_key  = { exec = ["op", "read", "op://Infra/to-remote/private key"] }  # or what a command writes (no shell)
+# connect_to  = "10.0.0.5"                         # dial this IP; the certificate is still checked for the URL's host
+# insecure_skip_verify = false                     # never in production: warned about, and audited per connection
+# pin_sha256  = ["kW1vBnQpOt7wBNmvZG2itgd9KUyIIeTffw1ZmJMRQXg="]  # trust this key alone (a self-signed upstream); `mcpdef tls pin <url>` prints it
+# How mcpdef proves itself to it: a header on every request, marked sensitive.
+# The secret is read when the upstream opens, and again once on a 401, so a
+# token rotated in its file is picked up without a restart. /api/v1/servers
+# shows how the credentials fare, as `credential`.
+# [server.auth]
+# kind     = "bearer"                               # Authorization: Bearer <token>
+# token    = { file = "/run/secrets/remote-token" }
+# kind     = "header"                               # or a header of its own:
+# name     = "X-Api-Key"
+# value    = { env = "REMOTE_API_KEY" }
+# kind     = "basic"                                # or Authorization: Basic
+# username = "mcpdef"
+# password = { exec = ["op", "read", "op://Infra/remote/password"] }
+# kind     = "oauth2"                               # or a token by the OAuth client credentials grant,
+# token_url     = "https://idp.internal/oauth2/token"  # fetched through the egress guard with [gateway.upstream_tls]
+# client_id     = "mcpdef-remote"
+# client_secret = { file = "/run/secrets/remote-client-secret" }  # read at each fetch
+# scopes        = ["mcp:tools"]
+# resource      = "https://mcp.internal.example/mcp"   # RFC 8707; default: this server's url; "" for none
+# client_auth   = "client_secret_post"                 # default: client_secret_basic
 
 # A forced legacy HTTP+SSE upstream (no probe): GET opens the SSE stream, the
 # server's `endpoint` event names the POST URL, and responses return over SSE.

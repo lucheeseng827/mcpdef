@@ -1,0 +1,36 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+/* MCPdef — typography.
+ * Two families, no third. IBM Plex Sans for everything a human reads; IBM Plex
+ * Mono for everything a machine emitted (ids, hashes, tool names, config keys,
+ * JSON, counts inside tables). The switch to mono is itself a signal: "this is
+ * literal data." Type is tight and information-dense — headings carry negative
+ * tracking, body is 14px, labels 12px UPPERCASE-tracked. */
+:root {
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* size ramp (px) */
+  --text-h1: 22px;    /* page title */
+  --text-h2: 18px;    /* modal title */
+  --text-kpi: 28px;   /* the big metric */
+  --text-title: 14px; /* card header / section title */
+  --text-body: 14px;  /* default body */
+  --text-sm: 13px;    /* controls, table cells */
+  --text-label: 12px; /* field labels, badges, meta */
+  --text-micro: 10px; /* brand sub-line, nav group labels */
+
+  /* weights */
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  /* tracking */
+  --track-tight: -0.4px;  /* h1 */
+  --track-snug: -0.2px;   /* wordmark */
+  --track-caps: 1.2px;    /* UPPERCASE nav/eyebrow labels */
+
+  /* line height */
+  --leading-tight: 1.2;
+  --leading-body: 1.6;
+}

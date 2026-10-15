@@ -19,6 +19,7 @@ use mcpdef::listener::{serve_http_on, AuthState, HttpConfig, JwksRefresher};
 use mcpdef::Gateway;
 use mcpdef_audit::Ledger;
 use mcpdef_auth::Verifier;
+use mcpdef_core::wire::WireMode;
 use mcpdef_policy::{Policy, Rbac, ServerPolicy};
 use mcpdef_transport::{EgressPolicy, StdioChild};
 use serde::Serialize;
@@ -92,6 +93,7 @@ fn spawn_mock() -> Box<StdioChild> {
 /// A loopback client that does NOT route through any ambient proxy (the test env
 /// sets HTTPS_PROXY, which would otherwise hijack the 127.0.0.1 request).
 fn client() -> reqwest::Client {
+    mcpdef_transport::install_crypto_provider();
     reqwest::Client::builder().no_proxy().build().unwrap()
 }
 
@@ -111,6 +113,7 @@ async fn start_authed() -> (String, tempfile::TempDir) {
         listen: addr.to_string(),
         allowed_origins: vec![],
         max_inflight: None,
+        wire: WireMode::default(),
     };
     tokio::spawn(serve_http_on(
         listener,
@@ -157,6 +160,7 @@ async fn start_authed_needing_refresh() -> (String, tempfile::TempDir) {
         listen: addr.to_string(),
         allowed_origins: vec![],
         max_inflight: None,
+        wire: WireMode::default(),
     };
     tokio::spawn(serve_http_on(
         listener,
@@ -315,4 +319,143 @@ async fn protected_resource_metadata_is_served() {
     let v: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
     assert_eq!(v["resource"], RESOURCE);
     assert_eq!(v["authorization_servers"][0], ISSUER);
+}
+
+/// Like [`start_authed_needing_refresh`], with `refresher` as the listener's
+/// JWKS refresher.
+async fn start_authed_refreshing_with(refresher: JwksRefresher) -> (String, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let ledger = Ledger::open(dir.path().join("audit.log")).unwrap();
+    let mut gw =
+        Gateway::new(allow_echo(), ledger, "agent:test").with_rbac(Some(reader_grants_echo()));
+    gw.add_upstream("mock", spawn_mock()).await.unwrap();
+    let stale = TEST_JWKS.replace("test-key-1", "old-key");
+    let verifier = Verifier::from_jwks_json(&stale, ISSUER, RESOURCE).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cfg = HttpConfig {
+        listen: addr.to_string(),
+        allowed_origins: vec![],
+        max_inflight: None,
+        wire: WireMode::default(),
+    };
+    tokio::spawn(serve_http_on(
+        listener,
+        gw,
+        cfg,
+        Some(AuthState::with_refresher(verifier, refresher)),
+    ));
+    (format!("http://{addr}"), dir)
+}
+
+/// An identity provider on a private CA: its `jwks_uri` is fetched with
+/// `[gateway.upstream_tls]`, as a reload last stored it.
+#[tokio::test]
+async fn a_jwks_uri_on_a_private_ca_is_refreshed_with_the_gateway_tls_profile() {
+    use arc_swap::ArcSwap;
+    use mcpdef::listener::Fetching;
+    use mcpdef_testkit::{HttpsUpstream, Pki};
+    use mcpdef_transport::TlsSettings;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let pki = Pki::new("idp CA");
+    let app = Router::new().route("/jwks.json", get(|| async { TEST_JWKS }));
+    let idp = HttpsUpstream::start_app(&pki.server(&["127.0.0.1"]), app).await;
+    let jwks_uri = format!("https://127.0.0.1:{}/jwks.json", idp.addr().port());
+    let tok = token_with_roles(&["reader"]);
+    let status = |base: String| {
+        let tok = tok.clone();
+        async move {
+            client()
+                .post(format!("{base}/mcp"))
+                .bearer_auth(&tok)
+                .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{}}}"#)
+                .send()
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+
+    // With the bundled roots alone, the refresh cannot reach the IdP: closed.
+    let bundled = Arc::new(ArcSwap::from_pointee(Fetching::default()));
+    let (base, _a) =
+        start_authed_refreshing_with(JwksRefresher::following(jwks_uri.clone(), bundled)).await;
+    assert_eq!(status(base).await, 401);
+
+    // Settings stored after the listener started, as a reload stores them,
+    // are the ones the refresh goes out with.
+    let fetching = Arc::new(ArcSwap::from_pointee(Fetching::default()));
+    let (base, _b) =
+        start_authed_refreshing_with(JwksRefresher::following(jwks_uri, Arc::clone(&fetching)))
+            .await;
+    fetching.store(Arc::new(Fetching {
+        tls: TlsSettings {
+            ca: vec![pki.write_root(dir.path(), "idp")],
+            ..TlsSettings::default()
+        },
+        ..Fetching::default()
+    }));
+    assert_eq!(status(base).await, 200);
+}
+
+/// A client key a command writes, for the `jwks_uri` fetch, is read off the
+/// async workers: while the command takes its time, the listener's other tasks
+/// go on, though its runtime has one thread.
+#[tokio::test(flavor = "current_thread")]
+async fn a_jwks_refresh_whose_client_key_a_command_writes_leaves_the_runtime_free() {
+    use arc_swap::ArcSwap;
+    use mcpdef::listener::Fetching;
+    use mcpdef_secrets::SecretRef;
+    use mcpdef_testkit::{HttpsUpstream, Pki};
+    use mcpdef_transport::{IdentityFiles, TlsSettings};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let pki = Pki::new("idp CA");
+    let app = Router::new().route("/jwks.json", get(|| async { TEST_JWKS }));
+    let idp = HttpsUpstream::start_app(&pki.server(&["127.0.0.1"]), app).await;
+    let jwks_uri = format!("https://127.0.0.1:{}/jwks.json", idp.addr().port());
+    let leaf = Pki::new("client CA").client("spiffe://example.org/mcpdef");
+    let (cert, key) = leaf.write(dir.path(), "gateway");
+    let fetching = Arc::new(ArcSwap::from_pointee(Fetching {
+        tls: TlsSettings {
+            ca: vec![pki.write_root(dir.path(), "idp")],
+            identity: Some(IdentityFiles {
+                cert,
+                key: SecretRef::Exec {
+                    program: "sh".into(),
+                    args: vec!["-c".into(), format!("sleep 0.5; cat '{}'", key.display())],
+                },
+            }),
+            ..TlsSettings::default()
+        },
+        ..Fetching::default()
+    }));
+    let (base, _audit) =
+        start_authed_refreshing_with(JwksRefresher::following(jwks_uri, fetching)).await;
+
+    let ticks = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&ticks);
+    let ticker = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    let status = client()
+        .post(format!("{base}/mcp"))
+        .bearer_auth(token_with_roles(&["reader"]))
+        .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{}}}"#)
+        .send()
+        .await
+        .unwrap()
+        .status();
+    ticker.abort();
+    assert_eq!(status, 200);
+    let ticks = ticks.load(Ordering::Relaxed);
+    assert!(ticks >= 20, "{ticks} ticks while the JWKS was fetched");
 }

@@ -16,7 +16,7 @@ use mcpdef_core::{Id, Message};
 use mcpdef_transport::{HttpClient, Transport};
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_stream::wrappers::BroadcastStream;
 
@@ -142,6 +142,64 @@ fn build_app() -> Router {
         .route("/mcp", post(modern_mcp))
         .route("/legacy", get(legacy_sse))
         .route("/legacy/messages", post(legacy_post))
+        // The same legacy bridge, but answering an unexpected POST the way a
+        // real framework does rather than the way axum's router does: a body,
+        // and not a JSON one. Express sends exactly this for `Cannot POST /sse`.
+        // A modern (2026-07-28) endpoint: it answers `initialize` normally, and
+        // answers anything else the way the revision requires — `404` carrying a
+        // JSON-RPC `-32601`. One route exercises both the opening probe and a
+        // request sent after the wire is resolved.
+        .route(
+            "/modern-404",
+            post(|body: String| async move {
+                let msg = Message::from_json_line(body.trim()).ok();
+                let id = msg
+                    .as_ref()
+                    .and_then(|m| m.id.clone())
+                    .unwrap_or(Id::Num(0));
+                match msg.as_ref().and_then(|m| m.method()) {
+                    Some("initialize") => (
+                        StatusCode::OK,
+                        Message::result(
+                            id,
+                            serde_json::json!({
+                                "protocolVersion": "2026-07-28",
+                                "capabilities": { "tools": {} },
+                                "serverInfo": { "name": "mock", "version": "0" }
+                            }),
+                        )
+                        .to_json_line(),
+                    ),
+                    _ => (
+                        StatusCode::NOT_FOUND,
+                        Message::error(id, -32601, "no such method here").to_json_line(),
+                    ),
+                }
+            }),
+        )
+        // One that refuses even the opening request, with a modern error body.
+        .route(
+            "/modern-refuses",
+            post(|body: String| async move {
+                let id = Message::from_json_line(body.trim())
+                    .ok()
+                    .and_then(|m| m.id)
+                    .unwrap_or(Id::Num(0));
+                let mut err = Message::error(id, -32022, "unsupported protocol version");
+                err.error.as_mut().unwrap()["data"] =
+                    serde_json::json!({ "supported": ["2026-07-28"] });
+                (StatusCode::BAD_REQUEST, err.to_json_line())
+            }),
+        )
+        .route(
+            "/framework",
+            get(legacy_sse).post(|| async {
+                (
+                    StatusCode::NOT_FOUND,
+                    "<!DOCTYPE html>\n<html><body>Cannot POST /framework</body></html>",
+                )
+            }),
+        )
         .route("/resume", get(resume_sse))
         .route("/resume/messages", post(|| async { StatusCode::ACCEPTED }))
         .with_state(state)
@@ -226,6 +284,27 @@ async fn streamable_probe_falls_back_to_legacy() {
     assert_eq!(resp.result.unwrap()["serverInfo"]["name"], "mock");
 }
 
+/// The same fallback, against a server that answers the probe with a body.
+///
+/// `streamable_probe_falls_back_to_legacy` above gets axum's own `405`, which
+/// carries nothing — so it passed even while the fallback was broken for real
+/// servers. A framework-generated `404` or `405` carries HTML, and decoding that
+/// strictly returned `Err` from the probe before the fallback branch was ever
+/// reached. The body of an error status is only interesting when it is JSON-RPC.
+#[tokio::test]
+async fn streamable_probe_falls_back_when_the_error_page_is_not_json() {
+    let base = spawn_app().await;
+    let mut c = HttpClient::streamable(format!("{base}/framework")).unwrap();
+
+    c.send(init()).await.unwrap();
+    let resp = recv_msg(&mut c).await;
+    assert!(
+        resp.is_response(),
+        "an HTML error page must not stop the legacy fallback"
+    );
+    assert_eq!(resp.result.unwrap()["serverInfo"]["name"], "mock");
+}
+
 #[tokio::test]
 async fn legacy_sse_resumes_with_last_event_id() {
     let base = spawn_app().await;
@@ -298,4 +377,139 @@ async fn default_policy_allows_loopback_upstream() {
     let base = spawn_app().await;
     let mut c = HttpClient::streamable(format!("{base}/mcp")).unwrap();
     assert!(c.send(init()).await.is_ok());
+}
+
+/// A modern upstream's JSON-RPC error is the answer to the request, not a
+/// transport failure.
+///
+/// The revision has a modern server return `404` with a `-32601` body for a
+/// method it does not implement, and `400` with `-32022` or `-32020` for an
+/// unsupported version or a header mismatch. Dropping those bodies for a
+/// `TransportError` means the gateway can only report "gateway error", and the
+/// reason the upstream stated never reaches whoever could act on it.
+#[tokio::test]
+async fn a_modern_error_body_reaches_the_caller_instead_of_a_transport_failure() {
+    let base = spawn_app().await;
+    let mut c = HttpClient::streamable(format!("{base}/modern-404")).unwrap();
+
+    // The opening request succeeds, so the wire resolves to Streamable HTTP.
+    c.send(init()).await.unwrap();
+    let resp = recv_msg(&mut c).await;
+    assert_eq!(resp.result.unwrap()["serverInfo"]["name"], "mock");
+
+    // A later method the upstream does not implement: `404` + `-32601`. That is
+    // its answer, and it has to survive the hop.
+    c.send(Message::request(Id::Num(2), "prompts/list", None))
+        .await
+        .expect("a 404 carrying JSON-RPC is an answer, not a send failure");
+    let resp = recv_msg(&mut c).await;
+    assert!(resp.is_response(), "got: {resp:?}");
+    assert_eq!(
+        resp.error.as_ref().and_then(|e| e["code"].as_i64()),
+        Some(-32601),
+        "the upstream's own error must survive the hop: {resp:?}"
+    );
+}
+
+/// The same, on the *opening* request. An error only a modern server produces
+/// settles the transport question — it is a Streamable-HTTP endpoint that did
+/// not like this request — so the client is left able to retry with a version
+/// the upstream named, rather than holding a failed transport.
+#[tokio::test]
+async fn a_probe_refused_with_a_modern_error_resolves_rather_than_failing() {
+    let base = spawn_app().await;
+    let mut c = HttpClient::streamable(format!("{base}/modern-refuses")).unwrap();
+
+    c.send(init())
+        .await
+        .expect("a modern refusal is an answer, not a dead transport");
+    let resp = recv_msg(&mut c).await;
+
+    assert_eq!(
+        resp.error.as_ref().and_then(|e| e["code"].as_i64()),
+        Some(-32022)
+    );
+    assert_eq!(
+        resp.error.as_ref().unwrap()["data"]["supported"],
+        serde_json::json!(["2026-07-28"]),
+        "the versions it does serve are the useful half: {resp:?}"
+    );
+}
+
+/// A later `initialize` settles the revision afresh, and one that settles none
+/// clears the old one rather than repeating it to a session that never agreed
+/// to it. MCPdef itself opens once; this is `HttpClient` keeping its own state
+/// right for any caller that initializes again, as the spec has a client do
+/// when its session expires.
+#[tokio::test]
+async fn a_later_initialize_that_settles_no_revision_clears_the_old_one() {
+    // Records each POST's method and `MCP-Protocol-Version`. The first
+    // `initialize` settles on 2025-06-18; the second names no revision at all.
+    type Sent = Vec<(String, Option<String>)>;
+    let seen: Arc<Mutex<Sent>> = Arc::default();
+    let inits = Arc::new(AtomicU64::new(0));
+    let app = Router::new().route(
+        "/mcp",
+        post({
+            let (seen, inits) = (Arc::clone(&seen), Arc::clone(&inits));
+            move |headers: HeaderMap, body: String| {
+                let (seen, inits) = (Arc::clone(&seen), Arc::clone(&inits));
+                async move {
+                    let msg = Message::from_json_line(body.trim()).unwrap();
+                    let method = msg.method().unwrap_or_default().to_string();
+                    let version = headers
+                        .get("mcp-protocol-version")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    seen.lock().unwrap().push((method.clone(), version));
+                    let result = if method == "initialize" {
+                        if inits.fetch_add(1, Ordering::SeqCst) == 0 {
+                            serde_json::json!({ "protocolVersion": "2025-06-18" })
+                        } else {
+                            serde_json::json!({ "capabilities": {} })
+                        }
+                    } else {
+                        serde_json::json!({})
+                    };
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        Message::result(msg.id.clone().unwrap(), result).to_json_line(),
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let mut c = HttpClient::streamable(format!("http://{addr}/mcp")).unwrap();
+    for (id, method) in [
+        (1, "initialize"),
+        (2, "ping"),
+        (3, "initialize"),
+        (4, "ping"),
+    ] {
+        c.send(Message::request(Id::Num(id), method, None))
+            .await
+            .unwrap();
+        recv_msg(&mut c).await;
+    }
+
+    let seen = seen.lock().unwrap();
+    let sent: Vec<_> = seen
+        .iter()
+        .map(|(method, version)| (method.as_str(), version.as_deref()))
+        .collect();
+    assert_eq!(
+        sent,
+        [
+            ("initialize", None),
+            ("ping", Some("2025-06-18")),
+            ("initialize", None),
+            ("ping", None),
+        ],
+        "the second session settled no revision, so none is sent for it"
+    );
 }

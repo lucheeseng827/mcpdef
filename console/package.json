@@ -1,0 +1,26 @@
+{
+  "name": "mcpdef-console",
+  "private": true,
+  "version": "0.4.0",
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "MCPdef console: a Vite + React front end on the MCPdef design system, served by the gateway's admin listener.",
+  "scripts": {
+    "dev": "node server/mcpdef-mock.mjs & vite",
+    "mock": "node server/mcpdef-mock.mjs",
+    "build": "vite build && node scripts/embed.mjs",
+    "preview": "vite preview",
+    "serve": "npm run build && node server/mcpdef-mock.mjs",
+    "check": "node scripts/check.mjs"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "axe-core": "4.10.3",
+    "playwright": "1.56.1",
+    "vite": "^6.0.7"
+  }
+}

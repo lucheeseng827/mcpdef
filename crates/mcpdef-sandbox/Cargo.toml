@@ -3,12 +3,16 @@ name = "mcpdef-sandbox"
 description = "MCPdef — in-path WASM sandbox: run an untrusted .wasm MCP server (core module or wasm32-wasip2 component) under Wasmtime with fuel/memory/epoch limits, capability-scoped WASI, and a per-destination egress allowlist (OSS engine, Phase 4)."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 # `wit/` is needed to build (the `bindgen!` macro reads it); the test fixture (a
 # nested wasm32-wasip2 guest crate + its built .wasm) is not needed by dependents,
 # so keep it out of the published crate.
 exclude = ["tests/fixtures"]
+
+[lints]
+workspace = true
 
 [dependencies]
 mcpdef-core.workspace = true

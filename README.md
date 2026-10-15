@@ -64,6 +64,51 @@ gateway/router owns *model* requests (provider routing, fallback, token/spend).
 and its **tool servers**, governing the tools / resources / prompts it invokes plus
 the initialize/capabilities handshake. That keeps each layer's threat model crisp.
 
+### Inside the binary
+
+[![MCPdef architecture — how one tools/call moves through the single mcpdef binary: front ends, OAuth authentication, the gateway loop, the policy / pin / rate-limit / inspect gates, then a transport or the Wasmtime sandbox to the upstream server, with every outcome written to the hash-linked audit ledger](docs/images/mcpdef-architecture-oss.png)](docs/images/mcpdef-architecture-oss.png)
+
+Every box is one crate in the one binary, and the arrows are the path a single
+`tools/call` takes:
+
+1. **Front ends.** A client speaks stdio (`mcpdef run`) or Streamable HTTP
+   (`mcpdef run --http` / `mcpdef up`). The HTTP listener binds loopback by
+   default, validates `Origin` (a cross-site request gets `403`), sheds load at an
+   optional in-flight cap (`503`) and caps request bodies at 2 MiB.
+2. **Auth (HTTP only).** `mcpdef-auth` validates the per-request bearer JWT
+   against a JWKS and serves the RFC 9728 metadata and challenge. The resulting
+   *principal* becomes the audit identity and the input to RBAC.
+3. **Gateway loop.** Answers `initialize`, `tools/list` and `ping` itself, listing
+   each tool name once (a name two servers offer is reported, or kept apart
+   with `tool_namespace = "prefix"`), routes `tools/call` through the gates,
+   gathers `resources/list` and `prompts/list` from every server, routes each
+   `resources/read`, `prompts/get` and `completion/complete` through the same
+   gates to the server that has what it names, and refuses everything else:
+   nothing reaches a server ungoverned. A server that says its tools changed
+   has them listed again and checked as at connect, and a stdio client is told.
+4. **Gates, in order.** `mcpdef-policy` (deny-by-default allowlist and profiles,
+   then `transform` rules that rewrite a call's arguments, the per-argument
+   allow/deny rules that judge what they made, and RBAC role grants) → `mcpdef-pin` (a tool whose definition drifted from its
+   pin is hidden and denied) → `mcpdef-ratelimit` (token buckets, per server's
+   tool and global) → the upstream → `transform` rules that redact, mask, remove or cut
+   what it answered → `mcpdef-inspect` (scans tool descriptions at connect and when they change,
+   and results per call, for injection and secret exfiltration, refusing or, in `redact` mode,
+   rewriting the secrets in place). A refusal is an MCP tool-error the
+   model can read and correct.
+5. **Transport or sandbox.** `mcpdef-transport` reaches a stdio child (credentials
+   injected via `[server.env]`), a Streamable-HTTP server, or a legacy HTTP+SSE
+   server, behind an egress/SSRF guard with DNS pinning. `mcpdef-sandbox` sits
+   behind the *same* transport seam and runs an untrusted `.wasm` server
+   in-process under Wasmtime (fuel, memory and epoch limits, egress allowlist), so
+   every gate applies to it unchanged.
+6. **Ledger.** The gateway appends **every** outcome, allow or deny, to the
+   append-only hash-linked ledger in `mcpdef-audit`; `mcpdef audit tail` exports
+   it to a SIEM. `mcpdef-core` (the JSON-RPC 2.0 envelope and decision types) is
+   shared by every crate.
+
+The same walkthrough, with the per-gate deny reasons a client sees, is on the
+[docs site](https://mcpdef.mancube.net/docs/architecture.html).
+
 ### Plug your MCP servers in
 
 Point your client at `mcpdef` and declare each server once. Minimal example —
@@ -114,14 +159,33 @@ tool layer.)
 ## Observability
 
 Turn on `[gateway.admin]` (off by default, a separate port from the MCP data
-path) for a **read-only, self-served view** of a running gateway — no external
-stack required: a built-in status UI at `/`, Prometheus `GET /metrics`, and a
-small JSON API (`/api/v1/{status,servers,stats,audit}`). The UI shows the fronted
-servers + their effective allowlists, a live audit tail (allow/deny), and
-counters; metrics are native in-process counters incremented at each governed
-decision (no log parsing).
+path) for a **self-served view** of a running gateway — no external stack
+required: the console at `/`, Prometheus `GET /metrics`, and the JSON API it
+reads (`/api/v1/*`, [docs/API.md](./docs/API.md)). The console shows an
+overview, the audit log (paged, filtered, its chain verified, exported, tailed
+live), the servers and every tool each offers with why one is hidden, policy,
+inspect's findings, the connections and their certificates, and each client's
+entry; an operator reloads the config, restarts or tests an upstream and
+approves pin drift from it. Metrics are native in-process counters incremented
+at each governed decision (no log parsing). Each upstream's health is there too:
+whether it is up, its certificate, and how the credentials MCPdef sends it fare
+— when they were last taken or refused, and when a token or client certificate
+expires — for an alert before one runs out. No secret is shown, nor one a URL
+holds.
 
-![The built-in mcpdef status UI: fronted servers with allow/deny allowlists and a live governed-call audit tail](./docs/screenshots/admin-ui.png)
+The console signs people in at your identity provider over **OpenID Connect**
+(Keycloak, Entra ID, Okta, Google, authentik or any other; `mcpdef sso init
+--provider …` writes the config and says what to set at the provider), and
+maps their groups or roles to `console:viewer`, `console:operator` and
+`console:admin` ([docs/SSO.md](./docs/SSO.md)). What each of them does there
+is in the ledger, as theirs.
+**SAML is supported through a broker**, not inside MCPdef: a SAML identity
+provider (ADFS, Entra ID, Okta, Shibboleth) signs people in through Keycloak,
+which checks the assertions and signs them in to MCPdef over OpenID Connect —
+[docs/SAML.md](./docs/SAML.md), and a compose file to try it,
+[deploy/compose/sso-saml](./deploy/compose/sso-saml).
+
+![The MCPdef console's overview: calls, allowed and denied, denials by rule, the most-called tools and the latest denials](./docs/screenshots/console.png)
 
 `/metrics` feeds any Prometheus/Grafana setup — e.g. the cluster lab ships a
 ready-made dashboard ([deploy/cluster-lab](./deploy/cluster-lab)):
@@ -163,7 +227,7 @@ ok: quickstart.toml — 1 upstream(s), config valid
 $ ./target/debug/mcpdef servers list --config quickstart.toml
 ID           TRANSPORT        PROFILE    ALLOWLISTED TOOLS              DENY
 mock         stdio            -          echo                           delete_*
-1 server(s) governed · allowlist deny-by-default · `mcpdef run` for the live tool list
+1 server(s) governed · allowlist deny-by-default · `mcpdef tools list` for the live tool list
 
 $ ./target/debug/mcpdef call echo --args '{"msg":"hi"}' --config quickstart.toml
 echo: {"msg":"hi"}
@@ -261,9 +325,9 @@ The **core-module** path (`transport = "wasm"`) runs against an empty linker —
 ambient capability, so the `opt` egress step never applies. The **component** path
 (`transport = "wasm-component"`) adds capability-scoped WASI whose only grant is
 outbound TCP, and that is what the egress allowlist gates (default deny-all). The
-Phase-3 policy-as-code engine and inline injection scan (result-content scanning /
-redaction) slot into the governance step when they land; today's shipped gates
-are the ones shown.
+Phase-3 policy-as-code engine (with its `transform` rules over arguments and
+results) and the inline injection / secret scan (refusing, or redacting in place)
+sit in the governance step; the gates shown are those a sandboxed call meets.
 
 ## Install / build
 
@@ -281,8 +345,8 @@ cargo run   -p mcpdef -- servers list
 ```
 
 The single binary fronts every agent action, so low latency and low memory are
-product requirements, not nice-to-haves — that is why it is Rust + Tokio + the
-official `rmcp` SDK, and why the **Wasmtime** sandbox (Rust's strongest area) is
+product requirements, not nice-to-haves — that is why it is Rust + Tokio, and why
+the **Wasmtime** sandbox (Rust's strongest area) is
 in-binary rather than a SaaS add-on. Because Wasmtime's Cranelift backend embeds
 a JIT, the fully-static `*-linux-musl` build has to be validated against that
 backend (the JIT path may fall back to glibc/distroless) — hence "static-ish,"
@@ -292,9 +356,10 @@ interpreter) is available for locked-down hosts that forbid W^X pages.
 ## Usage / config sketch
 
 MCPdef runs with one config file declaring the servers it fronts. Allowlists are
-the fast, declarative first gate (tools today; resource-URI allowlists are
-parsed but reserved); the Phase-3 policy engine will do the richer
-per-agent/per-arg logic. Every knob is documented in
+the fast, declarative first gate (tools, and resource-URI and prompt
+allowlists, where none listed exposes none); the policy engine (`[[policy]]`)
+does the richer per-agent/per-arg logic, and its `transform` rules rewrite a
+call's arguments and redact, mask, remove or cut what comes back. Every knob is documented in
 [docs/CONFIG.md](./docs/CONFIG.md); a full commented example is
 [`mcpdef.example.toml`](./mcpdef.example.toml).
 
@@ -327,6 +392,7 @@ wasm_allow_egress = ["10.0.0.7:8443"]               # outbound TCP allowlist (ip
 ```sh
 mcpdef run  --config mcpdef.toml                     # serve the client over stdio (mcpdef up = run --http)
 mcpdef call list_issues --args '{}'                # one-shot governed tool call (audited)
+mcpdef tools list --cost                           # what each server's tools cost every agent's context
 mcpdef audit verify                                # offline chain check (--head/--count: verify against a seal)
 mcpdef audit tail --format ocsf                    # SIEM export (also cef/syslog/json)
 mcpdef pin && mcpdef diff-tools                      # approve tool definitions / detect rug-pulls
@@ -334,13 +400,19 @@ mcpdef pin && mcpdef diff-tools                      # approve tool definitions 
 
 ## Documentation
 
+The same docs are readable online, with no GitHub account or checkout needed, at
+**[mcpdef.mancube.net/docs](https://mcpdef.mancube.net/docs/index.html)**.
+
 | Doc | What's in it |
 |---|---|
 | [README.md](./README.md) | This file — overview, the gap, a verified quickstart session + audit record, install, the boundary note. |
 | [docs/CONFIG.md](./docs/CONFIG.md) | **Reference.** Every knob: `mcpdef.toml` keys (gateway, auth, rate limits, egress, roles, profiles, servers/sandbox), CLI flags, on-disk data formats (ledger, pin store). |
 | [docs/API.md](./docs/API.md) | **Reference.** The wire surface as built: HTTP listener endpoints + status codes, the MCP method dispatch, the `tools/call` gate order and every deny rule/error a client can see. |
+| [docs/WIRE.md](./docs/WIRE.md) | **Reference.** The two MCP eras — legacy `2025-11-25` and stateless `2026-07-28` — what each revision changed, how to pick one per listener and per upstream, and which parts of the newer revision are not implemented yet. |
 | [docs/OPERATIONS.md](./docs/OPERATIONS.md) | **Runbook.** Deploy, what state to back up, the audit-ledger verification procedure (incl. out-of-band seals), monitoring, symptom-first troubleshooting, security posture. |
 | [docs/DEPLOY.md](./docs/DEPLOY.md) | **Deploy.** Run on a cloud VM (docker/podman-compose) or Kubernetes (the [`deploy/helm/mcpdef`](./deploy/helm/mcpdef) chart), plus the importable Grafana dashboard. |
+| [docs/SSO.md](./docs/SSO.md) | **Guide.** Signing in to the console at Keycloak, Entra ID, Okta, Google, authentik or any OpenID Connect provider: `mcpdef sso init`, each provider's particulars, and what to do when it does not work. |
+| [docs/SAML.md](./docs/SAML.md) | **Guide.** SAML sign-in to the console through a broker: why, a compose file to try it, and ADFS, Entra ID, Okta and Shibboleth behind Keycloak. |
 | [docs/DOCKERHUB.md](./docs/DOCKERHUB.md) | The published container image — tags, a quick `docker run`, and where MCPdef fits in a stack. |
 
 Repo-level docs:
@@ -356,21 +428,21 @@ The crate layout is in the table below.
 
 ## Status
 
-**Phase 1 + Phase 1.5 — landed; in progress.** The Phase-0 design doc set is
-complete, and the gateway ships as a working Cargo workspace under
-[`crates/`](./crates):
+**0.4.0.** The design doc set is complete, and the gateway ships as a
+working Cargo workspace under [`crates/`](./crates):
 
 | Crate | Role |
 |---|---|
-| [`mcpdef`](./crates/mcpdef) | the single binary — config, the gateway proxy loop, the downstream **Streamable HTTP listener** (`run --http` / `up`, with **OAuth 2.1** termination + **RBAC**), CLI (`run`/`up`/`call`/`validate`/`version`/`servers list`/`audit verify`/`audit tail`/`egress show`/`pin`/`diff-tools`) |
-| [`mcpdef-core`](./crates/mcpdef-core) | the normalized JSON-RPC 2.0 envelope + MCP method/decision types |
+| [`mcpdef`](./crates/mcpdef) | the single binary — config, the gateway proxy loop, the downstream **Streamable HTTP listener** (`run --http` / `up`, with **OAuth 2.1** termination + **RBAC**, and **TLS** from files or a local CA of its own), CLI (`run`/`up`/`bridge`/`connect`/`call`/`validate`/`doctor`/`version`/`servers list`/`tools list`/`audit verify`/`audit tail`/`egress show`/`tls init`/`tls show`/`tls export-ca`/`tls issue`/`tls revoke`/`tls pin`/`pin`/`diff-tools`) |
+| [`mcpdef-core`](./crates/mcpdef-core) | the normalized JSON-RPC 2.0 envelope + MCP method/decision types (MCPdef's own — the project has no MCP SDK dependency) |
 | [`mcpdef-transport`](./crates/mcpdef-transport) | the `Transport` trait + stdio child (with **token-broker env injection**), **Streamable HTTP + legacy HTTP+SSE bridge**, and the **egress/SSRF guard** (metadata block + DNS pinning) |
 | [`mcpdef-sandbox`](./crates/mcpdef-sandbox) | the **in-path WASM sandbox** — run an untrusted MCP server under **Wasmtime** behind the same `Transport` seam, with **fuel** (CPU) + **memory** caps and an **optional wall-clock deadline** (epoch). Two paths: a **core module** against an **empty linker** (zero ambient capability — no fs/net/clock), or a **`wasm32-wasip2` component** (the `mcpdef:server` WIT world) under **capability-scoped WASI** whose only grant is outbound TCP, gated by a **per-destination egress allowlist** (default deny-all; reuses the egress IP classification) |
 | [`mcpdef-policy`](./crates/mcpdef-policy) | the deny-by-default tool allowlist (**glob allow/deny + reusable named profiles**), the **RBAC** role→grant model, and the **policy-as-code** rule engine — per-agent / per-argument allow/deny (`[[policy]]`) layered over the allowlist |
+| [`mcpdef-secrets`](./crates/mcpdef-secrets) | **secret references** — a value from a file, a variable or the config itself, read when needed into memory wiped on drop, and never printed |
 | [`mcpdef-auth`](./crates/mcpdef-auth) | the **OAuth 2.1 Resource Server** — per-request bearer JWT validation against a JWKS (asymmetric-only, algorithm-confusion-safe), RFC 8707/9068 audience, RFC 9728 Protected Resource Metadata + `WWW-Authenticate` challenge |
 | [`mcpdef-pin`](./crates/mcpdef-pin) | **tool-def pinning + rug-pull detection** — canonical tool-def hashing + a persistent pin store |
 | [`mcpdef-ratelimit`](./crates/mcpdef-ratelimit) | **token-bucket rate limiting** (per-tool + global) for the `tools/call` hot path |
-| [`mcpdef-inspect`](./crates/mcpdef-inspect) | **inline injection / secret-exfil scanning** — a rule pack over tool descriptions (at connect) + tool-call results (per call), with off/warn/enforce modes |
+| [`mcpdef-inspect`](./crates/mcpdef-inspect) | **inline injection / secret-exfil scanning** — a rule pack over tool descriptions (at connect) + tool-call results (per call), with off/warn/enforce/redact modes |
 | [`mcpdef-audit`](./crates/mcpdef-audit) | the append-only, hash-linked, tamper-evident ledger + offline `verify` + OCSF/CEF/syslog SIEM export |
 
 What works today: a transport-multiplexing reverse proxy that fronts upstream MCP
@@ -384,22 +456,60 @@ call to the hash-linked ledger. HTTP upstreams pass through an **egress/SSRF
 guard** (cloud-metadata always blocked, private/loopback configurable, HTTPS for
 public hosts, DNS-pinned). Allowlists support **globs and named profiles**, and a
 gateway can be scoped to an **active profile** (`mcpdef run --profile readonly`) to
-cut the tool surface an agent sees. With `[gateway] pins` set, MCPdef **pins each
+cut the tool surface an agent sees. `mcpdef tools list --cost` shows what that
+saves: the bytes each server's tools take up in `tools/list`, which every agent
+reads into its context, and an estimate of the tokens. With `[gateway] pins`
+set, MCPdef **pins each
 tool's definition** and denies + audits a `rug-pull` if a server changes it after
-approval (`mcpdef pin` / `mcpdef diff-tools`). It defends its own availability with
+approval (`mcpdef pin` / `mcpdef diff-tools`), including while it runs: a server
+that sends `notifications/tools/list_changed` has its tools listed and checked
+again. A 2026-07-28 server that must ask the user something first can: its
+`InputRequiredResult` is scanned, audited and passed back to a client that can
+answer it, and the client's retry is governed as a new call. It defends its own
+availability with
 **token-bucket rate limiting** (per-tool + global → a `rate-limited` audit) and a
 **per-call upstream timeout** (a wedged upstream is failed as `upstream-timeout`,
-not left to hang). Clients reach mcpdef over **stdio** or the **downstream
+not left to hang), and it **supervises its upstreams**: they open in parallel, one
+that cannot start does not stop the gateway, and one that goes down is restarted
+with backoff while calls to it fail fast (`upstream-down`). It **reloads its config**
+on `SIGHUP`, or on a change with `[gateway] watch_config`, whole or not at all and
+without dropping a call in flight. Clients reach mcpdef over **stdio** or the **downstream
 Streamable HTTP listener** (`mcpdef run --http`) — `Origin`-validated (cross-site →
-`403`), loopback-bound, with an opt-in in-flight load-shedding cap. That listener
-can **terminate OAuth 2.1**: with `[gateway.auth]` set, every request must carry a
+`403`), loopback-bound, with an opt-in in-flight load-shedding cap. It serves
+**HTTPS** itself with `[gateway.tls]`: a certificate from files, as cert-manager or
+certbot writes it, swapped whole at a reload, or one a **local CA** of its own
+issues and renews, the CA made by `mcpdef tls init`, which prints how each client
+trusts it, and **name-constrained** to the gateway's own names, so that clients
+refuse a certificate its key signs for any other. With **mTLS**
+(`[gateway.tls.client_auth]`) it asks each client for a certificate, checked
+against the agents' CAs and CRLs at the handshake and again after a reload
+brings new ones, and takes one of its names as who the client is: a **SPIFFE
+ID** under the X509-SVID rules, a DNS name, an email address or the subject's
+common name. That identity is the audit identity (`cert:…`), or the `actor`
+behind a token's subject, and `[[identity.cert_map]]` gives it its roles. Behind a
+proxy such as **Envoy or Istio** terminating TLS in front (`[gateway.trusted_proxy]`), it
+reads the certificate the proxy forwards, in RFC 9440's `Client-Cert` or in XFCC,
+from the proxy's addresses alone, and checks it the same way. That listener
+can **terminate OAuth 2.1**: with `[gateway.auth]` set, a request must carry a
 valid bearer JWT (validated per request as an OAuth 2.1 **Resource Server** —
-signature against the JWKS, `aud`/`iss`/`exp`/`nbf`, asymmetric-only), a
-missing/invalid token gets `401` + a `WWW-Authenticate` challenge pointing at the
-**RFC 9728 Protected Resource Metadata** document, and the token's subject becomes
-the audit identity. **RBAC** roles (`[[role]]`, keyed on the token's scopes/roles)
+signature against the JWKS, `aud`/`iss`/`exp`/`nbf`, asymmetric-only), or, as its
+`methods` and `require` say, a client certificate in its place or beside it. A
+request refused for its token, missing or invalid, gets `401` + a `WWW-Authenticate`
+challenge pointing at the **RFC 9728 Protected Resource Metadata** document, and one
+refused for its certificate `403`; a token's subject becomes the audit identity.
+**RBAC** roles (`[[role]]`, keyed on the token's scopes/roles,
+or on the roles `[[identity.cert_map]]` gives a certificate without one)
 layer over the allowlist, and a stdio upstream's brokered credential is injected
-via **`[server.env]`** so a client's bearer is never passed through. An upstream
+via **`[server.env]`** so a client's bearer is never passed through; each value can
+be read from a file, a variable or a command at every start of the server, so the
+config need not hold it. An HTTP upstream gets its own via **`[server.auth]`**: a
+bearer token, a header of its own or HTTP Basic, read again when the upstream
+answers `401`, or a token MCPdef fetches by the **OAuth client credentials
+grant**, kept until 30 s before it expires, with one fetch however many calls
+need it. With **`[gateway] strict = true`** (or `mcpdef validate --strict` in CI),
+what would be a warning is an error: a secret written in the config, a secret file
+others can read, a certificate not checked, credentials sent in the clear, a listener
+other machines reach with neither TLS nor auth. An upstream
 can also be an **untrusted MCP server run in-path under Wasmtime** — MCPdef executes
 it itself, no child process — with each call bounded by a **fuel** budget (CPU), a
 **linear-memory ceiling**, and an **optional wall-clock deadline** (`wasm_deadline_ms`,
@@ -416,8 +526,11 @@ the CLI (`mcpdef audit verify` / `mcpdef audit tail --format ocsf`). For demos a
 shorthand for `run --http` and **`mcpdef call <tool>`** invokes a single tool through
 the governance path (allowlist/profiles/pinning/rate-limit + audit; RBAC gates
 authenticated HTTP callers, not this local CLI) and prints the result. Driven by one
-[`mcpdef.toml`](./mcpdef.example.toml). Built against MCP spec **2025-11-25** while
-forward-planning the stateless **2026-07-28** RC.
+[`mcpdef.toml`](./mcpdef.example.toml). Speaks MCP **2025-11-25** by default and the stateless
+**2026-07-28** revision when asked: `[gateway] wire` picks what the listener
+serves, `[[server]] spec` what each upstream speaks, and one gateway can front
+both at once. See [docs/WIRE.md](./docs/WIRE.md) for what each era gets and which
+parts of the newer revision are not implemented yet.
 
 ```sh
 cargo run -p mcpdef -- validate --config mcpdef.example.toml
@@ -427,9 +540,10 @@ cargo run -p mcpdef -- audit verify    # offline hash-chain check
 cargo test            # 152 tests: unit + stdio/HTTP-bridge + egress + pin + rate-limit + listener + OAuth/RBAC (+ JWKS rotation) + wasm-sandbox (module + component) + injection/secret-exfil scan + CLI
 ```
 
-**Next:** a `transform` policy effect (argument/result mutation) on the
-**policy-as-code** engine that shipped this cycle (per-agent / per-argument
-allow/deny, Phase 3).
+The **policy-as-code** engine's `transform` rules (Phase 3) now rewrite a tool
+call's arguments before its per-agent / per-argument allow/deny rules judge
+them, and redact, mask, remove or cut a result, a tool call's or a read's,
+before inspect sees it.
 Phase 4 has now landed — the in-path **Wasmtime sandbox**: an untrusted MCP server
 run behind the gateway with fuel + memory + epoch caps, as either a zero-capability
 **core module** (`transport = "wasm"`) or a **`wasm32-wasip2` component**

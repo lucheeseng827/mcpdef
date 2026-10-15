@@ -4,7 +4,7 @@
 //! the real binary (`CARGO_BIN_EXE_mcpdef`) against a ledger built through the
 //! `mcpdef-audit` API, so they exercise the same code path an operator does.
 
-use mcpdef_audit::{Entry, Ledger};
+use mcpdef_audit::{Attrs, Entry, Ledger};
 use mcpdef_core::Decision;
 use std::path::Path;
 use std::process::Command;
@@ -19,6 +19,7 @@ fn entry(server: &str, tool: &str, decision: Decision) -> Entry {
         tool: Some(tool.into()),
         decision,
         latency_ms: 2,
+        attrs: Attrs::default(),
     }
 }
 
@@ -228,6 +229,142 @@ fn servers_list_shows_governed_servers() {
     assert!(stdout.contains("delete_*"));
     assert!(stdout.contains("(all)")); // files has no allowlist
     assert!(stdout.contains("2 server(s) governed"));
+}
+
+/// `servers list` says where each variable a server is given comes from, and
+/// never what it holds: not a value written in the config, and not a command's
+/// arguments.
+#[test]
+fn servers_list_shows_where_env_comes_from_never_a_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("mcpdef.toml");
+    std::fs::write(
+        &cfg,
+        r#"
+        [gateway]
+        audit = "./audit.log"
+
+        [[server]]
+        id = "github"
+        transport = "stdio"
+        command = ["mcp-server-github"]
+
+        [server.env]
+        GITHUB_TOKEN = "s3cret-literal"
+        FROM_ENV = { env = "GH_TOKEN" }
+        FROM_FILE = { file = "/run/secrets/gh" }
+        FROM_EXEC = { exec = ["op", "read", "op://infra/gh/s3cret-field"] }
+        "#,
+    )
+    .unwrap();
+
+    let out = Command::new(BIN)
+        .args(["servers", "list", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(
+            "env FROM_ENV=$GH_TOKEN FROM_EXEC=(exec op) FROM_FILE=/run/secrets/gh \
+             GITHUB_TOKEN=(literal)"
+        ),
+        "{stdout}"
+    );
+    let all = format!("{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!all.contains("s3cret"), "{all}");
+}
+
+/// `servers list` says how a server proves itself, and where its secret comes
+/// from, never the secret or the user name that goes with it.
+#[test]
+fn servers_list_shows_auth_by_kind_and_source_never_the_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("mcpdef.toml");
+    std::fs::write(
+        &cfg,
+        r#"
+        [gateway]
+        audit = "./audit.log"
+
+        [[server]]
+        id = "remote"
+        transport = "streamable-http"
+        url = "https://mcp.example.com/mcp"
+
+        [server.auth]
+        kind = "basic"
+        username = "s3cret-user"
+        password = "s3cret-password"
+
+        [[server]]
+        id = "keyed"
+        transport = "streamable-http"
+        url = "https://api.example.com/mcp"
+
+        [server.auth]
+        kind = "header"
+        name = "X-Api-Key"
+        value = { env = "API_KEY" }
+        "#,
+    )
+    .unwrap();
+
+    let out = Command::new(BIN)
+        .args(["servers", "list", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("auth basic password=(literal)"), "{stdout}");
+    assert!(
+        stdout.contains("auth header X-Api-Key value=$API_KEY"),
+        "{stdout}"
+    );
+    let all = format!("{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!all.contains("s3cret"), "{all}");
+}
+
+#[test]
+fn servers_list_shows_where_oauth2_tokens_and_their_secret_come_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("mcpdef.toml");
+    std::fs::write(
+        &cfg,
+        r#"
+        [gateway]
+        audit = "./audit.log"
+
+        [[server]]
+        id = "remote"
+        transport = "streamable-http"
+        url = "https://mcp.example.com/mcp"
+
+        [server.auth]
+        kind = "oauth2"
+        token_url = "https://idp.example.com/oauth2/token"
+        client_id = "s3cret-id"
+        client_secret = "s3cret-literal"
+        scopes = ["mcp:tools"]
+        "#,
+    )
+    .unwrap();
+
+    let out = Command::new(BIN)
+        .args(["servers", "list", "--config"])
+        .arg(&cfg)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("auth oauth2 https://idp.example.com/oauth2/token client_secret=(literal)"),
+        "{stdout}"
+    );
+    let all = format!("{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!all.contains("s3cret"), "{all}");
 }
 
 #[test]
@@ -456,4 +593,449 @@ fn validate_rejects_unknown_profile() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("unknown profile 'ghost'"), "got: {stderr}");
+}
+
+#[test]
+fn validate_warns_about_insecure_skip_verify_and_refuses_a_bad_tls_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("mcpdef.toml");
+    let validate = |table: &str| {
+        let text = format!(
+            "[gateway]\n[[server]]\nid = \"lax\"\ntransport = \"streamable-http\"\n\
+             url = \"https://mcp.test/mcp\"\n[server.tls]\n{table}\n"
+        );
+        std::fs::write(&cfg, text).unwrap();
+        Command::new(BIN)
+            .args(["validate", "--config"])
+            .arg(&cfg)
+            .output()
+            .unwrap()
+    };
+
+    let out = validate("insecure_skip_verify = true");
+    assert!(out.status.success(), "a warning, not an error");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("⚠ server 'lax': [server.tls] insecure_skip_verify = true"),
+        "got: {stderr}"
+    );
+
+    let p12 = dir.path().join("client.p12");
+    std::fs::write(&p12, [0x30, 0x82, 0x04, 0x00, 0x02, 0x01, 0x03]).unwrap();
+    let key = dir.path().join("client.key");
+    let out = validate(&format!(
+        "client_cert = {p12:?}\nclient_key = {{ file = {key:?} }}"
+    ));
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("✗ server 'lax': [server.tls] client_cert")
+            && stderr.contains("is PKCS#12"),
+        "got: {stderr}"
+    );
+}
+
+/// `mcpdef validate` on `cfg`, with `--strict` when `strict`.
+fn validate(cfg: &Path, strict: bool) -> std::process::Output {
+    let mut command = Command::new(BIN);
+    command.args(["validate", "--config"]).arg(cfg);
+    if strict {
+        command.arg("--strict");
+    }
+    command.output().unwrap()
+}
+
+/// The example config, where the docs send a new user to start, is valid,
+/// and holds nothing strict mode refuses: no secret written in it.
+#[test]
+fn the_example_config_passes_strictly() {
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../mcpdef.example.toml");
+    let out = validate(&example, true);
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(out.status.success(), "{stderr}");
+    assert!(stdout.contains("config valid, strictly"), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+/// Each finding, one at a time: `validate` warns about it and passes the
+/// config, and `--strict`, or `[gateway] strict = true`, refuses it. No secret
+/// is repeated either way.
+#[cfg(unix)]
+#[test]
+fn strict_refuses_each_finding_that_validate_only_warns_about() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let readable = dir.path().join("token");
+    std::fs::write(&readable, "t").unwrap();
+    std::fs::set_permissions(&readable, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let leaf = mcpdef_testkit::Pki::new("mcpdef test CA").client("spiffe://mcpdef.test/gw");
+    let cert = dir.path().join("client.crt");
+    std::fs::write(&cert, leaf.cert_pem()).unwrap();
+    let token = format!("ghp_{}", "a1B2".repeat(9));
+    let stdio = "transport = \"stdio\"\ncommand = [\"srv\"]";
+    let https = "transport = \"streamable-http\"\nurl = \"https://mcp.example.com/mcp\"";
+    let oauth2 = "kind = \"oauth2\"\nclient_id = \"mcpdef\"";
+    let cases = [
+        // A secret written in the config.
+        (
+            format!("{stdio}\n[server.env]\nGITHUB_TOKEN = \"hunter2\""),
+            "server 's': [server.env] GITHUB_TOKEN is a secret written in the config".to_string(),
+        ),
+        (
+            format!("{stdio}\n[server.env]\nNOTE = \"{token}\""),
+            "server 's': [server.env] NOTE is a secret written in the config".to_string(),
+        ),
+        (
+            format!(
+                "{https}\n[server.tls]\nclient_cert = {cert:?}\nclient_key = \"\"\"\n{}\"\"\"",
+                leaf.key_pem()
+            ),
+            "server 's': [server.tls] client_key is a secret written in the config".to_string(),
+        ),
+        (
+            format!("{https}\n[server.auth]\nkind = \"bearer\"\ntoken = \"hunter2\""),
+            "server 's': [server.auth] token is a secret written in the config".to_string(),
+        ),
+        (
+            format!(
+                "{https}\n[server.auth]\n{oauth2}\ntoken_url = \"https://idp.example.com/token\"\n\
+                 client_secret = \"hunter2\""
+            ),
+            "server 's': [server.auth] client_secret is a secret written in the config".to_string(),
+        ),
+        (
+            "transport = \"streamable-http\"\n\
+             url = \"https://mcpdef:hunter2@mcp.example.com/mcp\""
+                .to_string(),
+            "server 's': url holds a password".to_string(),
+        ),
+        (
+            "transport = \"streamable-http\"\n\
+             url = \"https://mcp.example.com/mcp?api_key=hunter2\""
+                .to_string(),
+            "server 's': url holds a secret, its query parameter `api_key`".to_string(),
+        ),
+        (
+            format!("transport = \"stdio\"\ncommand = [\"srv\", \"--token\", \"{token}\"]"),
+            "server 's': command[2] holds a secret, a github-token by its shape".to_string(),
+        ),
+        // A certificate not checked.
+        (
+            format!("{https}\n[server.tls]\ninsecure_skip_verify = true"),
+            "server 's': [server.tls] insecure_skip_verify = true: its certificate is not \
+             checked"
+                .to_string(),
+        ),
+        // A secret file others can read.
+        (
+            format!("{stdio}\n[server.env]\nTOKEN = {{ file = {readable:?} }}"),
+            format!(
+                "server 's': [server.env] TOKEN: {} can be read by its group and every user \
+                 (mode 644)",
+                readable.display()
+            ),
+        ),
+        // Credentials sent in the clear.
+        (
+            "transport = \"streamable-http\"\nurl = \"http://mcp.example.com/mcp\"\n\
+             [server.auth]\nkind = \"bearer\"\ntoken = { env = \"T\" }"
+                .to_string(),
+            "server 's': [server.auth] sends its credentials over plain HTTP to mcp.example.com"
+                .to_string(),
+        ),
+        (
+            format!(
+                "{https}\n[server.auth]\n{oauth2}\ntoken_url = \"http://idp.example.com/token\"\n\
+                 client_secret = {{ env = \"S\" }}"
+            ),
+            "server 's': [server.auth] sends its client secret over plain HTTP to \
+             idp.example.com"
+                .to_string(),
+        ),
+    ];
+    let cfg = dir.path().join("mcpdef.toml");
+    for (server, found) in &cases {
+        for strict_key in [false, true] {
+            let gateway = if strict_key { "strict = true\n" } else { "" };
+            std::fs::write(
+                &cfg,
+                format!("[gateway]\n{gateway}\n[[server]]\nid = \"s\"\n{server}\n"),
+            )
+            .unwrap();
+            for flag in [false, true] {
+                let out = validate(&cfg, flag);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if strict_key || flag {
+                    assert!(!out.status.success(), "{found}: {stderr}");
+                    assert!(stderr.contains(&format!("✗ strict: {found}")), "{stderr}");
+                    assert_eq!(stderr.matches('✗').count(), 1, "{stderr}");
+                    assert!(!stderr.contains('⚠'), "{stderr}");
+                } else {
+                    assert!(out.status.success(), "{found}: {stderr}");
+                    assert!(stderr.contains(&format!("⚠ {found}")), "{stderr}");
+                    assert_eq!(stderr.matches('⚠').count(), 1, "{stderr}");
+                }
+                assert!(
+                    !stderr.contains("hunter2") && !stderr.contains(&token),
+                    "{stderr}"
+                );
+            }
+        }
+    }
+}
+
+/// The shape a strict config takes: an OAuth2 client-credentials HTTPS
+/// upstream on a private CA, with mTLS, and two stdio servers with API keys,
+/// every secret read from where it is kept. `validate --strict` passes it.
+#[cfg(unix)]
+#[test]
+fn strict_passes_a_config_that_keeps_its_secrets_elsewhere() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let pki = mcpdef_testkit::Pki::new("mcpdef test CA");
+    let ca = pki.write_root(dir.path(), "ca");
+    let (cert, key) = pki
+        .client("spiffe://mcpdef.test/gw")
+        .write(dir.path(), "client");
+    let slack = dir.path().join("slack-token");
+    std::fs::write(&slack, "a token kept in a file").unwrap();
+    std::fs::set_permissions(&slack, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let cfg = dir.path().join("mcpdef.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[gateway]\nstrict = true\n\n[gateway.upstream_tls]\nca = [{ca:?}]\n\n\
+             [[server]]\nid = \"github\"\ntransport = \"stdio\"\n\
+             command = [\"github-mcp-server\", \"stdio\"]\n\
+             [server.env]\nGITHUB_PERSONAL_ACCESS_TOKEN = {{ env = \"MCPDEF_GITHUB_TOKEN\" }}\n\
+             LOG_LEVEL = \"info\"\n\n\
+             [[server]]\nid = \"slack\"\ntransport = \"stdio\"\ncommand = [\"slack-mcp-server\"]\n\
+             [server.env]\nSLACK_BOT_TOKEN = {{ file = {slack:?} }}\n\n\
+             [[server]]\nid = \"remote\"\ntransport = \"streamable-http\"\n\
+             url = \"https://mcp.internal.test/mcp\"\n\
+             [server.tls]\nclient_cert = {cert:?}\nclient_key = {{ file = {key:?} }}\n\
+             [server.auth]\nkind = \"oauth2\"\ntoken_url = \"https://idp.internal.test/token\"\n\
+             client_id = \"mcpdef\"\nclient_secret = {{ exec = [\"op\", \"read\", \"op://x/y\"] }}\n\
+             scopes = [\"mcp:tools\"]\n"
+        ),
+    )
+    .unwrap();
+    for flag in [false, true] {
+        let out = validate(&cfg, flag);
+        let (stdout, stderr) = (
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert!(out.status.success(), "{stderr}");
+        assert!(
+            stdout.contains("3 upstream(s), config valid, strictly"),
+            "{stdout}"
+        );
+        assert!(stderr.is_empty(), "{stderr}");
+    }
+}
+
+/// `mcpdef call` through the gateway `cfg` describes, to `echo`.
+fn call_echo(cfg: &Path) -> std::process::Output {
+    Command::new(BIN)
+        .args(["call", "echo", "--config"])
+        .arg(cfg)
+        .output()
+        .unwrap()
+}
+
+/// Under `[gateway] strict`, the gateway starts whole or not at all: not with
+/// a config that has a warning, and not with an upstream that does not open.
+/// Without it, it starts with the one and without the other.
+#[test]
+fn under_strict_the_gateway_starts_whole_or_not_at_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("mcpdef.toml");
+    let mock = env!("CARGO_BIN_EXE_mock_mcp_server");
+    let write = |strict: bool, server: &str| {
+        std::fs::write(
+            &cfg,
+            format!(
+                "[gateway]\naudit = {:?}\nstrict = {strict}\n\n[[server]]\nid = \"s\"\n\
+                 tools = [\"echo\"]\n{server}\n",
+                dir.path().join("audit.log")
+            ),
+        )
+        .unwrap();
+    };
+    let literal = format!(
+        "transport = \"stdio\"\ncommand = [{mock:?}]\n[server.env]\nGITHUB_TOKEN = \"hunter2\""
+    );
+    write(false, &literal);
+    let out = call_echo(&cfg);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(
+            "mcpdef: warning — server 's': [server.env] GITHUB_TOKEN is a secret written in \
+             the config"
+        ),
+        "{stderr}"
+    );
+    write(true, &literal);
+    let out = call_echo(&cfg);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        stderr.contains("✗ strict: server 's': [server.env] GITHUB_TOKEN is a secret")
+            && stderr.contains("invalid config"),
+        "{stderr}"
+    );
+
+    let missing = "transport = \"stdio\"\ncommand = [\"/nonexistent/mcp-server\"]";
+    write(false, missing);
+    let out = call_echo(&cfg);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("upstream 's' is down"), "{stderr}");
+    write(true, missing);
+    let out = call_echo(&cfg);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        stderr.contains("initializing upstream 's'") && !stderr.contains("is down"),
+        "{stderr}"
+    );
+}
+
+/// Kills the gateway however the test ends.
+struct Running(std::process::Child);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A gateway that runs strictly says so when it is ready.
+#[test]
+fn a_strict_gateway_says_so_when_it_is_ready() {
+    use std::io::BufRead;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = mock_cfg(dir.path());
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(
+        &cfg,
+        text.replacen("[gateway]", "[gateway]\nstrict = true", 1),
+    )
+    .unwrap();
+    let mut child = Command::new(BIN)
+        .args(["run", "--config"])
+        .arg(&cfg)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let _running = Running(child);
+    let ready = std::io::BufReader::new(stderr)
+        .lines()
+        .map_while(Result::ok)
+        .find(|line| line.contains(" ready "))
+        .expect("a ready line");
+    assert!(ready.contains(" · strict · "), "{ready}");
+}
+
+// ---------------------------------------------------------------------------
+// `mcpdef version`
+// ---------------------------------------------------------------------------
+
+use mcpdef_core::wire::{SpecSetting, UpstreamSpec, WireMode, KNOWN_SPEC_VERSIONS};
+
+fn version_output() -> String {
+    let out = Command::new(BIN).arg("version").output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// `mcpdef version` reports every revision the build speaks, with the default
+/// listener's marked as the default.
+///
+/// The spec line was hand-written once and went stale — it went on calling
+/// 2026-07-28 "planned" after that revision shipped — and nothing caught it,
+/// because no test read this output. This one is written against the constants,
+/// not against a copy of the line: adding a revision cannot make it fail, and
+/// forgetting to report one cannot make it pass.
+#[test]
+fn version_reports_every_revision_the_build_speaks() {
+    let text = version_output();
+    let spec = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("spec target"))
+        .unwrap_or_else(|| panic!("no spec line in:\n{text}"));
+
+    for v in KNOWN_SPEC_VERSIONS {
+        assert!(spec.contains(v), "{v} is spoken but not reported: {spec}");
+    }
+    for v in WireMode::default().served() {
+        assert!(
+            spec.contains(&format!("{v} default")),
+            "{v} is the default listener's revision but not marked so: {spec}"
+        );
+    }
+    for v in WireMode::Modern.served() {
+        assert!(
+            spec.contains(&format!("stateless {v}")) || WireMode::default().served().contains(v),
+            "{v} is stateless but not called so: {spec}"
+        );
+    }
+}
+
+/// The first line is what `mcpdef-bench` records as the measured binary's
+/// identity, so it keeps its shape: the name, then the exact package version.
+#[test]
+fn version_first_line_names_the_exact_package_version() {
+    let text = version_output();
+    let first = text.lines().next().unwrap_or_default();
+    assert!(
+        first.starts_with(&format!("mcpdef {}  ·  ", env!("CARGO_PKG_VERSION"))),
+        "{first}"
+    );
+}
+
+/// The phase labels predate the 0.4.0 work and are retired.
+/// `mcpdef --help`'s header carried the same one.
+#[test]
+fn version_and_help_carry_no_phase_label() {
+    assert!(
+        !version_output().to_lowercase().contains("phase"),
+        "`mcpdef version` still names a phase"
+    );
+    let help = Command::new(BIN).arg("--help").output().unwrap();
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(
+        !help
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains("phase"),
+        "`mcpdef --help` still names a phase in its header:\n{help}"
+    );
+}
+
+/// `mcpdef version` prints one default, which is only true while a listener and
+/// an upstream default to the same revision.
+///
+/// If one moves — the listener to `dual`, say, with upstreams still pinned to
+/// 2025-11-25 — this fails, so the line gets rewritten to say which default is
+/// which instead of quietly claiming one for both.
+#[test]
+fn the_listener_and_upstream_defaults_agree() {
+    let upstream = SpecSetting::default().pinned().map(UpstreamSpec::version);
+    assert_eq!(
+        WireMode::default().served(),
+        upstream.as_slice(),
+        "`mcpdef version` reports one default; say which is which there before splitting them"
+    );
 }

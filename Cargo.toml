@@ -11,13 +11,20 @@
 #   mcpdef-transport  the Transport trait + stdio child + in-memory duplex (tests)
 #   mcpdef-policy     static tool allowlist (deny-by-default) — Phase 1 stub of P3
 #   mcpdef-audit      append-only, hash-linked (tamper-evident) audit ledger + verify
+#   mcpdef-secrets    where a secret comes from (a literal, an env var, a file), read when needed
 #   mcpdef            the `mcpdef` binary: config, the gateway proxy loop, CLI
+#   mcpdef-bench      load harness against the release binary (not published)
 #
 # Excluded from the repo-root workspace (root Cargo.toml `exclude`) because the
 # root `module_*` glob would otherwise try to absorb this nested workspace —
 # the same reason module_54 / module_57 are excluded.
 [workspace]
-resolver = "2"
+# Resolver 2, plus MSRV-aware resolution: when the lockfile is updated, a
+# dependency's newest release that needs a newer Rust than the members'
+# `rust-version` is passed over for the newest that builds on it. In the
+# manifest, rather than in `.cargo/config.toml`, so that it holds however cargo
+# is invoked, from any directory, and in the mirror.
+resolver = "3"
 members = [
     "crates/mcpdef-core",
     "crates/mcpdef-transport",
@@ -28,25 +35,42 @@ members = [
     "crates/mcpdef-ratelimit",
     "crates/mcpdef-auth",
     "crates/mcpdef-sandbox",
+    "crates/mcpdef-secrets",
+    "crates/mcpdef-console",
     "crates/mcpdef",
+    # The load harness (`publish = false`): drives the release binary, never ships with it.
+    "crates/mcpdef-bench",
+    # Test support (`publish = false`): a PKI made at test time, and an HTTPS mock upstream.
+    "crates/mcpdef-testkit",
 ]
 # The wasip2 guest test fixture is a standalone crate compiled for a *different*
 # target (`wasm32-wasip2`); it is not part of this (host) workspace.
 exclude = ["crates/mcpdef-sandbox/tests/fixtures/echo-component"]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.4.0"
 edition = "2021"
 # Minimum Supported Rust Version — the declared floor for the OSS engine, set by
 # the highest-MSRV dependency in the tree. Currently `time` (0.3.x) requires 1.88
 # (Wasmtime 36 itself needs only 1.86). CI enforces it via the `msrv` job in
 # mcpdef-ci.yml; bump both together (here and the job's toolchain pin) when a
-# dependency raises the floor.
+# dependency raises the floor. Every member inherits it (`rust-version.workspace`),
+# which is what makes cargo refuse an older toolchain, and what resolver 3 keeps
+# dependency updates within.
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/lucheeseng827/nick-rust-project"
 
+[workspace.lints.clippy]
+# Calls run concurrently, so a std lock held across an `.await` stalls every
+# other task on its thread, or deadlocks. Hold such a guard for a step, never
+# across a suspension (a Tokio lock is the tool when one must be).
+await_holding_lock = "deny"
+
 [workspace.dependencies]
+# The console's session cookie, sealed with AES-256-GCM: ring is in the tree
+# already, through rustls, rcgen and jsonwebtoken.
+ring = "0.17"
 # shared third-party
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -56,19 +80,41 @@ thiserror = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 toml = "0.8"
+# Editing a client's TOML config in place, comments and layout kept (`mcpdef connect`).
+toml_edit = "0.22"
 sha2 = "0.10"
 hex = "0.4"
+base64 = "0.22"
 tempfile = "3"
-# HTTP transports (Phase 1.5: Streamable HTTP + legacy HTTP+SSE bridge)
-reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls"] }
+# HTTP transports (Phase 1.5: Streamable HTTP + legacy HTTP+SSE bridge).
+# `rustls-no-provider`: reqwest's own rustls feature would bring aws-lc-rs.
+# rustls then takes the process's crypto provider, ring (see `rustls` below),
+# and a client built with none installed panics.
+reqwest = { version = "0.13", default-features = false, features = ["stream", "rustls-no-provider"] }
+# The one TLS stack: rustls on ring, which the binary installs as rustls'
+# process-wide provider. Never rustls' default features: they add aws-lc-rs.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# Mozilla's root certificates, which an HTTPS upstream is verified against,
+# rather than the host's own store (CDLA-Permissive-2.0).
+webpki-root-certs = "1"
+# The host's store, for a TLS profile with `roots = "system"`: the files
+# SSL_CERT_FILE and SSL_CERT_DIR name, else the system's. Linked already through
+# reqwest's platform verifier.
+rustls-native-certs = "0.8"
 futures-util = "0.3"
+# An HTTP `Date` header, read: `mcpdef doctor` compares an identity provider's
+# clock with the machine's. Linked already through hyper.
+httpdate = "1"
 # URL parsing for the egress/SSRF guard (host classification + DNS pinning)
 url = "2"
 # OAuth 2.1 Resource Server: JWT validation + JWKS (Phase 2 auth)
 jsonwebtoken = "9"
-# dev-only mock servers for the HTTP transport tests
-axum = "0.7"
+# The gateway's HTTP listener and admin API, and the mock servers in the tests
+axum = "0.8"
 tokio-stream = { version = "0.1", features = ["sync"] }
+# The gateway's governance snapshot: read lock-free on every call, swapped whole
+# when it changes (MIT OR Apache-2.0, no dependencies).
+arc-swap = "1"
 # In-path WASM sandbox for untrusted upstreams (Phase 4). `cranelift` compiles,
 # `runtime` runs with fuel + memory caps; both paths use a synchronous engine.
 # The core-module path (`WasmUpstream`) has zero ambient imports. The component
@@ -78,18 +124,48 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 wasmtime = { version = "36", default-features = false, features = ["runtime", "cranelift", "component-model"] }
 wasmtime-wasi = "36"
 wat = "1"
+# Property tests over random interleavings (tests only; MSRV 1.85, MIT OR Apache-2.0).
+proptest = { version = "1", default-features = false, features = ["std"] }
+# rcgen makes the test PKI at test time, and the gateway's local CA and the
+# certificates it issues its listeners, on ring: its `aws_lc_rs` and `fips`
+# features would pull in aws-lc, and its `x509-parser` is left out, since the
+# CA is read back from its key alone. tokio-rustls, hyper and hyper-util serve
+# the HTTPS mock upstream; tokio-rustls also serves the gateway's own listeners
+# over TLS, and lets `mcpdef tls pin` see a server's certificate. All three are
+# already in the tree through reqwest and axum, with these features.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+# The dates rcgen writes into a certificate (linked already, through
+# jsonwebtoken, with `std`).
+time = { version = "0.3", default-features = false, features = ["std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "service"] }
+# Checks a CA certificate and a CRL a TLS profile names when it is read, and
+# reads a certificate's names and key back in the tests; linked already through
+# rustls, with these features.
+webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["std"] }
+# A secret, once read, is held where its memory is wiped when it is dropped, and
+# where `Debug` prints no value (Apache-2.0 OR MIT). zeroize is linked already,
+# through rustls' key types, which it wipes too.
+secrecy = "0.10"
+zeroize = "1"
 # internal path deps (one-way: leaves depend on core, never the reverse).
 # A `version` alongside `path` is required for `cargo publish` (crates.io uses
 # the version, local builds use the path); it must track workspace.package.version.
-mcpdef-core = { path = "crates/mcpdef-core", version = "0.2.2" }
-mcpdef-transport = { path = "crates/mcpdef-transport", version = "0.2.2" }
-mcpdef-policy = { path = "crates/mcpdef-policy", version = "0.2.2" }
-mcpdef-audit = { path = "crates/mcpdef-audit", version = "0.2.2" }
-mcpdef-inspect = { path = "crates/mcpdef-inspect", version = "0.2.2" }
-mcpdef-pin = { path = "crates/mcpdef-pin", version = "0.2.2" }
-mcpdef-ratelimit = { path = "crates/mcpdef-ratelimit", version = "0.2.2" }
-mcpdef-auth = { path = "crates/mcpdef-auth", version = "0.2.2" }
-mcpdef-sandbox = { path = "crates/mcpdef-sandbox", version = "0.2.2" }
+mcpdef-core = { path = "crates/mcpdef-core", version = "0.4.0" }
+mcpdef-transport = { path = "crates/mcpdef-transport", version = "0.4.0" }
+mcpdef-policy = { path = "crates/mcpdef-policy", version = "0.4.0" }
+mcpdef-audit = { path = "crates/mcpdef-audit", version = "0.4.0" }
+mcpdef-inspect = { path = "crates/mcpdef-inspect", version = "0.4.0" }
+mcpdef-pin = { path = "crates/mcpdef-pin", version = "0.4.0" }
+mcpdef-ratelimit = { path = "crates/mcpdef-ratelimit", version = "0.4.0" }
+mcpdef-auth = { path = "crates/mcpdef-auth", version = "0.4.0" }
+mcpdef-sandbox = { path = "crates/mcpdef-sandbox", version = "0.4.0" }
+mcpdef-secrets = { path = "crates/mcpdef-secrets", version = "0.4.0" }
+mcpdef-console = { path = "crates/mcpdef-console", version = "0.4.0" }
+# Test support, never published: a path alone, so `cargo publish` leaves it
+# out of a published crate's dev-dependencies.
+mcpdef-testkit = { path = "crates/mcpdef-testkit" }
 
 # Line tables rather than full debug info in dev and test builds. A backtrace
 # keeps its files and lines, and each test binary, linking wasmtime, rustls and

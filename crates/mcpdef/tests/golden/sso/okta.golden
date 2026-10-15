@@ -1,0 +1,47 @@
+# Signing people in to MCPdef's console at Okta.
+#
+# At the provider:
+#   1. Applications > Create App Integration: OIDC, Web Application, the
+#      authorization code grant; sign-in redirect URI
+#      https://mcpdef.example.com:7879/callback, sign-out redirect URI
+#      https://mcpdef.example.com:7879/; its secret goes in
+#      MCPDEF_OIDC_CLIENT_SECRET, where MCPdef runs.
+#   2. Security > API > Authorization Servers > default > Claims: groups, in the
+#      ID token, with the groups scope, its value the groups whose names start
+#      with mcpdef-.
+#   3. Directory > Groups: the groups mcpdef-viewers, mcpdef-operators and
+#      mcpdef-admins, each giving the console role role_map says; assign them to
+#      the app.
+#
+# Then this goes in the config (or run this again with --write),
+# MCPDEF_OIDC_CLIENT_SECRET is set where MCPdef runs, and the gateway is
+# restarted. Someone the provider gives no console role is shown the claims
+# MCPdef received of them: map one to a role with [[identity.role_map]].
+
+[gateway.admin]
+public_url = "https://mcpdef.example.com:7879"
+
+[gateway.admin.oidc]
+issuer = "https://example.okta.com/oauth2/default"
+client_id = "mcpdef-console"
+client_secret = { env = "MCPDEF_OIDC_CLIENT_SECRET" }
+scopes = ["profile", "email", "groups"]
+
+[identity]
+subject_claim = "preferred_username"
+roles_claims = []
+
+[[identity.role_map]]
+claim = "groups"
+value = "mcpdef-viewers"
+roles = ["console:viewer"]
+
+[[identity.role_map]]
+claim = "groups"
+value = "mcpdef-operators"
+roles = ["console:operator"]
+
+[[identity.role_map]]
+claim = "groups"
+value = "mcpdef-admins"
+roles = ["console:admin"]

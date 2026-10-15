@@ -14,8 +14,8 @@ a security team can verify the binary end-to-end without trusting the publisher
    git tag v0.1.0
    git push origin v0.1.0
    ```
-   Exercise the pipeline first with a pre-release tag (`v0.1.0-rc.1`): it builds, signs, and
-   attaches a GitHub **pre-release**, but skips crates.io, Homebrew, and `:latest` promotion.
+   A tag with a pre-release suffix (`v0.4.0-alpha.1`, `v0.1.0-rc.1`) cuts a **pre-release**
+   instead: see [Cut a pre-release](#cut-a-pre-release).
 3. On a real `v*` tag the `release` workflow:
    - **builds** static-musl (`x86_64`/`aarch64`) and macOS (`x86_64`/`arm64`) `mcpdef` binaries,
      each archived as `mcpdef-<target>.tar.gz` with a `.sha256`, a **cosign** keyless signature
@@ -23,14 +23,37 @@ a security team can verify the binary end-to-end without trusting the publisher
    - generates a **CycloneDX SBOM** for the engine workspace;
    - **publishes** the GitHub release with every artifact + an aggregated `SHA256SUMS`;
    - **publishes** the OSS engine crates to crates.io in dependency order
-     (`mcpdef-core` → `mcpdef-pin`/`mcpdef-ratelimit`/`mcpdef-audit`/`mcpdef-inspect`/`mcpdef-policy`/`mcpdef-auth`/`mcpdef-transport`
-     → `mcpdef-sandbox` → `mcpdef`), idempotently; the paid `ee/` plane is a separate workspace and is **never** published;
+     (`mcpdef-core` → `mcpdef-secrets` → `mcpdef-pin`/`mcpdef-ratelimit`/`mcpdef-audit`/`mcpdef-inspect`/`mcpdef-policy`/`mcpdef-auth`/`mcpdef-transport`
+     → `mcpdef-sandbox` → `mcpdef-console` → `mcpdef`), idempotently; the paid `ee/` plane is a separate workspace and is **never** published;
    - **bumps** `Formula/mcpdef.rb` and commits it to `main` (this repo is its own tap);
    - **pushes** a multi-arch (`linux/amd64`+`linux/arm64`) distroless image to
      `docker.io/mancube/mcpdef:{vX.Y.Z,latest}`, cosign-signed + SLSA-attested.
 
 `workflow_dispatch` re-runs the pipeline against an existing tag (input `tag`); `promote`
 re-points Homebrew + `:latest` (use only for the newest tag).
+
+## Cut a pre-release
+
+A tag with a pre-release suffix, such as `v0.4.0-alpha.1`, builds, signs, attests and SBOMs
+every artifact as a release does, publishes them as a GitHub **pre-release**, and pushes the
+image as `docker.io/mancube/mcpdef:v0.4.0-alpha.1`. It skips crates.io, Homebrew, the
+`:latest` image and the Docker Hub description, so `cargo install mcpdef`, `brew install
+mcpdef` and `docker pull mancube/mcpdef` keep the last release.
+
+The `validate` job refuses the tag, before anything is built, unless it matches the workspace
+version one of two ways:
+
+- **It is the version**: `version = "0.4.0-alpha.1"` in `Cargo.toml` (and the
+  `[workspace.dependencies]` pins), tagged `v0.4.0-alpha.1`. The binary and the image then say
+  what they are: `mcpdef version` prints `0.4.0-alpha.1`. Cut an alpha or a beta that people
+  will run this way, with its own section in `CHANGELOG.md`.
+- **It is a pre-release of the version**: `version = "0.4.0"`, tagged `v0.4.0-rc.1`. The
+  artifacts report `0.4.0`, as the release's will, so this rehearses the release on its own
+  version before the real tag.
+
+A plain `v0.4.0` tag against `version = "0.4.0-alpha.1"` is refused: its crates.io job would
+publish `0.4.0-alpha.1`. So is a tag with build metadata, such as `v0.4.0+b1`: crates.io drops the
+`+b1`, so the job would publish `0.4.0`, then wait for a version that never appears.
 
 ## Distribution channels
 

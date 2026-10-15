@@ -16,8 +16,13 @@ LABEL org.opencontainers.image.source="https://github.com/lucheeseng827/mcpdef" 
       org.opencontainers.image.description="Fast, self-hostable, single-binary MCP gateway & governance plane" \
       org.opencontainers.image.licenses="Apache-2.0"
 COPY mcpdef-${TARGETARCH} /usr/local/bin/mcpdef
-# The downstream Streamable HTTP listener (Phase 1 tail) will bind this port; today mcpdef serves
-# its client over stdio. Reserved here so the published image is ready when the listener lands.
+# /var/lib/mcpdef, for the ledger and the state, belongs to the user the image runs as (65532):
+# Docker gives a new named volume mounted on a directory that directory's owner, and one mounted
+# where the image has none is root's, which the gateway cannot write to. The image has no shell
+# to make it, so it is the base's own empty home of that user, copied. It comes from the base
+# image, not the build context, which holds only the binaries.
+COPY --from=gcr.io/distroless/static-debian12:nonroot --chown=65532:65532 /home/nonroot /var/lib/mcpdef
+# `mcpdef run --http` serves MCP clients here ([gateway] listen).
 EXPOSE 7878
 ENTRYPOINT ["/usr/local/bin/mcpdef"]
 CMD ["version"]

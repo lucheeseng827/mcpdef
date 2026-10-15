@@ -25,6 +25,10 @@
 //! in the binary. Token **brokering** to upstreams and **RBAC** layer on top of
 //! the `Principal` this produces.
 
+mod identity;
+
+pub use self::identity::{claim, strings, IdentityModel, RoleMapping};
+
 use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::de::{self, Deserializer, Visitor};
@@ -119,10 +123,10 @@ struct Claims {
     nbf: Option<f64>,
     #[serde(default)]
     scope: Option<String>,
+    /// Scopes as Entra and others send them: an array, or one string of
+    /// them separated by spaces.
     #[serde(default)]
-    scp: Option<Vec<String>>,
-    #[serde(default)]
-    roles: Option<Vec<String>>,
+    scp: Option<serde_json::Value>,
     #[serde(default)]
     client_id: Option<String>,
     #[serde(default)]
@@ -165,6 +169,33 @@ fn not_before<'de, D: Deserializer<'de>>(claim: D) -> Result<Option<f64>, D::Err
     claim.deserialize_f64(NumericDate("nbf")).map(Some)
 }
 
+/// Whether `a` and `b` are the same bytes, compared in time that depends on
+/// their lengths alone.
+pub fn same(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
+}
+
+/// The claims of `token`, a JWT whose signature has been verified: its
+/// payload, read as a JSON object.
+fn payload(token: &str) -> Result<serde_json::Map<String, serde_json::Value>, AuthError> {
+    use base64::Engine as _;
+    let part = token
+        .split('.')
+        .nth(1)
+        .ok_or_else(|| AuthError::Malformed("token has no payload".into()))?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(part.trim_end_matches('='))
+        .map_err(|e| AuthError::Malformed(e.to_string()))?;
+    serde_json::from_slice(&bytes).map_err(|e| AuthError::Malformed(e.to_string()))
+}
+
+/// How far this machine's clock may be from the authorization server's before
+/// its tokens are refused: the skew a token's `exp` and `nbf` are allowed
+/// either way. `mcpdef doctor` measures the skew against it.
+pub fn clock_leeway() -> Duration {
+    Duration::from_secs(Validation::default().leeway)
+}
+
 /// Refuse a token that has expired, or is not valid yet, allowing `leeway`
 /// seconds of clock skew either way. jsonwebtoken has checked both, but only a
 /// time it reads as a whole number of seconds that fits a u64: an `nbf` beyond
@@ -198,6 +229,10 @@ pub struct Verifier {
     last_refresh: Mutex<Option<Instant>>,
     /// Minimum interval between refresh attempts.
     min_refresh_interval: Duration,
+    /// How a token's claims name its caller.
+    identity: IdentityModel,
+    /// Audiences a token may carry besides `resource`.
+    audiences: Vec<String>,
 }
 
 impl Verifier {
@@ -211,7 +246,25 @@ impl Verifier {
             metadata_path: "/.well-known/oauth-protected-resource".to_string(),
             last_refresh: Mutex::new(None),
             min_refresh_interval: DEFAULT_MIN_REFRESH_INTERVAL,
+            identity: IdentityModel::default(),
+            audiences: Vec::new(),
         }
+    }
+
+    /// Take tokens whose `aud` holds one of `audiences` as well as those for
+    /// `resource`: an identity provider that names an API its own way, as
+    /// Entra's `api://<app id>` does. `resource` stays what RFC 9728's
+    /// metadata says.
+    pub fn with_audiences(mut self, audiences: Vec<String>) -> Self {
+        self.audiences = audiences;
+        self
+    }
+
+    /// Read each token's subject and roles by `identity`, not as the
+    /// default does (`sub`, and the `roles` claim).
+    pub fn with_identity(mut self, identity: IdentityModel) -> Self {
+        self.identity = identity;
+        self
     }
 
     /// Override the minimum interval between JWKS refresh attempts (default 60s).
@@ -274,6 +327,16 @@ impl Verifier {
 
     /// Validate a raw bearer token (no `Bearer ` prefix) and return the caller.
     pub fn verify(&self, token: &str) -> Result<Principal, AuthError> {
+        self.verify_claims(token).map(|(principal, _)| principal)
+    }
+
+    /// [`verify`](Verifier::verify), and the claims the token holds, as
+    /// verified: for showing someone what their identity provider said of
+    /// them.
+    pub fn verify_claims(
+        &self,
+        token: &str,
+    ) -> Result<(Principal, serde_json::Map<String, serde_json::Value>), AuthError> {
         let token = token.trim();
         if token.is_empty() {
             return Err(AuthError::Missing);
@@ -330,31 +393,91 @@ impl Verifier {
         // pinned to the key family above, this validates with exactly that one
         // asymmetric algorithm against a key of the matching family.
         let mut validation = Validation::new(header.alg);
-        validation.set_audience(&[self.resource.as_str()]);
+        validation.leeway = clock_leeway().as_secs();
+        let audiences: Vec<&str> = std::iter::once(self.resource.as_str())
+            .chain(self.audiences.iter().map(String::as_str))
+            .collect();
+        validation.set_audience(&audiences);
         validation.set_issuer(&[self.issuer.as_str()]);
+        // jsonwebtoken checks `aud` and `iss` only when the token carries
+        // them: a token with no `aud`, which the issuer minted for some other
+        // use, passed. RFC 9068 requires both, with `exp` and `sub`.
+        validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
         validation.validate_exp = true;
         validation.validate_nbf = true;
 
         let data = decode::<Claims>(token, &key, &validation)
             .map_err(|e| AuthError::Invalid(e.to_string()))?;
         let c = data.claims;
+        // Every claim, as the payload just verified holds it.
+        let claims = payload(token)?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
         check_times(c.exp, c.nbf, now, validation.leeway as f64)?;
-        let scopes = c.scp.unwrap_or_else(|| {
-            c.scope
+        let scopes: Vec<String> = match &c.scp {
+            Some(scp) => strings(Some(scp))
+                .flat_map(str::split_whitespace)
+                .map(String::from)
+                .collect(),
+            None => c
+                .scope
+                .as_deref()
                 .map(|s| s.split_whitespace().map(String::from).collect())
-                .unwrap_or_default()
-        });
-        Ok(Principal {
-            subject: c.sub,
+                .unwrap_or_default(),
+        };
+        let subject = match self.identity.subject_claim.as_str() {
+            "sub" => c.sub,
+            _ => self.identity.subject(&claims).map_err(AuthError::Invalid)?,
+        };
+        let principal = Principal {
+            subject,
             scopes,
-            roles: c.roles.unwrap_or_default(),
+            roles: self.identity.roles(&claims),
             client_id: c.client_id.or(c.azp),
             issuer: c.iss,
-        })
+        };
+        Ok((principal, claims))
+    }
+
+    /// An OpenID Connect ID token, its audience being the client this
+    /// verifier was made for: verified as [`verify_claims`](Self::verify_claims)
+    /// verifies an access token, and then as OpenID Connect Core §3.1.3.7
+    /// asks: its `nonce` the one the sign-in sent, compared in constant time;
+    /// its `azp`, when it has one or names several audiences, the client; and
+    /// its `iat` there, and not in the future.
+    pub fn verify_id_token(
+        &self,
+        token: &str,
+        nonce: &str,
+    ) -> Result<(Principal, serde_json::Map<String, serde_json::Value>), AuthError> {
+        let (principal, claims) = self.verify_claims(token)?;
+        let invalid = |why: &str| Err(AuthError::Invalid(why.to_string()));
+        match claims.get("nonce").and_then(serde_json::Value::as_str) {
+            Some(sent) if same(sent.as_bytes(), nonce.as_bytes()) => {}
+            _ => return invalid("its nonce is not the one the sign-in sent"),
+        }
+        let audiences = strings(claims.get("aud")).count();
+        match claims.get("azp").and_then(serde_json::Value::as_str) {
+            Some(azp) if azp != self.resource => {
+                return invalid("it was issued to another client (azp)")
+            }
+            None if audiences > 1 => {
+                return invalid("it names several audiences, and no authorized party (azp)")
+            }
+            _ => {}
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        match claims.get("iat").and_then(serde_json::Value::as_f64) {
+            Some(iat) if iat <= now + clock_leeway().as_secs_f64() => {}
+            Some(_) => return invalid("it was issued in the future (iat)"),
+            None => return invalid("it says nothing of when it was issued (iat)"),
+        }
+        Ok((principal, claims))
     }
 
     /// The RFC 9728 Protected Resource Metadata document served at
@@ -429,6 +552,89 @@ mod tests {
         Verifier::from_jwks_json(TEST_JWKS, ISSUER, RESOURCE).unwrap()
     }
 
+    /// A token's claims: the ones every valid token has, then `extra`.
+    fn token_with(extra: Value) -> String {
+        let mut claims =
+            json!({ "sub": "agent-7", "iss": ISSUER, "aud": RESOURCE, "exp": now() + 3600 });
+        for (name, value) in extra.as_object().unwrap() {
+            claims[name] = value.clone();
+        }
+        sign_claims(&claims)
+    }
+
+    #[test]
+    fn audiences_besides_the_resource_are_taken_and_no_others() {
+        let entra = verifier().with_audiences(vec!["api://0000-aaaa".into()]);
+        let token = |aud: Value| token_with(json!({ "aud": aud }));
+        assert!(entra.verify(&token(json!("api://0000-aaaa"))).is_ok());
+        assert!(entra.verify(&token(json!(RESOURCE))).is_ok());
+        assert!(entra
+            .verify(&token(json!(["x", "api://0000-aaaa"])))
+            .is_ok());
+        for refused in [json!("api://0000-bbbb"), json!(["x", "y"])] {
+            assert!(
+                matches!(
+                    entra.verify(&token(refused.clone())),
+                    Err(AuthError::Invalid(_))
+                ),
+                "{refused}"
+            );
+        }
+        // Without them, only the resource.
+        assert!(verifier().verify(&token(json!("api://0000-aaaa"))).is_err());
+        // The metadata still names the resource alone.
+        assert_eq!(entra.protected_resource_metadata()["resource"], RESOURCE);
+    }
+
+    #[test]
+    fn an_entra_scp_string_is_read_as_scopes_and_a_string_role_as_a_role() {
+        let token = token_with(json!({ "scp": "User.Read  Mail.Read", "roles": "Mcp.Admin" }));
+        let p = verifier().verify(&token).unwrap();
+        assert_eq!(p.scopes, ["User.Read", "Mail.Read"]);
+        assert_eq!(p.roles, ["Mcp.Admin"]);
+        let token = token_with(json!({ "scp": ["a", "b c"] }));
+        assert_eq!(verifier().verify(&token).unwrap().scopes, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn the_identity_model_names_the_subject_and_the_roles() {
+        let model = IdentityModel {
+            subject_claim: "preferred_username".into(),
+            roles_claims: vec!["realm_access.roles".into()],
+            role_map: vec![RoleMapping {
+                claim: "groups".into(),
+                value: "/mcp-admins".into(),
+                roles: vec!["admin".into()],
+            }],
+        };
+        let token = token_with(json!({
+            "preferred_username": "ann",
+            "realm_access": { "roles": ["reader"] },
+            "groups": ["/mcp-admins"],
+            "roles": ["ignored"],
+        }));
+        let (p, claims) = verifier()
+            .with_identity(model.clone())
+            .verify_claims(&token)
+            .unwrap();
+        assert_eq!(
+            (p.subject.as_str(), p.roles.as_slice()),
+            ("ann", &["reader".to_string(), "admin".to_string()][..])
+        );
+        assert_eq!(claims["groups"], json!(["/mcp-admins"]));
+        assert_eq!(claims["sub"], "agent-7");
+        // No such claim: the token names no subject, and is refused.
+        let nameless = token_with(json!({}));
+        let refusal = verifier()
+            .with_identity(model)
+            .verify(&nameless)
+            .unwrap_err();
+        assert!(
+            matches!(&refusal, AuthError::Invalid(why) if why.contains("`preferred_username`")),
+            "{refusal}"
+        );
+    }
+
     #[test]
     fn valid_token_yields_principal() {
         let token = sign(RESOURCE, ISSUER, now() + 3600, Some("mcp.read mcp.write"));
@@ -501,6 +707,18 @@ mod tests {
         );
     }
 
+    /// A token the issuer signed for no audience is not a token for this
+    /// resource: RFC 9068 makes `aud` required, and a token minted for some
+    /// other use, an ID token without one say, must not open the gateway.
+    #[test]
+    fn a_token_with_no_aud_is_refused() {
+        let token = sign_claims(&json!({ "sub": "agent-7", "iss": ISSUER, "exp": now() + 3600 }));
+        assert!(
+            matches!(verifier().verify(&token), Err(AuthError::Invalid(_))),
+            "a token with no `aud` was accepted"
+        );
+    }
+
     #[test]
     fn a_future_nbf_is_refused() {
         let token = sign_claims(&with_time("nbf", Some(json!(now() + 3600))));
@@ -528,6 +746,18 @@ mod tests {
         claims["exp"] = json!(now() - 30);
         let token = sign_claims(&claims);
         assert_eq!(verifier().verify(&token).unwrap().subject, "agent-7");
+    }
+
+    /// `clock_leeway` is the skew `verify` allows, so what `mcpdef doctor`
+    /// measures against it is what tokens meet: valid a little inside it is
+    /// taken, a little beyond it is not.
+    #[test]
+    fn clock_leeway_is_the_skew_verify_allows() {
+        let leeway = clock_leeway().as_secs();
+        let inside = sign_claims(&with_time("nbf", Some(json!(now() + leeway - 5))));
+        assert!(verifier().verify(&inside).is_ok());
+        let beyond = sign_claims(&with_time("nbf", Some(json!(now() + leeway + 5))));
+        assert!(verifier().verify(&beyond).is_err());
     }
 
     /// jsonwebtoken refuses a string `exp` too, but only because it requires

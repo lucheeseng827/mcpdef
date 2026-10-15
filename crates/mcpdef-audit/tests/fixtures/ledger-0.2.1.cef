@@ -1,0 +1,8 @@
+CEF:0|mcpdef|mcpdef|{version}|allow|allow tools/call s0.echo|2|rt=1790262828229 suser=agent:unknown dvchost=s0 act=allow externalId=0 cn1Label=latencyMs cn1=0 cs1Label=tool cs1=echo
+CEF:0|mcpdef|mcpdef|{version}|deny|deny tools/call s1.danger|7|rt=1790262828237 suser=agent:unknown dvchost=s1 act=deny externalId=1 cn1Label=latencyMs cn1=0 cs1Label=tool cs1=danger cs2Label=rule cs2=not-on-allowlist
+CEF:0|mcpdef|mcpdef|{version}|deny|deny tools/call (unrouted).no_such_tool|7|rt=1790262828245 suser=agent:unknown dvchost=(unrouted) act=deny externalId=2 cn1Label=latencyMs cn1=0 cs1Label=tool cs1=no_such_tool cs2Label=rule cs2=unknown-tool
+CEF:0|mcpdef|mcpdef|{version}|allow|allow resources/list s0|2|rt=1790262828255 suser=agent:unknown dvchost=s0 act=allow externalId=3 cn1Label=latencyMs cn1=0
+CEF:0|mcpdef|mcpdef|{version}|deny|deny tools/call (unrouted).quote"back\\slash é ✓|7|rt=1790262828265 suser=agent:unknown dvchost=(unrouted) act=deny externalId=4 cn1Label=latencyMs cn1=0 cs1Label=tool cs1=quote"back\\slash é ✓ cs2Label=rule cs2=unknown-tool
+CEF:0|mcpdef|mcpdef|{version}|deny|deny tools/call (unrouted).evil  fake=injected|7|rt=1790262828273 suser=agent:unknown dvchost=(unrouted) act=deny externalId=5 cn1Label=latencyMs cn1=0 cs1Label=tool cs1=evil  fake\=injected cs2Label=rule cs2=unknown-tool
+CEF:0|mcpdef|mcpdef|{version}|deny|deny tools/call (unrouted).xallow|7|rt=1790262828283 suser=agent:unknown dvchost=(unrouted) act=deny externalId=6 cn1Label=latencyMs cn1=0 cs1Label=tool cs1=xallow cs2Label=rule cs2=unknown-tool
+CEF:0|mcpdef|mcpdef|{version}|allow|allow tools/call s0.echo|2|rt=1790262828292 suser=agent:unknown dvchost=s0 act=allow externalId=7 cn1Label=latencyMs cn1=0 cs1Label=tool cs1=echo

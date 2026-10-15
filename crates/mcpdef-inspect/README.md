@@ -10,7 +10,9 @@ crates; most users want the `mcpdef` binary, not this library directly.
 
 - Scans tool descriptions at connect time for prompt-injection patterns.
 - Scans tool-call results per call for secret-exfil / injection signals.
-- Runs a rule pack over the MCP wire content with off / warn / enforce modes.
+- Runs a rule pack over the MCP wire content with off / warn / enforce / redact modes: `redact` blocks as `enforce` does, but tells the caller (`Scanner::redacts`) to rewrite a result's secrets in place rather than refuse it.
+- Tells, with `secret_pattern`, whether other text holds a known credential shape: MCPdef asks it of values written in its config.
+- Says where, with `Scanner::find_all`: every match with its byte range, in the order of the text and never overlapping, for a caller that rewrites what matched instead of refusing the whole text.
 
 ## Usage
 

@@ -1,0 +1,56 @@
+# SAML sign-in to MCPdef's console, through Keycloak as the broker: one
+# command, on one machine, to see it work before your own identity provider
+# goes in.
+#
+#   docker compose up -d
+#   open http://localhost:7879, choose "Corp (SAML)", sign in as saml-admin
+#   (its password is its name; so are saml-operator's, saml-viewer's and
+#   saml-nobody's)
+#
+# Keycloak holds two realms (./realms). corp stands in for your SAML identity
+# provider: ADFS, Entra ID, Okta, Shibboleth. mcpdef is the broker: it takes
+# corp's assertions, checks their signatures, maps the groups they carry, and
+# signs people in to MCPdef over OpenID Connect. MCPdef never parses SAML.
+# The broker has people of its own too (ops-admin, ops-operator, ops-viewer,
+# ops-nobody), who sign in on its own form.
+#
+# For trying it out alone: Keycloak in development mode, plain http on this
+# machine, demo passwords and a demo client secret. README.md says how your
+# identity provider takes corp's place, and what production needs.
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.0
+    command: ["start-dev", "--import-realm", "--hostname=http://localhost:8080"]
+    environment:
+      # Keycloak's own administration console, http://localhost:8080/admin,
+      # to see how the realms are wired.
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+    ports:
+      - "127.0.0.1:8080:8080"   # Keycloak
+      - "127.0.0.1:7879:7879"   # MCPdef's console, on this service's network (below)
+      - "127.0.0.1:7878:7878"   # MCPdef's MCP listener
+    volumes:
+      - ./realms:/opt/keycloak/data/import:ro
+
+  mcpdef:
+    # MCPdef 0.4.0 or later. This tree's own: `make docker-build` at the
+    # repository's root, then MCPDEF_IMAGE=mcpdef:dev docker compose up -d
+    image: ${MCPDEF_IMAGE:-mancube/mcpdef:v0.4.0}
+    # On Keycloak's network, http://localhost:8080 is Keycloak for MCPdef as
+    # it is for the browser: both see the one issuer the tokens name.
+    network_mode: "service:keycloak"
+    depends_on: [keycloak]
+    command: ["run", "--http", "--config", "/etc/mcpdef/mcpdef.toml"]
+    environment:
+      # The client secret realms/mcpdef.json gives the console's client.
+      MCPDEF_OIDC_CLIENT_SECRET: mcpdef-console-demo-secret
+    volumes:
+      - ./mcpdef.toml:/etc/mcpdef/mcpdef.toml:ro
+      # The ledger and the session key, in the home of the user the image
+      # runs as (65532), so that a new volume there is that user's to write.
+      - mcpdef-data:/home/nonroot
+    restart: unless-stopped
+
+volumes:
+  mcpdef-data:

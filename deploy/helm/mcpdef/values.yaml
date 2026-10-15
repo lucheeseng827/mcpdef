@@ -8,27 +8,34 @@ image:
   tag: ""
   pullPolicy: IfNotPresent
 
-# The gateway serialises upstream calls behind a mutex, and each replica keeps
-# its OWN audit ledger / pin store (no cross-replica coordination in OSS). Scale
-# out only if you aggregate the per-replica ledgers downstream.
+# Each replica keeps its OWN audit ledger and pin store (no cross-replica
+# coordination in OSS). Scale out only if you aggregate the per-replica ledgers
+# downstream.
 replicaCount: 1
 
 # The full mcpdef.toml, rendered into a ConfigMap and mounted at
-# /etc/mcpdef/mcpdef.toml. Declare your MCP servers here. The read-only admin
-# server (Prometheus /metrics + status UI) has no auth of its own, so it is
-# DISABLED by default. To turn it on, set `enabled = true` here AND
-# `admin.enabled=true` below (which publishes the port); keep it in-cluster /
-# behind a NetworkPolicy or an auth proxy — never internet-facing.
+# /etc/mcpdef/mcpdef.toml. Declare your MCP servers here. The admin listener
+# (the console, its API and Prometheus /metrics) is DISABLED by default. To turn
+# it on, set `enabled = true` here AND `admin.enabled=true` below (which
+# publishes the port), and say how people sign in: at your identity provider
+# ([gateway.admin.oidc], docs/SSO.md, and docs/DEPLOY.md for this chart), by
+# client certificate, or by an auth proxy in front.
 config: |
   [gateway]
   listen = "0.0.0.0:7878"
   audit  = "/var/lib/mcpdef/audit.log"
 
-  # Unauthenticated read-only admin/metrics — off by default. To enable, flip
-  # this to true and set `admin.enabled=true` in values to expose the port.
+  # The console, its API and /metrics — off by default. To enable, flip this to
+  # true and set `admin.enabled=true` in values to expose the port. Bound to
+  # every interface, it needs a sign-in ([gateway.admin.oidc], or client
+  # certificates, see docs/CONFIG.md) or `allow_unauthenticated = true` behind
+  # a NetworkPolicy or an auth proxy; a scrape by the Service's name needs that
+  # name in `hosts`.
   [gateway.admin]
   enabled = false
   listen  = "0.0.0.0:7879"
+  # allow_unauthenticated = true
+  # hosts = ["mcpdef"]
 
   # --- declare the MCP servers to front (deny-by-default allowlist) ---
   # [[server]]
@@ -38,11 +45,47 @@ config: |
   # tools     = ["*"]                  # allowlist; deny wins over allow
   # deny      = ["delete_*"]
 
-# Expose the read-only admin/metrics listener (:7879) on the container and the
-# Service. OFF by default because it is unauthenticated — any in-cluster workload
-# could otherwise reach it. Enabling here only publishes the port; you must also
-# turn the listener on in `config` ([gateway.admin] enabled = true). Keep it
-# behind a NetworkPolicy / auth proxy, never internet-facing.
+# Roll the pods when `config` changes (a `checksum/config` annotation), so that
+# every change applies, one only a restart can apply included. Set it to false
+# to have the gateway apply a change itself, without dropping a call: set
+# `[gateway] watch_config = true` in `config`, and the gateway picks up the
+# mounted ConfigMap within 30 s of the kubelet updating it, which takes up to a
+# minute or so. A change only a restart applies (`listen`, `[gateway.auth]`,
+# ...) is then refused, and logged, until the pods next restart.
+rolloutOnConfigChange: true
+
+# Variables for the gateway: a secret `config` reads with `{ env = "NAME" }`,
+# from a Kubernetes Secret, say. No stdio server the gateway starts inherits a
+# variable a secret is read from.
+env: []
+#  - name: MCPDEF_GITHUB_TOKEN
+#    valueFrom:
+#      secretKeyRef: { name: mcpdef-secrets, key: github-token }
+envFrom: []
+
+# Volumes to add, and where the gateway mounts them: a Kubernetes Secret whose
+# files `config` reads with `{ file = "/run/secrets/mcpdef/<key>" }`, a CA
+# bundle, client certificate and key for [gateway.upstream_tls] and
+# [server.tls], or the listener's own certificate and key for [gateway.tls]
+# mode = "files", such as a cert-manager Secret (with `watch_config = true`, a
+# renewal is served within 30 s). Mount the directory, not a subPath: the kubelet replaces a
+# Secret's files in place when it changes, and a subPath mount never sees that.
+# Give a Secret `defaultMode: 0400`: the kubelet makes its files root's, and
+# readable by the pod's fsGroup too, which MCPdef accepts, since the gateway
+# reads them through that group. The default, 0644, lets every user read them.
+extraVolumes: []
+#  - name: secrets
+#    secret:
+#      secretName: mcpdef-secrets
+#      defaultMode: 0400
+extraVolumeMounts: []
+#  - { name: secrets, mountPath: /run/secrets/mcpdef, readOnly: true }
+
+# Expose the admin listener (:7879: the console, its API, /metrics) on the
+# container and the Service. OFF by default. Enabling here only publishes the
+# port; you must also turn the listener on in `config` ([gateway.admin]
+# enabled = true), and sign its callers in: at your identity provider, by
+# client certificate, or by an auth proxy. Never internet-facing without one.
 admin:
   enabled: false
 
@@ -64,6 +107,19 @@ serviceMonitor:
   enabled: false
   interval: 15s
   scrapeTimeout: 10s
+  # Where the admin listener signs its callers in, /metrics answers only one
+  # that is: Prometheus too. Added to the endpoint as it is, how it does: a
+  # token your identity provider issues for [gateway.admin.oidc] api_audience
+  # with mcpdef:admin:read, fetched by the client credentials grant,
+  #   endpoint:
+  #     oauth2:
+  #       clientId: { secret: { name: mcpdef-scraper, key: client-id } }
+  #       clientSecret: { name: mcpdef-scraper, key: client-secret }
+  #       tokenUrl: https://keycloak.example.com/realms/ops/protocol/openid-connect/token
+  #       scopes: ["mcpdef:admin:read"]
+  # or a client certificate the listener maps to console:viewer (`scheme:
+  # https` and `tlsConfig`).
+  endpoint: {}
 
 resources:
   requests:

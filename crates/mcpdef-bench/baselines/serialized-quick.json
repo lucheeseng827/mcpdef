@@ -1,0 +1,196 @@
+{
+  "schema": 1,
+  "generated_at_unix": 1790258892,
+  "mcpdef_version": "mcpdef 0.2.1  ·  MCP gateway & governance plane",
+  "commit": "e53ecc58a420762078aeee6f1fdf0c234bd71595",
+  "note": "From before calls ran concurrently, quick run: the serialized gateway, one lock held across every upstream call. Measured on a 4-vCPU cloud container; comparable only with quick runs on the same machine type.",
+  "machine": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpus": 4,
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "mem_total_kb": 16481980
+  },
+  "params": {
+    "quick": true,
+    "warmup": 100,
+    "requests": 600,
+    "concurrency": [
+      1,
+      16
+    ],
+    "slow_ms": 1000,
+    "neighbour_upstreams": 20,
+    "neighbour_concurrency": 8,
+    "neighbour_alone_ms": 1500,
+    "neighbour_beside_ms": 3000,
+    "idle_upstreams": 10,
+    "idle_load_requests": 300
+  },
+  "scenarios": {
+    "allowed": [
+      {
+        "concurrency": 1,
+        "direct": {
+          "n": 600,
+          "errors": 0,
+          "min_us": 58,
+          "p50_us": 109,
+          "p90_us": 155,
+          "p99_us": 229,
+          "max_us": 277,
+          "mean_us": 119,
+          "rps": 8330.141500781618
+        },
+        "gateway": {
+          "n": 600,
+          "errors": 0,
+          "min_us": 216,
+          "p50_us": 274,
+          "p90_us": 396,
+          "p99_us": 704,
+          "max_us": 3050,
+          "mean_us": 311,
+          "rps": 3204.356711744898
+        },
+        "added_p50_us": 165,
+        "added_p99_us": 475,
+        "ratio_p50": 2.5137614678899083,
+        "ratio_p99": 3.074235807860262
+      },
+      {
+        "concurrency": 16,
+        "direct": {
+          "n": 600,
+          "errors": 0,
+          "min_us": 94,
+          "p50_us": 318,
+          "p90_us": 441,
+          "p99_us": 546,
+          "max_us": 836,
+          "mean_us": 324,
+          "rps": 48068.89233649667
+        },
+        "gateway": {
+          "n": 600,
+          "errors": 0,
+          "min_us": 399,
+          "p50_us": 4252,
+          "p90_us": 4634,
+          "p99_us": 9484,
+          "max_us": 9694,
+          "mean_us": 4318,
+          "rps": 3666.399402445337
+        },
+        "added_p50_us": 3934,
+        "added_p99_us": 8938,
+        "ratio_p50": 13.371069182389936,
+        "ratio_p99": 17.36996336996337
+      }
+    ],
+    "denied": [
+      {
+        "concurrency": 1,
+        "gateway": {
+          "n": 600,
+          "errors": 0,
+          "min_us": 104,
+          "p50_us": 112,
+          "p90_us": 144,
+          "p99_us": 235,
+          "max_us": 297,
+          "mean_us": 121,
+          "rps": 8211.444588672386
+        },
+        "ratio_p50_vs_direct": 1.0275229357798166
+      },
+      {
+        "concurrency": 16,
+        "gateway": {
+          "n": 600,
+          "errors": 0,
+          "min_us": 74,
+          "p50_us": 476,
+          "p90_us": 819,
+          "p99_us": 1100,
+          "max_us": 1309,
+          "mean_us": 517,
+          "rps": 30495.633330263438
+        },
+        "ratio_p50_vs_direct": 1.4968553459119496
+      }
+    ],
+    "slow_neighbour": [
+      {
+        "transport": "http",
+        "upstreams": 20,
+        "slow_ms": 1000,
+        "concurrency": 8,
+        "alone": {
+          "n": 5814,
+          "errors": 0,
+          "min_us": 324,
+          "p50_us": 2010,
+          "p90_us": 2480,
+          "p99_us": 3705,
+          "max_us": 7202,
+          "mean_us": 2064,
+          "rps": 3871.071978270926
+        },
+        "beside_slow": {
+          "n": 32,
+          "errors": 0,
+          "min_us": 900700,
+          "p50_us": 1004789,
+          "p90_us": 1005205,
+          "p99_us": 1005579,
+          "max_us": 1005579,
+          "mean_us": 979065,
+          "rps": 8.16865134389516
+        },
+        "slow_calls_completed": 5,
+        "ratio_p50": 499.8950248756219,
+        "ratio_p99": 271.41133603238865
+      },
+      {
+        "transport": "stdio",
+        "upstreams": 20,
+        "slow_ms": 1000,
+        "concurrency": 8,
+        "alone": {
+          "n": 10684,
+          "errors": 0,
+          "min_us": 209,
+          "p50_us": 1093,
+          "p90_us": 1302,
+          "p99_us": 2400,
+          "max_us": 4551,
+          "mean_us": 1122,
+          "rps": 7118.128390021554
+        },
+        "beside_slow": {
+          "n": 32,
+          "errors": 0,
+          "min_us": 899385,
+          "p50_us": 1002473,
+          "p90_us": 1003787,
+          "p99_us": 1004269,
+          "max_us": 1004269,
+          "mean_us": 977305,
+          "rps": 8.180908882395155
+        },
+        "slow_calls_completed": 5,
+        "ratio_p50": 917.1756633119853,
+        "ratio_p99": 418.4454166666667
+      }
+    ],
+    "idle_rss": {
+      "upstreams": 10,
+      "idle_rss_kb": 8192,
+      "idle_hwm_kb": 8192,
+      "after_load_rss_kb": 8768,
+      "after_load_hwm_kb": 8768,
+      "load_requests": 300
+    }
+  }
+}

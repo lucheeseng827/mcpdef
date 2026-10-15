@@ -1,0 +1,104 @@
+{
+  "realm": "corp",
+  "displayName": "Corp, a SAML identity provider",
+  "enabled": true,
+  "sslRequired": "external",
+  "registrationAllowed": false,
+  "groups": [
+    { "name": "mcpdef-admins" },
+    { "name": "mcpdef-operators" },
+    { "name": "mcpdef-viewers" }
+  ],
+  "users": [
+    {
+      "username": "saml-admin",
+      "enabled": true,
+      "email": "saml-admin@corp.example",
+      "emailVerified": true,
+      "firstName": "Sam",
+      "lastName": "Admin",
+      "credentials": [{ "type": "password", "value": "saml-admin", "temporary": false }],
+      "groups": ["/mcpdef-admins"]
+    },
+    {
+      "username": "saml-operator",
+      "enabled": true,
+      "email": "saml-operator@corp.example",
+      "emailVerified": true,
+      "firstName": "Oli",
+      "lastName": "Operator",
+      "credentials": [{ "type": "password", "value": "saml-operator", "temporary": false }],
+      "groups": ["/mcpdef-operators"]
+    },
+    {
+      "username": "saml-viewer",
+      "enabled": true,
+      "email": "saml-viewer@corp.example",
+      "emailVerified": true,
+      "firstName": "Sal",
+      "lastName": "Viewer",
+      "credentials": [{ "type": "password", "value": "saml-viewer", "temporary": false }],
+      "groups": ["/mcpdef-viewers"]
+    },
+    {
+      "username": "saml-nobody",
+      "enabled": true,
+      "email": "saml-nobody@corp.example",
+      "emailVerified": true,
+      "firstName": "Sid",
+      "lastName": "Nobody",
+      "credentials": [{ "type": "password", "value": "saml-nobody", "temporary": false }]
+    }
+  ],
+  "clients": [
+    {
+      "clientId": "http://localhost:8080/realms/mcpdef",
+      "name": "The mcpdef realm, brokering this one",
+      "protocol": "saml",
+      "enabled": true,
+      "fullScopeAllowed": false,
+      "frontchannelLogout": true,
+      "redirectUris": ["http://localhost:8080/realms/mcpdef/broker/corp/endpoint"],
+      "attributes": {
+        "saml.authnstatement": "true",
+        "saml.server.signature": "true",
+        "saml.assertion.signature": "true",
+        "saml.client.signature": "false",
+        "saml.encrypt": "false",
+        "saml.force.post.binding": "true",
+        "saml.signature.algorithm": "RSA_SHA256",
+        "saml_signature_canonicalization_method": "http://www.w3.org/2001/10/xml-exc-c14n#",
+        "saml_name_id_format": "email",
+        "saml_force_name_id_format": "true",
+        "saml_assertion_consumer_url_post": "http://localhost:8080/realms/mcpdef/broker/corp/endpoint",
+        "saml_single_logout_service_url_post": "http://localhost:8080/realms/mcpdef/broker/corp/endpoint"
+      },
+      "protocolMappers": [
+        {
+          "name": "email",
+          "protocol": "saml",
+          "protocolMapper": "saml-user-property-mapper",
+          "config": { "user.attribute": "email", "attribute.name": "email", "attribute.nameformat": "Basic" }
+        },
+        {
+          "name": "firstName",
+          "protocol": "saml",
+          "protocolMapper": "saml-user-property-mapper",
+          "config": { "user.attribute": "firstName", "attribute.name": "firstName", "attribute.nameformat": "Basic" }
+        },
+        {
+          "name": "lastName",
+          "protocol": "saml",
+          "protocolMapper": "saml-user-property-mapper",
+          "config": { "user.attribute": "lastName", "attribute.name": "lastName", "attribute.nameformat": "Basic" }
+        },
+        {
+          "name": "groups",
+          "protocol": "saml",
+          "protocolMapper": "saml-group-membership-mapper",
+          "config": { "attribute.name": "groups", "attribute.nameformat": "Basic", "full.path": "false", "single": "true" }
+        }
+      ]
+    }
+  ]
+}

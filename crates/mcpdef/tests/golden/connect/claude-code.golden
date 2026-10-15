@@ -1,0 +1,14 @@
+# Claude Code: merge into .mcp.json (`mcpdef connect claude-code --write` does it)
+{
+  "mcpServers": {
+    "mcpdef": {
+      "type": "http",
+      "url": "https://127.0.0.1:8443/mcp"
+    }
+  }
+}
+
+# or, for every project rather than this one:
+claude mcp add --transport http --scope user mcpdef https://127.0.0.1:8443/mcp
+
+The gateway's certificate is from its own CA. Before starting Claude Code: export NODE_EXTRA_CA_CERTS=$DIR/state/tls/ca.crt

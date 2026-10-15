@@ -28,7 +28,8 @@ fn respond(req: &Message) -> Option<Message> {
         )),
         Some("notifications/initialized") => None,
         Some("tools/list") => Some(Message::result(id?, serde_json::json!({ "tools": [] }))),
-        // Anything else (e.g. "resources/list") goes through forward_to_primary.
+        // Anything else: the gateway refuses what it does not serve before it
+        // gets here.
         _ => id.map(|i| Message::error(i, -32601, "method not found")),
     }
 }
@@ -76,19 +77,22 @@ async fn gateway_with_metrics(dir: &std::path::Path) -> (Gateway, Arc<Metrics>) 
 }
 
 #[tokio::test]
-async fn forwarded_non_tool_call_is_audited_but_not_metered() {
+async fn a_refused_non_tool_call_is_audited_but_not_metered() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut gw, metrics) = gateway_with_metrics(dir.path()).await;
+    let (gw, metrics) = gateway_with_metrics(dir.path()).await;
 
-    gw.handle(Message::request(Id::Num(2), "resources/list", None))
+    // A method MCPdef does not serve is refused, and its refusal audited
+    // (ledger), but mcpdef_tools_calls_total is a tools/call-only counter —
+    // nothing should have been recorded.
+    let refused = gw
+        .handle(Message::request(Id::Num(2), "logging/setLevel", None))
         .await
+        .unwrap()
         .unwrap();
-
-    // forward_to_primary's Allow is audited (ledger), but mcpdef_tools_calls_total
-    // is a tools/call-only counter — nothing should have been recorded.
+    assert_eq!(refused.error.expect("a refusal")["code"], -32601);
     assert!(
-        !metrics.render_prometheus().contains("resources/list"),
-        "a forwarded non-tools/call method must not appear in tool-call metrics"
+        !metrics.render_prometheus().contains("logging/setLevel"),
+        "a non-tools/call method must not appear in tool-call metrics"
     );
     assert_eq!(metrics.snapshot_json()["total"], serde_json::json!(0));
 }
@@ -96,7 +100,7 @@ async fn forwarded_non_tool_call_is_audited_but_not_metered() {
 #[tokio::test]
 async fn unrouted_tool_call_collapses_to_a_fixed_metrics_label() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut gw, metrics) = gateway_with_metrics(dir.path()).await;
+    let (gw, metrics) = gateway_with_metrics(dir.path()).await;
 
     // Two distinct, caller-controlled "tool names" hitting the unknown-tool gate.
     for name in ["../../etc/passwd", "not-a-real-tool-xyz"] {
