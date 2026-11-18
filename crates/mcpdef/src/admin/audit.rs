@@ -318,7 +318,7 @@ struct ExportQuery {
     wanted: Wanted,
 }
 
-/// `GET /api/v1/audit/export?format=json|ocsf|cef|syslog`: the records a
+/// `GET /api/v1/audit/export?format=json|ocsf|cef|syslog|otlp`: the records a
 /// filter wants, first to last, one line each in the format `mcpdef audit
 /// tail` writes, streamed as they are read.
 async fn export(
@@ -360,8 +360,10 @@ async fn export(
             };
             let mut out = String::new();
             for (record, _) in batch.iter().filter(|(r, _)| filter.matches(r)) {
-                out.push_str(&record.export(format));
-                out.push('\n');
+                if let Some(line) = record.export(format) {
+                    out.push_str(&line);
+                    out.push('\n');
+                }
             }
             if !out.is_empty() && tx.blocking_send(Ok(Bytes::from(out))).is_err() {
                 return;
@@ -373,6 +375,7 @@ async fn export(
         ExportFormat::Ocsf => ("application/x-ndjson", "mcpdef-audit.ocsf.jsonl"),
         ExportFormat::Cef => ("text/plain; charset=utf-8", "mcpdef-audit.cef"),
         ExportFormat::Syslog => ("text/plain; charset=utf-8", "mcpdef-audit.log"),
+        ExportFormat::Otlp => ("application/x-ndjson", "mcpdef-audit.otlp.jsonl"),
     };
     Ok((
         [

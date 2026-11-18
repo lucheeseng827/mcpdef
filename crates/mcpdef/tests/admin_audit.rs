@@ -394,11 +394,22 @@ async fn export_streams_each_format() {
         let event: Value = serde_json::from_str(line).unwrap();
         assert_eq!(event["class_uid"], 6003, "{event}");
     }
+    // A span for each governed call: the gateway's own records have none.
+    let otlp = lines("otlp", "&server=a").await;
+    assert_eq!(otlp.len(), 7, "9 records, 2 of them the gateway's own");
+    for line in &otlp {
+        let request: Value = serde_json::from_str(line).unwrap();
+        let span = &request["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert!(
+            span["name"].as_str().unwrap().starts_with("tools/call "),
+            "{span}"
+        );
+    }
     let (status, _, problem) = get(&format!("{base}/api/v1/audit/export?format=pdf")).await;
     assert_eq!(status, 400);
     assert_eq!(
         problem["detail"],
-        "format is one of json, ocsf, cef, syslog"
+        "format is one of json, ocsf, cef, syslog, otlp"
     );
 }
 

@@ -95,8 +95,14 @@ impl Gateway {
         }
         changes.removed = count(before.keys().filter(|name| !after.contains_key(*name)));
 
-        let drifted = self.pin_check(id, &tools);
-        changes.drifted = count(drifted.difference(&slot.drifted));
+        let verdicts = self.pin_check(id, &tools);
+        self.audit_accepted(id, &verdicts.accepted).await;
+        let drifted = verdicts.held;
+        changes.drifted = count(
+            drifted
+                .keys()
+                .filter(|name| !slot.drifted.contains_key(*name)),
+        );
         let scanner = g.inspect.as_deref();
         let mut poisoned = self.inspect_check(scanner, id, &fresh, TOOLS_CHANGED).await;
         poisoned.extend(

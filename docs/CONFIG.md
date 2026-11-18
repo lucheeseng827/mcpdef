@@ -321,8 +321,10 @@ Struct: `GatewayConfig` (`config.rs`).
 |---|---|---|---|
 | `listen` | string `host:port` | `"127.0.0.1:7878"` | Bind address for the downstream Streamable HTTP listener (`mcpdef run --http` / `mcpdef up`). Loopback by default — binding wider is a deliberate act. It is bound before the upstreams start, and the ready line names the address taken: port `0` takes one the system gives. One that cannot be bound stops the start. |
 | `audit` | path | `"./mcpdef-audit/audit.log"` | The append-only, hash-linked audit ledger (JSONL, one record per governed call). Parent dirs are created on first run. |
+| `audit_fsync` | bool | `false` | `fsync` each audit record before the call it records is answered, so that an answer means its record is on disk. Each start syncs the ledger and its directory first, so the file's name and the records already in it are not lost either, including ones written before `audit_fsync` was turned on. So is the directory above it, for a directory just made, where MCPdef may read it. Where it may not, MCPdef starts all the same, and a crash can lose a directory made just before. `false`: each record is written to the operating system before the answer, and the system writes it to disk in its own time. A crash of MCPdef then loses no record, but a crash of the machine can lose the last ones. [PERFORMANCE.md](./PERFORMANCE.md) has what each mode costs. Either way, if writing a record fails, MCPdef logs it and still answers the call. |
 | `policy` | path | unset | **Reserved** for a policy directory. Parsed but unused today — declare rules inline with [`[[policy]]`](#policy--policy-as-code-rules). |
-| `pins` | path | unset (pinning off) | Tool-def pin store (TOML). When set, MCPdef pins each upstream tool's definition (trust-on-first-use) and denies + audits a `rug-pull` if a definition later drifts. Managed with `mcpdef pin` / `mcpdef diff-tools`. |
+| `pins` | path | unset (pinning off) | Tool-def pin store (TOML). When set, MCPdef pins each upstream tool's definition (trust-on-first-use) and grades a definition that later drifts: one within `pin_accept` is pinned again and recorded, and any other is held, hidden, and denied + audited as a `rug-pull` until approved. Managed with `mcpdef pin` / `mcpdef diff-tools`. See [OPERATIONS.md § When a tool drifts from its pin](./OPERATIONS.md#when-a-tool-drifts-from-its-pin). |
+| `pin_accept` | `info` \| `risky` | `info` | The worst grade of drift a pin takes without an approval. `info`: a change that means nothing, such as an array whose order means nothing reordered, whitespace in a text, or a number written another way. `risky`: that, and a definition that takes less: a property required now, or gone from an object that takes no other; an enum value gone; a type, a bound or a pattern narrowed. A tool so changed is pinned again, and the ledger records how (`rule = "drift-accepted"`). There is no `breaking`: a reworded description, a tool that takes or returns more, or a changed annotation is always held. With no `pins`, it has no effect. A reload applies it. |
 | `profile` | string | unset | The active gateway profile — a `[profile.<name>]` layered over **every** server, scoping the whole tool surface an agent sees. Overridable at launch with `--profile`. |
 | `upstream_timeout_ms` | int (ms) | unset / `0` = no timeout | Per-call upstream bound, covering the whole call: waiting for a slot under the server's `max_inflight`, sending the request (a Streamable-HTTP POST, a wasm module's run) and waiting for the reply. A wedged upstream is failed as an audited `upstream-timeout` instead of hanging the gateway; a reply that arrives later is dropped. Also bounds each upstream's opening, at startup and on every restart: one that does not open in time starts down and is retried. Unset, an opening waits as long as it takes. And it bounds the `tools/list` MCPdef sends when an upstream says its tools changed; unset, that waits 30 s at most. A `spec = "auto"` upstream gets the era probe's 5s **on top of** this for its opening, since the probe measures something else — see [WIRE.md](./WIRE.md). |
 | `allowed_origins` | array of strings | `[]` | Extra `Origin` values accepted on the HTTP listener beyond loopback (`localhost`/`127.0.0.1`/`::1`, any port, always allowed; requests with no Origin always pass). Anything else → `403` (DNS-rebinding defense). |
@@ -334,14 +336,52 @@ Struct: `GatewayConfig` (`config.rs`).
 | `state_dir` | path | `"./mcpdef-state"` | Where MCPdef keeps what it makes for itself: under `tls/`, the local CA and the certificate it issues the listeners with `[gateway.tls] mode = "self-signed"`. The directory is made `0700` and the keys in it `0600`. Keep it across restarts and upgrades: a new CA is one every client has to trust anew. |
 
 A reload (`SIGHUP`, or `watch_config`) applies every setting except these:
-the `[gateway]` keys `listen`, `allowed_origins`, `max_inflight`, `wire` and
-`audit`; `[gateway.admin]`'s `enabled` and `listen`; the `[gateway.auth]`
+the `[gateway]` keys `listen`, `allowed_origins`, `max_inflight`, `wire`,
+`audit` and `audit_fsync`; the `[gateway.otel]` table; `[gateway.admin]`'s `enabled` and `listen`; the `[gateway.auth]`
 table, a `jwks` file's content included; and TLS turned on or off on either
 listener. A config that changes one of them is refused whole, and applies at
 the next restart. TLS profiles apply on a reload, a certificate renewed in
 place included, and so does each listener's certificate, and what it asks of a
 client's: see
 [TLS on MCPdef's own listeners](#gatewaytls-and-gatewayadmintls--tls-on-mcpdefs-own-listeners).
+
+## `[gateway.otel]` — spans to an OpenTelemetry endpoint
+
+Struct: `OtelConfig` (`config.rs`).
+
+Each governed request the ledger records is sent as an OpenTelemetry span, by
+OTLP/HTTP in JSON, to the endpoint the table names: evald's `:4318`, an
+OpenTelemetry Collector, or any backend that takes OTLP. Without the table,
+none is sent.
+[OPERATIONS.md § Traces](./OPERATIONS.md#traces-each-call-as-an-opentelemetry-span)
+has what a span holds, and how it joins the agent's own trace.
+
+```toml
+[gateway.otel]
+endpoint = "http://127.0.0.1:4318"
+token = { env = "EVALD_TOKEN" }
+```
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `endpoint` | URL | required | The OTLP/HTTP endpoint, as `OTEL_EXPORTER_OTLP_ENDPOINT` names one: the spans are posted to its `/v1/traces`. A URL whose path already ends in `/v1/traces` is used as it is. `http://` or `https://`, with no credentials in it; a secret in its query is warned about, to be given as `token` instead. It is reached as the gateway's other requests are: through [`[gateway.egress]`](#gatewayegress), so a public endpoint needs `https://`, and with the TLS profile of [`[gateway.upstream_tls]`](#gatewayupstream_tls-and-servertls--tls-towards-upstreams). |
+| `token` | [secret](#secrets) | unset | A bearer token, sent as `Authorization: Bearer <token>`. Read when the first spans are sent, and again once after a `401`, so a token rotated in place is picked up. A token sent over plain HTTP to another machine is warned about. |
+| `service_name` | string | `"mcpdef"` | The `service.name` of the spans' resource: what a backend lists them under. |
+
+- **When spans go:** a second after a record is written, with the records
+  written meanwhile, at most 512 to a request. No call waits for them: the
+  exporter reads the ledger's file, as `mcpdef audit tail` does.
+- **When the endpoint does not take them:** one that cannot be reached, or
+  answers `429`, `502`, `503` or `504`, is tried again after its
+  `Retry-After`, or after a second, twice as long each time, up to a minute.
+  The records written meanwhile wait in the ledger, and go once it takes
+  spans again. Any other answer has the spans refused for good: they are
+  dropped, with a log line that says so.
+- **A restart** starts at the ledger's end. The spans of records written
+  while the endpoint was down, and not yet sent, are not sent after it.
+  `mcpdef audit tail --format otlp` prints any record's span.
+- **A reload** that changes the table is refused, and the change applies at
+  the next restart.
 
 ## `[gateway.rate_limit]`
 
@@ -950,6 +990,20 @@ A new key, or a deleted `session.key`, signs everyone out. A change to
 `[gateway.admin.oidc]`, `[gateway.admin.session]` or `public_url` takes a
 restart.
 
+## `[gateway.filter]` — filter mode, behind a proxy that routes
+
+Struct: `FilterConfig`. Where `mcpdef filter` answers the checks of a proxy
+that routes MCP requests itself, as Envoy's `ext_authz` filter makes them, and
+how it reads their paths: see [OPERATIONS.md § Filter mode](./OPERATIONS.md#filter-mode-behind-a-proxy-that-routes).
+Each `[[server]]`'s `filter_path` says which requests are its. The rest of
+`[gateway]` applies as it does to the gateway: `audit`, `audit_fsync`,
+`rate_limit`, `allowed_origins`, `[gateway.auth]` and `[gateway.otel]`.
+
+| Key | Type | Default | What it does |
+|---|---|---|---|
+| `listen` | string `host:port` | `"127.0.0.1:7880"` | Where the proxy sends its checks: an address only the proxy reaches, such as loopback beside it. The ready line names the address taken. One that cannot be bound stops the start. |
+| `path_prefix` | string (path) | unset | What the proxy puts before a request's path in the check it sends, Envoy's `http_service.path_prefix`: taken off, by whole segments, before the path is routed. A check whose path does not start with it is refused (`unknown-route`). It must start with `/`, and hold nothing a proxy could read otherwise, as a `filter_path` must not. |
+
 ## `[gateway.inspect]` — injection / secret-exfil scanning
 
 Struct: `InspectConfig`. Inline scanning of the two untrusted-content surfaces an
@@ -1378,6 +1432,7 @@ Struct: `ServerConfig`. At least one is required.
 | `deny` | all | array of globs | `[]` | Glob denies (e.g. `delete_*`); deny wins over allow. |
 | `profile` | all | string | unset | Inherit allow/deny from `[profile.<name>]` (see resolution rule above). |
 | `prefix` | all | string | the server's `id` | With `[gateway] tool_namespace = "prefix"`, what its tools' listed names start with, before `__`: letters, digits, `_`, `-` and `.`. Unused, and warned about, while `tool_namespace` is off. See [Tool names](#tool-names). |
+| `filter_path` | all | string (path) | unset | Filter mode (`mcpdef filter`): the path, at the proxy in front, under which the proxy routes requests to this server, such as `/github`. A request is this server's when its path is this one or below it, by whole segments, the longest that fits winning; `/` takes any path. It must start with `/`, with no query, and hold no `.` or `..` segment, `//`, `\`, or escaped `/`, `\` or `.`; two servers may not share one. Unset, filter mode routes nothing here. Unused by the gateway in the path. See [OPERATIONS.md § Filter mode](./OPERATIONS.md#filter-mode-behind-a-proxy-that-routes). |
 | `max_inflight` | all | int ≥ 1 | `16`; `1` for `wasm` and `wasm-component` | The most calls that may wait on this upstream at once. A call over the cap waits for a slot, and the wait counts against `upstream_timeout_ms`; nothing is refused. (`[gateway] max_inflight` is different: it sheds excess HTTP requests with a `503`.) On a Streamable-HTTP upstream this many calls POST at once. On stdio and the SSE bridge they share the one connection: each goes out under its own request id, and each reply is routed back to its call, in whatever order replies arrive. A wasm module runs one call at a time whatever this says. |
 | `resources` | all | array of [URI patterns](#resource-uri-patterns) | unset = none | Resource allowlist: the URIs a `resources/read` may name, and the resources `resources/list` shows. Unset or empty exposes none of this server's resources. |
 | `resource_templates` | all | array of globs | unset = none | The URI templates `resources/templates/list` shows, matched against each template as the server writes it (`file:///{path}`). Showing one allows no read: a URI filled in from it is read only if `resources` allows it. A `completion/complete` for a template goes to the server that listed it, else the first whose `resource_templates` shows it. |
@@ -1514,17 +1569,30 @@ Every subcommand that reads config takes `--config <file>` (default `mcpdef.toml
 
 | Command | Flags beyond `--config` | What it does |
 |---|---|---|
-| `mcpdef run` | `--profile <name>`, `--http` | Run the gateway; serves the client over stdio, or over the Streamable HTTP listener with `--http`. `--profile` overrides `[gateway] profile` for this run. |
-| `mcpdef up` | `--profile <name>` | Shorthand for `run --http`. |
+| `mcpdef run` | `--profile <name>`, `--http`, `--bundle-trust <jwks>` | Run the gateway; serves the client over stdio, or over the Streamable HTTP listener with `--http`. `--profile` overrides `[gateway] profile` for this run. `--bundle-trust`, or the variable `MCPDEF_BUNDLE_TRUST`, runs only a config the signed bundle beside it holds, `<config>.bundle`, signed by a key in the file it names: at the start and at each reload, a config that bundle does not hold is refused as `bundle-unverified`, and one older than the node's floor or than the revision running as `bundle-older`. A refusal at the start stops it. The ready line names the revision: `· bundle r<n>`. See [DEPLOY.md § Holding the gateway to its bundle](./DEPLOY.md#holding-the-gateway-to-its-bundle). |
+| `mcpdef up` | `--config <path>`, `--profile <name>`, `--bundle-trust <jwks>` | Shorthand for `run --http`. With no `--config` it runs `mcpdef.toml`. When there is none in the working directory, it first writes one, as `mcpdef import` writes it, from the MCP servers the clients on this machine run. It says which, and fails if there are none. A server only the working directory's own files name is not started unless a client was told to run it there (see `import`). With `--bundle-trust`, as on `run`, none is written: no bundle would hold it. |
+| `mcpdef import` | `--from <client>` (repeatable), `--out <path>`, `--force`, `--listen <addr>` (default `127.0.0.1:7878`), `--project-servers` | Print the config that fronts the MCP servers this machine's clients already run, or write it to `--out` (`--force` replaces a file that is there). The servers are read from Claude Code's `.mcp.json` and `~/.claude.json` (its user servers, and this directory's), Claude Desktop's config, Cursor's `.cursor/mcp.json` and `~/.cursor/mcp.json`, VS Code's `.vscode/mcp.json` and Codex's `~/.codex/config.toml`. None of them is changed. `--from claude-code`, `claude-desktop`, `cursor`, `vscode` or `codex` reads only that client's. **What the config does:** each server's tools, resources and prompts are all let through, every call is audited, and `[gateway.inspect] mode = "warn"`. **How it is built:** a server several clients run, under any name, is fronted once, and a different server under a name already taken gets the client's name after it. **Values:** a variable the client fills in becomes `{ env = "NAME" }`: Claude Code's `${NAME}`, `${env:NAME}` in Cursor and VS Code, and Codex's `bearer_token_env_var` and `env_http_headers`. A value written in the client is written in the config. The file is always made `0600`. **The directory's own files:** a server only `.mcp.json`, `.cursor/mcp.json` or `.vscode/mcp.json` here names is fronted when a client was told to run it here: Claude Code's approval for the directory, in `~/.claude.json` or the user's `~/.claude/settings.json`, and never a file in the directory itself. MCPdef cannot see that Cursor or VS Code was told to, so theirs are listed as not fronted. `--project-servers` fronts them all, each with a note to read what it runs first. **Not fronted:** an entry that is MCPdef itself is listed as not fronted, as is one the client has turned off. MCPdef itself is an entry that runs `mcpdef` (`mcpdef.exe`) or the `mancube/mcpdef` image under `docker run` or `podman run`, and one whose URL reaches `--listen`: at its host; at a loopback or the unspecified address, for a listener on loopback or on every address; and at this machine's name or one of its addresses, such as its LAN address, for a listener on every address (`0.0.0.0`, `[::]`). An address is this machine's when a socket can be bound to it, which sends nothing. A name that reaches this machine only through DNS is not recognized; written as its address, it is. **Comments:** what the gateway cannot do as the client did is said in a comment above the server, such as a working directory, a second header, or a VS Code `${input:…}`. What a client's file holds is written there with its control characters escaped, so that none starts TOML of its own. |
 | `mcpdef bridge <url>` | `--ca <pem>` (repeatable), `--cert <pem> --key <pem>` (together), `--token-file <file>`, `--spec auto\|2025-11-25\|2026-07-28` (default `auto`), `--audit <path>`, `--state-dir <dir>`, `--print-config` | Bridge a stdio client to a remote MCPdef, or to any Streamable-HTTP MCP endpoint, for a client that cannot use a private CA, a client certificate or a token itself: the client launches it as its stdio server. It is the gateway with that one upstream (`--print-config` prints the config it runs, which is a valid file for `run`), and governance passes through: every tool, resource, resource template and prompt the remote end offers is offered, and the remote end decides. The key and the token are read from their files when needed and never printed. The ledger and state default under `~/.mcpdef/bridge/`, never the working directory a client launched it from; with no `HOME`, give `--audit` and `--state-dir`. |
-| `mcpdef connect <client>` | `--write`, `--file <path>`, `--url <url>`, `--name <name>` (default `mcpdef`), `--token-env <VAR>`, `--token-file <file>`, `--cert <pem> --key <pem>` (together) | Print the entry an MCP client needs to reach this gateway, in that client's own format: `claude-code` (`.mcp.json`, and the `claude mcp add` line for every project), `claude-desktop`, `cursor` (`~/.cursor/mcp.json`), `vscode` (`.vscode/mcp.json`, under `servers`), `codex` (`~/.codex/config.toml`) or `generic`. It carries the URL; a token by the variable that holds it, never its value; and how that client trusts the gateway's local CA. Claude Desktop, whose file runs only commands, and any client given `--cert`/`--key`, gets a `mcpdef bridge` entry instead. With `--write` it merges the entry into that file and keeps a `.bak` of what was there; run again, it writes nothing and the backup is kept. A file it cannot read as plain JSON, such as VS Code's with comments, is left as it is, and the entry is to be added by hand. JSON is written back with its keys in order; Codex's TOML keeps its comments and layout. |
+| `mcpdef connect <client>` | `--write`, `--replace` (with `--write`), `--file <path>`, `--url <url>`, `--name <name>` (default `mcpdef`), `--token-env <VAR>`, `--token-file <file>`, `--cert <pem> --key <pem>` (together) | Print the entry an MCP client needs to reach this gateway, in that client's own format: `claude-code` (`.mcp.json`, and the `claude mcp add` line for every project), `claude-desktop`, `cursor` (`~/.cursor/mcp.json`), `vscode` (`.vscode/mcp.json`, under `servers`), `codex` (`~/.codex/config.toml`) or `generic`. It carries the URL; a token by the variable that holds it, never its value; and how that client trusts the gateway's local CA. Claude Desktop, whose file runs only commands, and any client given `--cert`/`--key`, gets a `mcpdef bridge` entry instead. With `--write` it merges the entry into that file and keeps a `.bak` of what was there; run again, it writes nothing and the backup is kept. A file it cannot read as plain JSON, such as VS Code's with comments, is left as it is, and the entry is to be added by hand. JSON is written back with its keys in order; Codex's TOML keeps its comments and layout. With `--replace` as well, each server in that file that the gateway fronts is taken out of it, so that the client reaches it through the gateway only. Fronted means the same command with the same variables, or the same URL with the same credentials: the same command with another token is another server, and stays. The `.bak` keeps what was taken out, as private as the file was, and the output names it. A fronted server the client also has in another file it reads is named too, to take out there. |
 | `mcpdef call <tool>` | `--args <json-object>` (default `{}`), `--json`, `--profile` | One-shot governed tool call: allowlist/profile/pin/rate-limit gates + audit apply; RBAC does not (no bearer on this trusted local path). Exits non-zero on a denial or tool error. |
+| `mcpdef hook` | `--client claude-code` (the default) or `codex`, `--bundle-trust <jwks>` | Judge one MCP tool call as the `PreToolUse` hook of Claude Code, or of Codex with `--client codex`, with no proxy in the path: the event on standard input. The config's allowlists, profile and policy rules judge the call's arguments as a gateway's would, and the decision goes to its ledger, marked `hook`: a write that fails is logged and leaves the decision as it was, and a call refused because the config does not read has no record. A refusal exits `2`, which blocks the call, with why on standard error and as a `deny` answer on standard output; an allowed call gets no answer and exits `0`, so the client goes on as it would. A tool that is no MCP tool is not MCPdef's: no answer, no record. Fail closed: a server the config does not name, or a config that does not read, refuses the call, and an event or command line that does not read, or a panic, exits `2`. Relative paths in the config are read from its directory. `--bundle-trust`, or `MCPDEF_BUNDLE_TRUST`, holds it to the signed bundle beside the config as on `run`: each call's hook reads the config afresh, so at each call a config that bundle does not hold refuses the call as `bundle-unverified`, and one older than the floor as `bundle-older`, with no record. A bundle carried in raises the floor at the first call it judges; where the floor cannot be raised, the call is refused. The keys' path is read from where the hook runs, as the config's is. See [OPERATIONS.md § Hook mode](./OPERATIONS.md#hook-mode-no-proxy-in-the-path). |
+| `mcpdef hook install` | `--client claude-code` (the default) or `codex`, `--timeout <secs>` (default 10, 1–600), `--write`, `--file <path>` (with `--write`), `--bundle-trust <jwks>` | Print the hook a client needs to ask MCPdef before each MCP tool call: a `PreToolUse` matcher group for `mcp__.*` that runs this `mcpdef`, with the config's absolute path, and a `timeout`, so that a hook that hangs holds a call for seconds rather than the clients' default of ten minutes. For Claude Code it carries `"onFailure": "block"`, so that a hook that fails refuses the call; Codex has no such setting, and goes on with a call whose hook failed. A Codex hook carries `commandWindows` too, the line `cmd.exe` reads on Windows; a path `cmd.exe` would expand even in quotes (`%`, `!`) gets none, and on Windows no hook. Codex runs a new hook only once it is trusted in `/hooks`. `--write` merges it into the project's `.claude/settings.local.json` (Claude Code) or `.codex/hooks.json` (Codex), or the file `--file` names, keeping a `.bak` as private as the file, every other hook there, and nothing of an earlier `mcpdef hook` (`mcpdef.exe` on Windows). With `--bundle-trust`, the hook it writes runs `mcpdef hook --bundle-trust` with the keys' absolute path, and only once the bundle beside the config holds it at a revision no lower than the floor: a hook that would refuse every call is not written. |
+| `mcpdef filter` | `--bundle-trust <jwks>` | Answer the checks of a proxy that routes MCP requests itself, as Envoy's `ext_authz` filter makes them over HTTP, on `[gateway.filter] listen`: each request is judged by the server its path names (`filter_path`), by the gates a gateway's request meets that a request alone can be judged by, and each decision goes to the config's ledger, marked `hook = "ext_authz"`. A `200` lets the request through; a refusal is a `403` with a JSON-RPC error, which the proxy hands the client. Opens no upstream. Refuses to start with no `filter_path`, or with `[gateway.auth]` taking client certificates. `--bundle-trust`, or `MCPDEF_BUNDLE_TRUST`, holds it to the signed bundle beside the config as on `run`: it reads its config once, as it starts, and a config that bundle does not hold, or one older than the floor, stops the start. The ready line names the revision. See [OPERATIONS.md § Filter mode](./OPERATIONS.md#filter-mode-behind-a-proxy-that-routes). |
 | `mcpdef validate` | `--strict` | Validate the config, and the TLS files it names; exit non-zero listing every problem. Warnings (a secret written in the config, a secret file others can read, `insecure_skip_verify`, credentials in the clear) are printed and do not fail it, unless `--strict` or `[gateway] strict = true` makes each an error: see [Strict mode](#strict-mode). |
 | `mcpdef doctor` | `--wait <secs>` (default `30`) | Check the gateway end to end and print what is wrong, or soon will be, each line marked ✓, ⚠ (works, but should not be left so) or ✗ (broken); exit non-zero if anything is broken. **config**: `validate`'s errors and warnings, a secret written in the config among them. **tls**: what `tls show` warns of, a certificate near its end among them. **sign-in**: for bearer tokens, whether the identity provider's keys can be had, fetched from `jwks_uri` as the gateway fetches them, and how far this machine's clock is from the provider's, read from its `Date`: further than the 60 s a token's `exp` and `nbf` are allowed, fresh tokens are refused as not valid yet, or every token expires early. **admin**: an admin listener other machines can reach, which asks no one who they are. **servers**: each upstream opened as `run` opens it, up or down and why, what it adds to `tools/list`, the resources and prompts it offers that no `resources` or `prompts` list exposes, a tool name two servers offer, and certificates near their end. It keeps nothing a running gateway keeps: no audit record, no pin, no state. An upstream may take `upstream_timeout_ms` to open, or `--wait` where that is unset. |
 | `mcpdef servers list` | — | Static, config-level view of the governed servers and their *resolved* allow/deny (profiles applied), and under a server with `[server.env]`, where each variable's value comes from (`NAME=$VAR`, a path, `(exec PROGRAM)` or `(literal)`), never the value. Does not connect upstreams. |
 | `mcpdef tools list` | `--profile <name>`, `--cost` | Open every upstream, as `run` does, and print each tool `tools/list` gives a client, with its server: what the allowlist, the profile, the pins and the scanner leave, by the name each is listed by. With `--cost`, print instead what each server adds to that list, which every agent that lists the tools reads into its context: how many of its tools are listed, of those it offers, the bytes they take up there, and bytes ÷ 4, an estimate of the tokens. See [OPERATIONS.md § What the tools cost each agent](./OPERATIONS.md#what-the-tools-cost-each-agent). `--profile` overrides `[gateway] profile`, as for `run`. A new tool is pinned on first use, as `run` pins it. |
 | `mcpdef audit verify` | `--path <ledger>`, `--head <hash> --count <n>` (together) | Offline hash-chain check; with `--head`/`--count`, also checks against a seal recorded out-of-band (catches tail-truncation). Exit non-zero on a break. |
-| `mcpdef audit tail` | `--path <ledger>`, `-n/--lines <n>` (default 20), `--format json\|ocsf\|cef\|syslog` | Print the last N records in a SIEM-ready format, one line per record. |
+| `mcpdef audit tail` | `--path <ledger>`, `-n/--lines <n>` (default 20), `--format json\|ocsf\|cef\|syslog\|otlp` | Print the last N records in a SIEM-ready format, one line per record. `otlp` prints each governed request's span as an OTLP/JSON `ExportTraceServiceRequest`, the line the OTLP file exporter writes, and no line for a record the gateway wrote of itself: see [`[gateway.otel]`](#gatewayotel--spans-to-an-opentelemetry-endpoint). |
+| `mcpdef receipts key` | `--out <file>` (default `mcpdef-receipts.jwk`) | Make an Ed25519 key to sign receipts with: a private JWK (RFC 8037), made `0600`, and never written over a file that is there. It prints the key's name, its `kid`. See [OPERATIONS.md § Signed receipts](./OPERATIONS.md#signed-receipts). |
+| `mcpdef receipts jwks` | `--key <file>` | Print the key's public half as a JWK Set, to publish where whoever checks the receipts fetches it. The draft suggests `/.well-known/acta-keys.json`. |
+| `mcpdef receipts export` | `--key <file>`, `--path <ledger>`, `--head <hash> --count <n>` (together), `--out <file>`, `--force` (with `--out`) | Sign each tool call in the ledger as an Access Decision Receipt of `draft-farley-acta-signed-receipts-03`, one JSON line each, each linked to the one before. The ledger's chain is checked as it is read, and with `--head`/`--count` the seal too. Nothing is kept from a ledger that fails: the receipts reach standard output, or the file `--out` names, only once the whole ledger has checked. `--force` replaces a file that is there. It prints the last receipt's hash and the count, to record somewhere else. |
+| `mcpdef receipts verify <file>` | `--jwks <file>`, `--last <hash> --count <n>` (together) | Check receipts offline against the keys `--jwks` holds: each one's signature (`EdDSA` or `ES256`), that its `issuer_id` is its `kid` and that it names no member twice, and its link to the one before. With `--last`/`--count`, also that they end where a seal says, which catches receipts taken off the end. Exit non-zero on a failure. |
+| `mcpdef bundle key` | `--out <file>` (default `mcpdef-bundle.jwk`) | Make an Ed25519 key to sign policy bundles with: a private JWK (RFC 8037), made `0600`, never written over a file that is there, and named `mcpdef:bundle:…`. See [DEPLOY.md § A signed policy update](./DEPLOY.md#a-signed-policy-update). |
+| `mcpdef bundle jwks` | `--key <file>` | Print the key's public half as a JWK Set: what each node is given to trust. |
+| `mcpdef bundle sign` | `--config <file>`, `--key <file>`, `--revision <n>`, `--out <file>` (default `mcpdef.bundle`), `--force` | Check the config as `validate` does, and sign none with an error; then sign it at the revision, from 1 to 2^53 − 1, as a bundle. `--force` replaces a file that is there. |
+| `mcpdef bundle verify` | `<bundle>`, `--trust <jwks>`, `--config-out <file>` | Check the bundle against the keys in `--trust`, and print its revision, the key that signed it, when, and its config's digest. `--config-out` writes the config it holds, to read before applying it. Exit non-zero if it does not verify. |
+| `mcpdef bundle apply` | `<bundle>`, `--trust <jwks>`, `--config <file>` | Check the bundle against the keys in `--trust`, its revision against the node's floor, its config as `validate` does, and that each file the config names is there. Then raise the floor, keep the bundle beside the config as `<config>.bundle`, put the config in place of `--config`, and record it in the ledger. A refusal changes nothing, is recorded in the ledger of the config in effect, and exits non-zero. The bundle the floor is at changes nothing, unless the config no longer holds its config or the bundle beside it is not this one: then it puts them back. Applies take turns on a lock beside the config, `.<config>.lock`. A running gateway takes the config at its next reload. |
 | `mcpdef egress show` | — | Print the effective SSRF/egress policy, and the TLS profile each HTTPS upstream is verified with: its `[server.tls]` over `[gateway.upstream_tls]`, and the gateway's own for a `jwks_uri`. It says how a certificate is checked (`ca`, `pin` or `disabled`), then the roots, CAs and CRLs that check it (or the pins), `min_version`, the client certificate and `connect_to`. A plain-HTTP or stdio upstream has no profile, and is not listed. |
 | `mcpdef tls pin <url>` | `--connect-to <ip>`; `--config <file>`, optional, for its `[gateway.egress]` | Connect through the egress guard and print the SPKI pin of the certificate the server presents, as a `pin_sha256` line. The other lines (the address, the certificate's names, its SHA-256 fingerprint) are TOML comments, so the output pastes into `[server.tls]` as it is. The connection is not verified: check the fingerprint against the server's own before trusting the pin. A server that asks for a client certificate still gives its pin. |
 | `mcpdef tls init` | `--new-ca` | Make the local CA and the certificate it issues the listeners, as [`mode = "self-signed"`](#gatewaytls-and-gatewayadmintls--tls-on-mcpdefs-own-listeners) serves them, and print how each client trusts the CA: `NODE_EXTRA_CA_CERTS` (Claude Code), `CODEX_CA_CERTIFICATE` (Codex), `curl --cacert`, and the command that adds it to the system's store (VS Code, Cursor and the rest). A CA already there is kept, and so is a certificate that still does. `--new-ca` makes a new CA in its place, for a name the old one does not vouch for: every client has to trust it instead. Once the CA has issued client certificates (`tls issue`), it also writes the new CA's CRL, and from the next reload those the old CA issued are refused. Refused with `mode = "files"`. |
@@ -1532,8 +1600,8 @@ Every subcommand that reads config takes `--config <file>` (default `mcpdef.toml
 | `mcpdef tls export-ca` | `--out <file>` | Print the local CA's certificate, or write it to `--out`, for a client to trust. Its key is not read. |
 | `mcpdef tls issue` | `--client <name>`, `--spiffe-id <id>`, `--days <n>` (default `30`), `--out <dir>` (default `.`) | Issue a workload a client certificate from the local CA, for mTLS with no PKI of one's own: `<name>` as its subject's common name, which `identity = "subject-cn"` reads, and `--spiffe-id` in a URI name, which `identity = "spiffe"` reads; no DNS name, which the local CA keeps for the listeners. Writes `<name>.crt` and `<name>.key` in `--out`, the key `0600`, and never over a file there; prints its serial, and the `[gateway.tls.client_auth]` that takes it unless the config already does. It is checked, and its names read, as the gateway would before it is written. Makes the local CA if there is none, and writes its CRL, `<state_dir>/tls/ca.crl`, so that `crl` can name it from the start. |
 | `mcpdef tls revoke <serial \| file>` | — | Revoke a certificate the local CA issued, by the serial `tls issue` printed (as `openssl x509 -noout -serial` prints it too) or by its file: it goes in `<state_dir>/tls/ca.crl`, written from `revoked.json` beside it. A gateway whose `crl` names it refuses the certificate from its next reload, on connections already open as well. Revoking it again changes nothing. |
-| `mcpdef pin` | — | Pin the current tool definitions of all upstreams as approved (writes `[gateway] pins`; overwrites — this is the re-approval command). A running gateway reads it at its next reload (`kill -HUP`). |
-| `mcpdef diff-tools` | — | Diff current tool definitions against the pin store (read-only); exit non-zero if any pinned tool changed (rug-pull). |
+| `mcpdef pin` | — | Pin the current tool definitions of all upstreams as approved (writes `[gateway] pins`; overwrites — this is the re-approval command). Each pin keeps the definition with its hash, so the next drift is graded. A running gateway reads it at its next reload (`kill -HUP`). |
+| `mcpdef diff-tools` | — | Diff current tool definitions against the pin store (read-only). A changed tool is printed with its grade and its changes, a line each: `~ changed, info: within [gateway] pin_accept, the gateway pins it again`, or `~ CHANGED, breaking (held: possible rug-pull)`. Exit non-zero if any changed tool is one the gateway holds: graded worse than `[gateway] pin_accept`, or ungraded. |
 | `mcpdef version` | — | Print the version and the MCP revisions this build speaks. |
 
 ## Data formats & compatibility
@@ -1561,7 +1629,37 @@ shapes below are what `mcpdef 0.1.0` reads and writes.
   - `tool_changes?`: on an upstream's `tools-changed` record, how its tools
     changed, as `{ "added", "removed", "changed", "drifted" }`, each a count.
     A line whose `tool_changes` lacks one of the four, or holds another member,
-    is corrupt.
+    is corrupt;
+  - `trace_id?` and `parent_id?`: the W3C trace the request was part of, and
+    the caller's span in it, from the `traceparent` the request carried in
+    `params._meta`, or else in its HTTP header. 32 and 16 lowercase hex
+    characters. A `traceparent` that does not read is ignored, and records
+    neither;
+  - `tool_digest?`: on a tool call, with a pin store (`[gateway] pins`), the
+    digest of the tool's definition as the store pins it (`sha256:<hex>`): the
+    definition the call was judged against;
+  - `hook?`: on a decision made with no gateway in the path: `claude-code`
+    or `codex` for a client's hook (`mcpdef hook`), `ext_authz` for a
+    proxy's check (`mcpdef filter`). The call went to its server without the
+    gateway, so the record says what MCPdef decided, not that the call ran;
+  - `drift?`: how a tool's definition changed since it was pinned, as
+    `{ "grade", "changes" }`, on a call refused as a `rug-pull` and on the
+    record of a drift `[gateway] pin_accept` took (`kind = "upstream"`,
+    `method = "pin"`, `rule = "drift-accepted"`). `grade` is `info`, `risky`
+    or `breaking`, or `ungraded` for a pin that holds the hash alone. `changes`
+    has a line per change, `<path>: <what>`, such as
+    `inputSchema.required: now requires "repo"`: at most 20, and a last line
+    that counts the rest. A line whose `drift` lacks either member, or holds
+    another, is corrupt;
+  - `bundle?`: on the record of a policy bundle a node was given
+    (`kind = "reload"`, `method = "bundle"`), applied, or refused as
+    `bundle-unverified`, `bundle-older` or `bundle-invalid`, and on the
+    reload records of a gateway started with `--bundle-trust`
+    (`method = "reload"`), applied or refused, naming the bundle beside the
+    config: `{ "sha256", "revision"?, "kid"? }`. That is the digest of the
+    bundle's file, and, when its signature verified, its revision and the key
+    that signed it. What a bundle that did not verify says of itself is not
+    recorded. A line whose `bundle` holds another member is corrupt.
 
   `hash = SHA-256` of the v1 encoding: `seq`, `ts_unix_ms`, `agent`, `server`,
   `method`, `tool`, `decision`, `rule`, `latency_ms` and `prev_hash`, joined by
@@ -1572,17 +1670,46 @@ shapes below are what `mcpdef 0.1.0` reads and writes.
   the RFC 8785 (JCS) form. The rule covers members a future release adds, so a
   newer ledger still verifies with this release. The first record chains to 64
   hex zeros (`GENESIS`). Append-only; re-opening resumes the chain from the
-  current head. The hash covers the fields, not the JSON text, so member order in
+  current head. Writers in other processes take turns on an exclusive lock on
+  the file (`flock`), and each goes on from the last record in it: hooks, a
+  gateway and `mcpdef call` can share one ledger. A writer from before 0.5.0
+  takes no lock. The hash covers the fields, not the JSON text, so member order in
   a line does not matter. A member named twice in a line makes it corrupt.
   A U+001F inside a v1 field is stored as `␟` (U+241F); `mcpdef audit verify`
   warns about any record from an older gateway that still holds one.
   A ledger written by 0.2.1 verifies unchanged.
-- **Pin store** (`[gateway] pins`): TOML, `[<server-id>]` tables mapping
-  `tool = "<hex sha-256>"` (`mcpdef-pin::PinStore`, serde-transparent
-  `BTreeMap<String, BTreeMap<String, String>>`). Sorted deterministically so it
-  diffs cleanly in version control; written atomically (temp file + rename).
-  The hash covers the tool's governed fields only: `name`, `description`,
-  `inputSchema`, `outputSchema`, `annotations`, canonicalized with recursively
-  sorted keys.
+- **Pin store** (`[gateway] pins`): TOML, a pin for each tool of each server
+  (`mcpdef-pin::PinStore`). From 0.5.0 a pin is a table, `[<server-id>.<tool>]`,
+  with `hash`, the hex SHA-256, and `definition`, the JSON text the hash covers,
+  so that a later drift can be graded against it. A pin as a store before 0.5.0
+  holds it, `tool = "<hex sha-256>"` in a `[<server-id>]` table, still loads: a
+  drift from it is held, ungraded, and approving it writes the definition. A
+  pin whose `definition` does not hash to its `hash`, as when edited by hand, is
+  not graded against. Sorted deterministically so it diffs cleanly in version
+  control; written atomically (temp file + rename). The hash covers the tool's
+  governed fields only: `name`, `description`, `inputSchema`, `outputSchema`,
+  `annotations`, canonicalized with recursively sorted keys.
+- **Policy bundle** (`mcpdef bundle sign`): one JSON object,
+  `{ "mcpdef_bundle": 1, "revision", "issued_at", "config", "signature" }`.
+  `config` is the config's text, `revision` an integer from 1 to 2^53 − 1,
+  and `issued_at` the time on the signer's clock, in RFC 3339. `signature` is
+  `{ "alg": "EdDSA", "kid", "sig" }`: `sig` is Ed25519 over the RFC 8785 (JCS)
+  form of the object without `signature`, in lowercase hex, as a receipt's
+  is. A bundle with any other member, one named twice, or another
+  `mcpdef_bundle`, is refused.
+- **Bundle beside the config** (`<config>.bundle`, as `mcpdef.toml.bundle`):
+  the bundle `mcpdef bundle apply` put the config in place from, byte for
+  byte. A gateway started with `--bundle-trust` runs the config only as it
+  holds it. `apply` writes it after the floor and before the config, each in
+  one rename. The gateway reads the config first, holding the lock `apply`
+  takes where it can open it, so it runs no apply half done: where it
+  cannot, what it reads half done fails a check, and is refused.
+- **Bundle floor** (`<state_dir>/bundle.json`): the last revision the node
+  applied, `{ "revision", "config", "kid", "applied_at" }`, with `config` the
+  `sha256:<hex>` of that revision's config text. `mcpdef bundle apply` stops
+  at a floor that does not read. With none, it takes any revision. A gateway
+  started with `--bundle-trust` raises it to a revision above it that it
+  runs; one that does not read stops its start, and refuses a reload as
+  `invalid-config`.
 - **JWKS** (`[gateway.auth] jwks`): a standard JWKS JSON document; keys must
   carry `kid` and be RSA or EC (RS256/384/512, PS256, ES256/384).

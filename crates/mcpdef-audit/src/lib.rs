@@ -11,9 +11,11 @@
 //! **What plain `verify` does *not* catch:** truncating the tail (removing the
 //! last N records) or replacing the whole file with a shorter valid chain leaves
 //! it internally consistent. Detecting that needs a `(head, count)` sealed
-//! out-of-band — see [`verify_against`]. (`append` itself uses a userspace
-//! `flush`, not `fsync`, so a crash can also lose the last unsynced record(s);
-//! a durable/`sync_all` mode is a later option — see [`Ledger::append`].)
+//! out-of-band — see [`verify_against`]. (By default `append` hands each record
+//! to the operating system without an `fsync`, so a crash of the machine, though
+//! not of the gateway, can also lose the last records; under
+//! [`Durability::Fsync`] each is on disk before `append` returns — see
+//! [`Ledger::append`].)
 //!
 //! This is the Phase-1 shape from the [ROADMAP](../../../ROADMAP.md): local,
 //! hash-linked, never paywalled. SIEM export (OCSF/CEF/syslog/OTel) layers on
@@ -27,15 +29,22 @@ use sha2::{Digest, Sha256};
 use std::collections::btree_map::{BTreeMap, Entry as MapEntry};
 use std::fmt;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::watch;
 
+pub mod otlp;
 mod read;
+pub mod receipt;
 pub use read::{find, page, Cursor, Filter, Follow, Page};
+
+/// The `agent` of a record the gateway writes about itself, such as an
+/// upstream going down or a finding at an upstream's connection, rather than
+/// about a caller's request.
+pub const GATEWAY_AGENT: &str = "mcpdef";
 
 /// The hash-chain anchor for the first record (64 hex zeros).
 pub const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
@@ -63,9 +72,9 @@ pub enum AuditError {
 ///
 /// `seq` through `latency_ms`, with `prev_hash` and `hash`, are the v1 record.
 /// Every later member is optional and absent from a plain governed call: `kind`,
-/// `uri`, `transforms`, `actor`, `peer`, `config_from`, `config_to` and
-/// `tool_changes`, and any member a later release adds, which this one keeps in
-/// [`Record::extra`].
+/// `uri`, `transforms`, `actor`, `peer`, `config_from`, `config_to`,
+/// `tool_changes`, `drift` and `bundle`, and any member a later release adds,
+/// which this one keeps in [`Record::extra`].
 ///
 /// # The hash
 ///
@@ -134,6 +143,32 @@ pub struct Record {
     /// removed and changed, and how many of them now drift from their pins.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub tool_changes: Option<ToolChanges>,
+    /// On a record about a tool whose definition drifted from its pin: how the
+    /// change was graded, and what changed.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub drift: Option<Drift>,
+    /// On the record of a policy bundle a node was given, and of a reload
+    /// under `--bundle-trust`: which bundle, and, once its signature
+    /// verified, its revision and the key that signed it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub bundle: Option<BundleRef>,
+    /// The W3C trace the request was part of, from the `traceparent` its
+    /// caller sent: 32 lowercase hex characters.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub trace_id: Option<String>,
+    /// The caller's span the request was made in, from the same
+    /// `traceparent`: 16 lowercase hex characters.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub parent_id: Option<String>,
+    /// On a tool call: the digest of the tool's definition as the pin store
+    /// holds it (`sha256:<hex>`), the definition the call was judged against.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tool_digest: Option<String>,
+    /// On a decision a client's hook asked for (`mcpdef hook`), rather than
+    /// one the gateway made in the path: the client, such as `claude-code`.
+    /// The call went to its server without the gateway.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub hook: Option<String>,
     /// Members this release does not know, from a ledger a later one wrote.
     #[serde(flatten)]
     pub extra: Extra,
@@ -184,15 +219,7 @@ impl Record {
     /// it always did.
     fn later_members(&self) -> Option<String> {
         let mut members: BTreeMap<&str, String> = BTreeMap::new();
-        let strings = [
-            ("kind", &self.kind),
-            ("uri", &self.uri),
-            ("actor", &self.actor),
-            ("peer", &self.peer),
-            ("config_from", &self.config_from),
-            ("config_to", &self.config_to),
-        ];
-        for (name, value) in strings {
+        for (name, value) in self.later_strings() {
             if let Some(value) = value {
                 members.insert(name, json_str(value));
             }
@@ -203,6 +230,12 @@ impl Record {
         }
         if let Some(changes) = &self.tool_changes {
             members.insert("tool_changes", canonical_json(&changes.to_value()));
+        }
+        if let Some(drift) = &self.drift {
+            members.insert("drift", canonical_json(&drift.to_value()));
+        }
+        if let Some(bundle) = &self.bundle {
+            members.insert("bundle", canonical_json(&bundle.to_value()));
         }
         for (name, value) in self.extra.iter() {
             if !value.is_null() {
@@ -217,6 +250,23 @@ impl Record {
             .map(|(name, value)| format!("{}:{value}", json_str(name)))
             .collect();
         Some(format!("{{{}}}", body.join(",")))
+    }
+
+    /// The later members that are strings, by name, in the order the exports
+    /// list them.
+    fn later_strings(&self) -> [(&'static str, &Option<String>); 10] {
+        [
+            ("kind", &self.kind),
+            ("uri", &self.uri),
+            ("actor", &self.actor),
+            ("peer", &self.peer),
+            ("config_from", &self.config_from),
+            ("config_to", &self.config_to),
+            ("trace_id", &self.trace_id),
+            ("parent_id", &self.parent_id),
+            ("tool_digest", &self.tool_digest),
+            ("hook", &self.hook),
+        ]
     }
 
     /// Whether a field holds the encoding's separator. The hash of such a record
@@ -360,6 +410,11 @@ fn collect_members<'de, A: MapAccess<'de>>(
     Ok(members)
 }
 
+/// `text` as JSON, refusing an object that names a member twice, at any depth.
+pub(crate) fn parse_strict(text: &str) -> Result<Value, serde_json::Error> {
+    serde_json::from_str::<Strict>(text).map(|Strict(value)| value)
+}
+
 /// A JSON value parsed by a visitor that refuses an object naming a member twice.
 struct Strict(Value);
 
@@ -465,6 +520,20 @@ pub struct Attrs {
     pub rule: Option<String>,
     /// On an upstream's `tools-changed` record: how its tools changed.
     pub tool_changes: Option<ToolChanges>,
+    /// On a record about a tool whose definition drifted from its pin: its
+    /// grade, and what changed.
+    pub drift: Option<Drift>,
+    /// On the record of a policy bundle a node was given, and of a reload
+    /// under `--bundle-trust`: which one.
+    pub bundle: Option<BundleRef>,
+    /// The W3C trace the request was part of, and the caller's span in it, as
+    /// its `traceparent` named them: see [`otlp::traceparent`].
+    pub trace_id: Option<String>,
+    pub parent_id: Option<String>,
+    /// On a tool call: the pinned digest of the tool's definition.
+    pub tool_digest: Option<String>,
+    /// On a decision a client's hook asked for: the client.
+    pub hook: Option<String>,
 }
 
 /// How an upstream's tools changed when it listed them again: the names it
@@ -495,6 +564,55 @@ impl ToolChanges {
     }
 }
 
+/// How a tool's definition drifted from its pin: the grade the gateway gave
+/// the change, and each change, a line each.
+///
+/// Both members are written, and a line whose `drift` holds any other member
+/// is corrupt, as with [`ToolChanges`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Drift {
+    /// `info`, `risky` or `breaking`, or `ungraded` when the pin holds no
+    /// definition to compare with.
+    pub grade: String,
+    /// Where in the definition, and what changed there, such as
+    /// `inputSchema.required: now requires "repo"`.
+    pub changes: Vec<String>,
+}
+
+impl Drift {
+    /// As the record and the exports write it: an object of the two members.
+    fn to_value(&self) -> Value {
+        serde_json::to_value(self).expect("a drift serializes")
+    }
+}
+
+/// A policy bundle a node was given (`mcpdef bundle apply`), applied or
+/// refused, or the one beside the config a gateway started with
+/// `--bundle-trust` reloaded: the digest of its file, and, when its signature
+/// verified, the revision it holds and the key that signed it. A bundle that
+/// did not verify has neither: what it claims of itself is no one's word.
+///
+/// A line whose `bundle` holds any other member is corrupt, as with
+/// [`ToolChanges`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BundleRef {
+    /// `sha256:<hex>` of the bundle's file.
+    pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub kid: Option<String>,
+}
+
+impl BundleRef {
+    /// As the record and the exports write it: an object of the members it has.
+    fn to_value(&self) -> Value {
+        serde_json::to_value(self).expect("a bundle serializes")
+    }
+}
+
 /// What a record is about.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Kind {
@@ -522,50 +640,133 @@ impl Kind {
     }
 }
 
+/// How far a record has gone when [`Ledger::append`] returns.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Durability {
+    /// Written to the operating system, which writes it to disk later. A crash
+    /// of the gateway loses no record; a crash of the machine can lose the last
+    /// ones.
+    #[default]
+    Os,
+    /// Written and `fsync`ed (`fdatasync`, or `F_FULLFSYNC` on macOS): on disk
+    /// before `append` returns. Each open syncs the file and its directory
+    /// first, so the ledger's name and the records already in it survive a
+    /// crash too: one written before without `fsync`, or made by an open that
+    /// then failed, is made safe by the next open. The directory above that is
+    /// synced as well, for a directory just made, but only as far as MCPdef
+    /// may: if it cannot, opening goes on, and a crash can lose a directory
+    /// made just before.
+    Fsync,
+}
+
 /// An append-only, hash-linked ledger backed by a file. Re-opening an existing
 /// file resumes the chain from its current head.
+///
+/// Writers in other processes can append to the same file: a hook that
+/// records a decision and exits, `mcpdef call`, a second gateway. They take
+/// turns on an exclusive lock on the file while they write, and each goes on
+/// from the last record in it, whoever wrote that. A release before 0.5.0
+/// takes no lock: two writers from one would fork the chain.
 pub struct Ledger {
     path: PathBuf,
-    file: File,
+    /// Shared with the blocking task a [`LedgerHandle`] syncs it on. Open to
+    /// read as well: a writer reads from it what another one appended.
+    file: Arc<File>,
+    durability: Durability,
     head: String,
     next_seq: u64,
+    /// How far into the file this writer has seen, as the end of the last
+    /// record it read or wrote: what lies past it, another writer appended.
+    seen: u64,
+    /// Whether the file ends in a line with no newline, which the next record
+    /// must not be joined to.
+    newline_due: bool,
 }
 
 impl Ledger {
     /// Open (creating if absent) the ledger at `path`, resuming the hash chain
-    /// and sequence from any existing records.
+    /// and sequence from any existing records. Records are written with
+    /// [`Durability::Os`].
     pub fn open(path: impl AsRef<Path>) -> Result<Self, AuditError> {
-        let path = path.as_ref().to_path_buf();
-        let (head, next_seq) = match File::open(&path) {
-            Ok(f) => {
-                let mut head = GENESIS.to_string();
-                let mut count: u64 = 0;
-                for line in BufReader::new(f).lines() {
-                    let line = line?;
-                    if line.trim().is_empty() {
-                        continue;
-                    }
-                    let rec: Record =
-                        serde_json::from_str(&line).map_err(|e| AuditError::Corrupt {
-                            line: count,
-                            detail: e.to_string(),
-                        })?;
-                    head = rec.hash;
-                    count += 1;
-                }
-                (head, count)
-            }
-            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => (GENESIS.to_string(), 0),
-            Err(e) => return Err(e.into()),
-        };
+        Self::open_with(path, Durability::Os)
+    }
 
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+    /// [`open`](Self::open), writing each record with `durability`.
+    pub fn open_with(path: impl AsRef<Path>, durability: Durability) -> Result<Self, AuditError> {
+        let path = path.as_ref().to_path_buf();
+        let mut opened = Ledger::attach(&path, durability)?;
+        // As far as other writers have appended: its length under their lock,
+        // which none of them holds with a line half written. What they append
+        // after, the first write catches up with. The lock is not held for
+        // the read, which a long ledger would make a long wait for them.
+        let len = {
+            let lock = fd_lock::RwLock::new(&*opened.file);
+            let _turn = lock.read()?;
+            opened.file.metadata()?.len()
+        };
+        let mut reader = BufReader::new((&*opened.file).take(len));
+        let mut line = Vec::new();
+        let mut count: u64 = 0;
+        loop {
+            line.clear();
+            let n = reader.read_until(b'\n', &mut line)?;
+            if n == 0 {
+                break;
+            }
+            opened.seen += n as u64;
+            opened.newline_due = line.last() != Some(&b'\n');
+            let text = line.strip_suffix(b"\n").unwrap_or(&line);
+            let text = text.strip_suffix(b"\r").unwrap_or(text);
+            if text.trim_ascii().is_empty() {
+                continue;
+            }
+            let rec: Record = serde_json::from_slice(text).map_err(|e| AuditError::Corrupt {
+                line: count,
+                detail: e.to_string(),
+            })?;
+            opened.head = rec.hash;
+            count += 1;
+        }
+        opened.next_seq = count;
+        Ok(opened)
+    }
+
+    /// The ledger at `path` (made if absent) for a writer that appends to it
+    /// and is done, such as a hook: nothing is read until it writes, when it
+    /// goes on from the last record in the file. Until then, [`head`] and
+    /// [`next_seq`] are those of an empty ledger.
+    ///
+    /// [`head`]: Self::head
+    /// [`next_seq`]: Self::next_seq
+    pub fn attach(path: impl AsRef<Path>, durability: Durability) -> Result<Self, AuditError> {
+        let path = path.as_ref().to_path_buf();
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)?;
+        if durability == Durability::Fsync {
+            // Synced records in a file whose name never reached the disk are
+            // lost with it. Every open, not only one that makes the file: an
+            // open that made it and then failed here would leave its name
+            // unsynced for good, and so would a ledger written without fsync.
+            file.sync_all()?;
+            sync_dirs(&path)?;
+        }
         Ok(Ledger {
             path,
-            file,
-            head,
-            next_seq,
+            file: Arc::new(file),
+            durability,
+            head: GENESIS.to_string(),
+            next_seq: 0,
+            seen: 0,
+            newline_due: false,
         })
+    }
+
+    /// How far a record has gone when [`append`](Self::append) returns.
+    pub fn durability(&self) -> Durability {
+        self.durability
     }
 
     /// The current head hash (the last record's hash, or [`GENESIS`] if empty).
@@ -584,15 +785,43 @@ impl Ledger {
 
     /// Append one entry, returning the stamped, hash-linked record.
     ///
-    /// Durability: this `write` + userspace `flush` is **not** an `fsync`, so a
-    /// crash can lose records the OS had not yet written to disk. A durable mode
-    /// (`sync_all` per append, at a throughput cost) is a later option; the
-    /// hash chain proves *integrity*, not *durability*.
+    /// Durability is the ledger's [`Durability`]. Under [`Durability::Os`] the
+    /// record is written to the operating system, not `fsync`ed, so a crash of
+    /// the machine can lose records it had not yet written to disk. Under
+    /// [`Durability::Fsync`] it is on disk before this returns, and an `fsync`
+    /// that fails is an error: the record is written but may not be on disk.
+    /// Either way the hash chain proves *integrity*, not *durability*.
     ///
     /// A U+001F in any field is stored as U+241F (`␟`): the hash encoding uses
     /// U+001F as its separator, and a caller-chosen tool name must not be able to
     /// move a field boundary (see [`VerifyReport::ambiguous`]).
     pub fn append(&mut self, entry: Entry) -> Result<Record, AuditError> {
+        let rec = self.write(entry)?;
+        if self.durability == Durability::Fsync {
+            self.file.sync_data()?;
+        }
+        Ok(rec)
+    }
+
+    /// The file to `fsync` after a [`write`](Self::write), if records are to be
+    /// on disk before an append returns.
+    fn to_sync(&self) -> Option<Arc<File>> {
+        (self.durability == Durability::Fsync).then(|| Arc::clone(&self.file))
+    }
+
+    /// [`append`](Self::append) without the `fsync`: the record is written to
+    /// the operating system and the chain moves on.
+    ///
+    /// It holds the file's lock while it writes, and first catches up with
+    /// what another writer appended since it last did.
+    fn write(&mut self, entry: Entry) -> Result<Record, AuditError> {
+        let file = Arc::clone(&self.file);
+        let mut lock = fd_lock::RwLock::new(&*file);
+        let _turn = lock.write()?;
+        let len = file.metadata()?.len();
+        if len != self.seen {
+            self.catch_up(&file, len)?;
+        }
         let Attrs {
             kind,
             uri,
@@ -603,6 +832,12 @@ impl Ledger {
             config_to,
             rule,
             tool_changes,
+            drift,
+            bundle,
+            trace_id,
+            parent_id,
+            tool_digest,
+            hook,
         } = entry.attrs;
         let (rule, decision) = match &entry.decision {
             Decision::Allow => (rule, "allow".to_string()),
@@ -626,6 +861,12 @@ impl Ledger {
             config_from,
             config_to,
             tool_changes,
+            drift,
+            bundle,
+            trace_id,
+            parent_id,
+            tool_digest,
+            hook,
             extra: Extra::default(),
             prev_hash: self.head.clone(),
             hash: String::new(),
@@ -634,15 +875,130 @@ impl Ledger {
 
         // The line and its newline in one write, so that a reader sees a
         // partial line as rarely as it can; it never reads one as a record.
-        let mut line = serde_json::to_vec(&rec).expect("Record serializes");
+        // After a line that has none, a newline first: the record is a line
+        // of its own, and that one stays what it was.
+        let mut line = Vec::new();
+        if self.newline_due {
+            line.push(b'\n');
+        }
+        serde_json::to_writer(&mut line, &rec).expect("Record serializes");
         line.push(b'\n');
-        self.file.write_all(&line)?;
-        self.file.flush()?;
+        (&*file).write_all(&line)?;
+        (&*file).flush()?;
 
+        self.seen = len + line.len() as u64;
+        self.newline_due = false;
         self.head = rec.hash.clone();
         self.next_seq += 1;
         Ok(rec)
     }
+
+    /// Catch up with a file `len` bytes long, which this writer last saw at
+    /// another length. Grown, another writer appended to it: the chain goes on
+    /// from the last record in it. Shorter, it was cut short or replaced: the
+    /// chain goes on from this writer's head, so that a check finds the cut.
+    /// A last line that does not read leaves the head as it is, and a check
+    /// finds that line.
+    fn catch_up(&mut self, file: &File, len: u64) -> Result<(), AuditError> {
+        let mut last = [0u8];
+        self.newline_due = len > 0 && {
+            read_exact_at(file, &mut last, len - 1)?;
+            last[0] != b'\n'
+        };
+        if len > self.seen {
+            if let Some(rec) = last_record(file, len)? {
+                self.head = rec.hash;
+                self.next_seq = rec.seq.saturating_add(1);
+            }
+        }
+        self.seen = len;
+        Ok(())
+    }
+}
+
+/// The last whole record in the first `len` bytes of `file`: the last line
+/// that ends in a newline and is not blank, if it reads as a record.
+fn last_record(file: &File, len: u64) -> std::io::Result<Option<Record>> {
+    const CHUNK: u64 = 64 * 1024;
+    // The file's last bytes: `file[start..len]`.
+    let mut tail: Vec<u8> = Vec::new();
+    let mut start = len;
+    loop {
+        if let Some(end) = tail.iter().rposition(|&b| b == b'\n') {
+            let whole = &tail[..end];
+            match whole.iter().rposition(|&b| b == b'\n') {
+                Some(before) if whole[before + 1..].trim_ascii().is_empty() => {
+                    tail.truncate(before + 1);
+                    continue;
+                }
+                Some(before) => return Ok(serde_json::from_slice(&whole[before + 1..]).ok()),
+                None if start == 0 => {
+                    let line = whole.trim_ascii();
+                    return Ok((!line.is_empty())
+                        .then(|| serde_json::from_slice(line).ok())
+                        .flatten());
+                }
+                None => {}
+            }
+        } else if start == 0 {
+            return Ok(None);
+        }
+        let take = start.min(CHUNK);
+        let from = start - take;
+        let mut chunk = vec![0u8; take as usize];
+        read_exact_at(file, &mut chunk, from)?;
+        chunk.extend_from_slice(&tail);
+        tail = chunk;
+        start = from;
+    }
+}
+
+/// Fill `buf` from `file` at `offset`, not moving where it writes.
+fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        let mut done = 0;
+        while done < buf.len() {
+            let n = std::os::windows::fs::FileExt::seek_read(
+                file,
+                &mut buf[done..],
+                offset + done as u64,
+            )?;
+            if n == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            done += n;
+        }
+        Ok(())
+    }
+}
+
+/// `fsync` the directory `path` is in, so that a file just made there keeps its
+/// name through a crash, and then the one that holds it, for a directory just
+/// made too, as the default `./mcpdef-audit/` is on a first start. That second
+/// one is best effort: a directory MCPdef may not read, above its own, must not
+/// stop it starting. Windows has no such call, nor the need for one.
+fn sync_dirs(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        File::open(&dir)?.sync_all()?;
+        let above = match dir.parent() {
+            Some(up) if !up.as_os_str().is_empty() => up.to_path_buf(),
+            _ => dir.join(".."),
+        };
+        let _ = File::open(above).and_then(|d| d.sync_all());
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 /// A cloneable handle to one [`Ledger`], for appending from many tasks at once.
@@ -651,8 +1007,9 @@ impl Ledger {
 /// its record before letting go. The lock's order is therefore the chain's order:
 /// `seq` stays contiguous and every `prev_hash` names the record before it.
 ///
-/// - [`append`](Self::append) resolves once the record is written, with the same
-///   write + flush as [`Ledger::append`] (not an `fsync`).
+/// - [`append`](Self::append) resolves once the record is written as
+///   [`Ledger::append`] writes it: to the operating system, and under
+///   [`Durability::Fsync`] to disk.
 /// - While another append is writing, `append` waits its turn: backpressure,
 ///   never a dropped record.
 /// - Nothing is awaited between taking the lock and writing, so an append that
@@ -662,9 +1019,13 @@ impl Ledger {
 /// Whoever holds the lock writes, so there is no hand-off to a writer task or
 /// thread. That is the point: sending each record to a writer on another thread
 /// and waking the caller again measured +12 to +63 µs per append (+46 µs p50 on a
-/// denied call through the gateway), against about 4 µs for the write itself. A
-/// durable mode would keep this lock for ordering and add a commit task that
-/// `fsync`s after a group of writes and releases the appends it covers.
+/// denied call through the gateway), against about 4 µs for the write itself.
+///
+/// Under [`Durability::Fsync`] the `fsync` runs on Tokio's blocking pool, after
+/// the lock is let go: it takes milliseconds, which no async worker should spend
+/// waiting. Meanwhile the next append writes its record, and its own `fsync`
+/// covers both, so appends that arrive together share the disk's time rather
+/// than queueing for one `fsync` each.
 #[derive(Clone)]
 pub struct LedgerHandle {
     shared: Arc<tokio::sync::Mutex<Shared>>,
@@ -708,9 +1069,16 @@ impl LedgerHandle {
     /// written. See [`LedgerHandle`] for ordering, backpressure and cancellation.
     pub async fn append(&self, entry: Entry) -> Result<Record, AuditError> {
         let mut shared = self.shared.lock().await;
-        let record = shared.ledger.append(entry)?;
+        let record = shared.ledger.write(entry)?;
         let head = Head::of(&shared.ledger);
         shared.publish.send_replace(head);
+        let to_sync = shared.ledger.to_sync();
+        drop(shared);
+        if let Some(file) = to_sync {
+            tokio::task::spawn_blocking(move || file.sync_data())
+                .await
+                .map_err(std::io::Error::other)??;
+        }
         Ok(record)
     }
 
@@ -933,6 +1301,10 @@ pub enum ExportFormat {
     Cef,
     /// RFC 5424 syslog line (epoch carried in structured data + as RFC3339).
     Syslog,
+    /// An OTLP/JSON `ExportTraceServiceRequest` holding the record's span, one
+    /// line, as the OTLP file exporter writes it: see [`otlp`]. A record the
+    /// gateway wrote of itself is no span, and has no line.
+    Otlp,
 }
 
 impl ExportFormat {
@@ -943,22 +1315,28 @@ impl ExportFormat {
             "ocsf" => Some(ExportFormat::Ocsf),
             "cef" => Some(ExportFormat::Cef),
             "syslog" => Some(ExportFormat::Syslog),
+            "otlp" => Some(ExportFormat::Otlp),
             _ => None,
         }
     }
 
     /// The accepted format names, for help text / error messages.
-    pub const NAMES: &'static [&'static str] = &["json", "ocsf", "cef", "syslog"];
+    pub const NAMES: &'static [&'static str] = &["json", "ocsf", "cef", "syslog", "otlp"];
 }
 
 impl Record {
-    /// Render this record in `fmt` as a single line (no trailing newline).
-    pub fn export(&self, fmt: ExportFormat) -> String {
+    /// Render this record in `fmt` as a single line (no trailing newline):
+    /// `None` when the format has none for it, as [`ExportFormat::Otlp`] has
+    /// none for a record the gateway wrote of itself.
+    pub fn export(&self, fmt: ExportFormat) -> Option<String> {
         match fmt {
-            ExportFormat::Json => serde_json::to_string(self).expect("Record serializes"),
-            ExportFormat::Ocsf => self.to_ocsf(),
-            ExportFormat::Cef => self.to_cef(),
-            ExportFormat::Syslog => self.to_syslog(),
+            ExportFormat::Json => Some(serde_json::to_string(self).expect("Record serializes")),
+            ExportFormat::Ocsf => Some(self.to_ocsf()),
+            ExportFormat::Cef => Some(self.to_cef()),
+            ExportFormat::Syslog => Some(self.to_syslog()),
+            ExportFormat::Otlp => {
+                otlp::request([self], otlp::SERVICE).map(|request| request.to_string())
+            }
         }
     }
 
@@ -1020,15 +1398,7 @@ impl Record {
             obj["resources"] = serde_json::json!([{ "uid": uri }]);
         }
         let unmapped = &mut obj["unmapped"];
-        let strings = [
-            ("kind", &self.kind),
-            ("uri", &self.uri),
-            ("actor", &self.actor),
-            ("peer", &self.peer),
-            ("config_from", &self.config_from),
-            ("config_to", &self.config_to),
-        ];
-        for (name, value) in strings {
+        for (name, value) in self.later_strings() {
             if let Some(value) = value {
                 unmapped[name] = Value::String(value.clone());
             }
@@ -1038,6 +1408,12 @@ impl Record {
         }
         if let Some(changes) = &self.tool_changes {
             unmapped["tool_changes"] = changes.to_value();
+        }
+        if let Some(drift) = &self.drift {
+            unmapped["drift"] = drift.to_value();
+        }
+        if let Some(bundle) = &self.bundle {
+            unmapped["bundle"] = bundle.to_value();
         }
         for (name, value) in self.extra.iter() {
             unmapped[name] = value.clone();
@@ -1050,8 +1426,10 @@ impl Record {
     /// map to `cs3` (kind), `cs4` (actor), `cs5` (transforms, as a JSON array),
     /// `cs6` (tool_changes, as a JSON object), `request` (uri), `src`/`c6a2` +
     /// `spt` or `shost` (peer), and `oldFileHash` and `fileHash` (a reload's
-    /// `config_from` and `config_to`). Members this release does not know are left
-    /// to the JSON and OCSF exports.
+    /// `config_from` and `config_to`). The trace (`trace_id`, `parent_id`), the
+    /// `tool_digest`, a pin's `drift`, a policy `bundle`, and members this
+    /// release does not know are left to the JSON and OCSF exports, and the first four to syslog's
+    /// too, the first three to OTLP's.
     fn to_cef(&self) -> String {
         let severity = if self.is_deny() { 7 } else { 2 };
         let signature = self.decision.clone();
@@ -1128,8 +1506,8 @@ impl Record {
     /// for allow, 4 (warning) for deny. The event detail rides in an `mcpdef@0`
     /// structured-data element; the human message follows. The later members are
     /// parameters of that element when present (`transforms` as a JSON array,
-    /// `tool_changes` as a JSON object); members this release does not know are
-    /// left to the JSON and OCSF exports.
+    /// `tool_changes`, `drift` and `bundle` as JSON objects); members this
+    /// release does not know are left to the JSON and OCSF exports.
     fn to_syslog(&self) -> String {
         let severity = if self.is_deny() { 4 } else { 6 };
         let pri = 10 * 8 + severity;
@@ -1143,15 +1521,7 @@ impl Record {
             rule = sd_escape(self.rule.as_deref().unwrap_or("")),
             lat = self.latency_ms,
         );
-        let strings = [
-            ("kind", &self.kind),
-            ("uri", &self.uri),
-            ("actor", &self.actor),
-            ("peer", &self.peer),
-            ("config_from", &self.config_from),
-            ("config_to", &self.config_to),
-        ];
-        for (name, value) in strings {
+        for (name, value) in self.later_strings() {
             if let Some(value) = value {
                 sd.push_str(&format!(" {name}=\"{}\"", sd_escape(value)));
             }
@@ -1163,6 +1533,14 @@ impl Record {
         if let Some(changes) = &self.tool_changes {
             let counts = canonical_json(&changes.to_value());
             sd.push_str(&format!(" tool_changes=\"{}\"", sd_escape(&counts)));
+        }
+        if let Some(drift) = &self.drift {
+            let drift = canonical_json(&drift.to_value());
+            sd.push_str(&format!(" drift=\"{}\"", sd_escape(&drift)));
+        }
+        if let Some(bundle) = &self.bundle {
+            let bundle = canonical_json(&bundle.to_value());
+            sd.push_str(&format!(" bundle=\"{}\"", sd_escape(&bundle)));
         }
         sd.push_str(&format!(" hash=\"{}\"]", sd_escape(&self.hash)));
         format!(
@@ -1238,7 +1616,7 @@ fn sd_escape(s: &str) -> String {
 
 /// A peer's IP and port when it is a socket address, or its IP when it is only
 /// that. `None` for anything else (a hostname, say).
-fn parse_peer(peer: &str) -> Option<(IpAddr, Option<u16>)> {
+pub(crate) fn parse_peer(peer: &str) -> Option<(IpAddr, Option<u16>)> {
     match peer.parse::<SocketAddr>() {
         Ok(addr) => Some((addr.ip(), Some(addr.port()))),
         Err(_) => peer.parse::<IpAddr>().ok().map(|ip| (ip, None)),
@@ -1258,7 +1636,7 @@ fn ocsf_endpoint(peer: &str) -> Value {
 /// Format a Unix-epoch-millis timestamp as RFC 3339 UTC
 /// (`YYYY-MM-DDTHH:MM:SS.mmmZ`), using Howard Hinnant's `civil_from_days`
 /// algorithm so the crate needs no date/time dependency.
-fn rfc3339_utc(ts_unix_ms: u64) -> String {
+pub fn rfc3339_utc(ts_unix_ms: u64) -> String {
     let secs = (ts_unix_ms / 1000) as i64;
     let millis = ts_unix_ms % 1000;
     let days = secs.div_euclid(86_400);
@@ -1292,6 +1670,33 @@ mod tests {
             latency_ms: 1,
             attrs: Attrs::default(),
         }
+    }
+
+    /// A release before the trace and digest members reads them as members
+    /// it does not know, into `extra`, and hashes them the same: a ledger
+    /// this one writes still verifies there.
+    #[test]
+    fn the_trace_and_digest_hash_as_a_release_that_knows_neither_hashes_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut led = Ledger::open(dir.path().join("audit.log")).unwrap();
+        let mut e = entry("github", "list_issues", Decision::Allow);
+        e.attrs.trace_id = Some("4bf92f3577b34da6a3ce929d0e0e4736".into());
+        e.attrs.parent_id = Some("00f067aa0ba902b7".into());
+        e.attrs.tool_digest = Some(format!("sha256:{}", "ab".repeat(32)));
+        let written = led.append(e).unwrap();
+
+        let mut older = written.clone();
+        let mut unknown = BTreeMap::new();
+        for (name, value) in [
+            ("trace_id", older.trace_id.take()),
+            ("parent_id", older.parent_id.take()),
+            ("tool_digest", older.tool_digest.take()),
+        ] {
+            unknown.insert(name.to_string(), Value::String(value.unwrap()));
+        }
+        older.extra = Extra(unknown);
+        assert_eq!(older.compute_hash(), written.hash);
+        assert_eq!(written.compute_hash(), written.hash);
     }
 
     #[test]
@@ -1329,6 +1734,97 @@ mod tests {
         assert!(report.ok());
         assert_eq!(report.records, 2);
         assert_eq!(report.head, r1.hash);
+    }
+
+    #[test]
+    fn under_fsync_a_record_is_appended_and_a_reopened_ledger_resumes_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let first = {
+            let mut led = Ledger::open_with(&path, Durability::Fsync).unwrap();
+            assert_eq!(led.durability(), Durability::Fsync);
+            led.append(entry("github", "list_issues", Decision::Allow))
+                .unwrap()
+        };
+        let mut led = Ledger::open_with(&path, Durability::Fsync).unwrap();
+        assert_eq!(led.head(), first.hash);
+        let second = led
+            .append(entry("github", "get_issue", Decision::Allow))
+            .unwrap();
+        assert_eq!((second.seq, second.prev_hash), (1, first.hash));
+        assert!(verify(&path).unwrap().ok());
+    }
+
+    /// `audit_fsync` turned on for a ledger written without it: the open syncs
+    /// what is there, and the chain carries on.
+    #[test]
+    fn a_ledger_written_plainly_carries_on_under_fsync() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let first = Ledger::open(&path)
+            .unwrap()
+            .append(entry("github", "list_issues", Decision::Allow))
+            .unwrap();
+        let mut led = Ledger::open_with(&path, Durability::Fsync).unwrap();
+        assert_eq!((led.head(), led.next_seq()), (first.hash.as_str(), 1));
+        led.append(entry("github", "get_issue", Decision::Allow))
+            .unwrap();
+        let report = verify(&path).unwrap();
+        assert!(report.ok());
+        assert_eq!(report.records, 2);
+    }
+
+    #[test]
+    fn a_ledger_opened_plainly_leaves_the_fsync_to_the_operating_system() {
+        let dir = tempfile::tempdir().unwrap();
+        let led = Ledger::open(dir.path().join("audit.log")).unwrap();
+        assert_eq!(led.durability(), Durability::Os);
+        assert!(led.to_sync().is_none());
+    }
+
+    /// The `fsync` runs after the lock is let go, so appends interleave around
+    /// it; the chain must come out whole and in order all the same.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn under_fsync_concurrent_appends_keep_the_chain_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let handle = LedgerHandle::new(Ledger::open_with(&path, Durability::Fsync).unwrap());
+        let tasks: Vec<_> = (0..32)
+            .map(|i| {
+                let handle = handle.clone();
+                tokio::spawn(async move {
+                    handle
+                        .append(entry("s", &format!("t{i}"), Decision::Allow))
+                        .await
+                        .unwrap()
+                })
+            })
+            .collect();
+        let mut seqs = Vec::new();
+        for task in tasks {
+            seqs.push(task.await.unwrap().seq);
+        }
+        seqs.sort_unstable();
+        assert_eq!(seqs, (0..32).collect::<Vec<u64>>());
+        let report = verify(&path).unwrap();
+        assert!(report.ok());
+        assert_eq!(report.records, 32);
+        assert_eq!(handle.written(), (32, report.head));
+    }
+
+    /// A gateway's tests, and `mcpdef call`, run on one thread: the blocking
+    /// pool is there too.
+    #[tokio::test]
+    async fn under_fsync_a_handle_appends_on_a_single_threaded_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let handle = LedgerHandle::new(Ledger::open_with(&path, Durability::Fsync).unwrap());
+        let rec = handle
+            .append(entry("s", "t", Decision::Allow))
+            .await
+            .unwrap();
+        assert_eq!(rec.seq, 0);
+        assert_eq!(handle.written(), (1, rec.hash));
     }
 
     #[test]
@@ -1417,26 +1913,26 @@ mod tests {
         };
 
         // JSON round-trips back to the same record.
-        let j = rec.export(ExportFormat::Json);
+        let j = rec.export(ExportFormat::Json).unwrap();
         assert!(!j.contains('\n'));
         let back: Record = serde_json::from_str(&j).unwrap();
         assert_eq!(back, rec);
 
         // OCSF is valid JSON with the API-Activity class and a Failure status.
-        let o = rec.export(ExportFormat::Ocsf);
+        let o = rec.export(ExportFormat::Ocsf).unwrap();
         let v: serde_json::Value = serde_json::from_str(&o).unwrap();
         assert_eq!(v["class_uid"], 6003);
         assert_eq!(v["status"], "Failure");
         assert_eq!(v["unmapped"]["tool"], "delete_repo");
 
         // CEF header + a couple of extensions.
-        let c = rec.export(ExportFormat::Cef);
+        let c = rec.export(ExportFormat::Cef).unwrap();
         assert!(c.starts_with("CEF:0|mcpdef|mcpdef|"));
         assert!(c.contains("act=deny"));
         assert!(c.contains("cs1=delete_repo"));
 
         // Syslog: a PRI + version 1 + structured data, no embedded newline.
-        let s = rec.export(ExportFormat::Syslog);
+        let s = rec.export(ExportFormat::Syslog).unwrap();
         assert!(s.starts_with('<') && s.contains(">1 "));
         assert!(s.contains("[mcpdef@0 "));
         assert!(!s.contains('\n'));
@@ -1458,11 +1954,11 @@ mod tests {
                 .unwrap()
         };
 
-        let c = rec.export(ExportFormat::Cef);
+        let c = rec.export(ExportFormat::Cef).unwrap();
         assert!(!c.contains('\n'), "CEF must be single-line: {c:?}");
         assert!(!c.contains('\r'));
 
-        let s = rec.export(ExportFormat::Syslog);
+        let s = rec.export(ExportFormat::Syslog).unwrap();
         assert!(!s.contains('\n'), "syslog must be single-line: {s:?}");
         assert!(!s.contains('\r'));
     }
@@ -1492,7 +1988,7 @@ mod tests {
         for (method, msgid) in methods {
             let mut e = entry("github", "delete_repo", Decision::Allow);
             e.method = method.map(String::from);
-            let s = led.append(e).unwrap().export(ExportFormat::Syslog);
+            let s = led.append(e).unwrap().export(ExportFormat::Syslog).unwrap();
             // PRI+VERSION TIMESTAMP HOSTNAME APP-NAME PROCID MSGID STRUCTURED-DATA MSG
             let header: Vec<&str> = s.splitn(7, ' ').collect();
             assert_eq!(header[5], msgid, "{s}");
@@ -1582,6 +2078,70 @@ mod tests {
 
     /// The same for `tool_changes`, an object: 0.4.0-alpha.1 keeps it as a
     /// member it does not know, and hashes it to the same value.
+    /// The same for `drift`: a release before it keeps it as a member it does
+    /// not know, and hashes the record the same.
+    #[test]
+    fn a_drift_hashes_as_an_unknown_member_would() {
+        let typed: Record = serde_json::from_str(
+            r#"{"seq":0,"ts_unix_ms":1,"agent":"mcpdef","server":"files","method":"pin","tool":"echo","decision":"allow","rule":"drift-accepted","latency_ms":0,"kind":"upstream","drift":{"changes":["inputSchema.required: reordered"],"grade":"info"},"prev_hash":"","hash":""}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            typed.drift,
+            Some(Drift {
+                grade: "info".into(),
+                changes: vec!["inputSchema.required: reordered".into()],
+            })
+        );
+        let mut unknown = typed.clone();
+        unknown.drift = None;
+        unknown.extra = serde_json::from_value(serde_json::json!({
+            "drift": { "grade": "info", "changes": ["inputSchema.required: reordered"] },
+        }))
+        .unwrap();
+        assert_eq!(typed.compute_hash(), unknown.compute_hash());
+        let mut other = typed.clone();
+        other.drift = Some(Drift {
+            grade: "breaking".into(),
+            ..typed.drift.clone().unwrap()
+        });
+        assert_ne!(typed.compute_hash(), other.compute_hash());
+    }
+
+    /// The same for `bundle`, with a revision, an integer, among its members.
+    #[test]
+    fn a_bundle_hashes_as_an_unknown_member_would() {
+        let typed: Record = serde_json::from_str(
+            r#"{"seq":0,"ts_unix_ms":1,"agent":"mcpdef","server":"(config)","method":"bundle","decision":"allow","latency_ms":3,"kind":"reload","bundle":{"kid":"mcpdef:bundle:3UZupYMhdcKC","revision":7,"sha256":"sha256:24fe"},"prev_hash":"","hash":""}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            typed.bundle,
+            Some(BundleRef {
+                sha256: "sha256:24fe".into(),
+                revision: Some(7),
+                kid: Some("mcpdef:bundle:3UZupYMhdcKC".into()),
+            })
+        );
+        let mut unknown = typed.clone();
+        unknown.bundle = None;
+        unknown.extra = serde_json::from_value(serde_json::json!({
+            "bundle": { "sha256": "sha256:24fe", "revision": 7, "kid": "mcpdef:bundle:3UZupYMhdcKC" },
+        }))
+        .unwrap();
+        assert_eq!(typed.compute_hash(), unknown.compute_hash());
+        // One that did not verify names its file alone.
+        let unverified: Record = serde_json::from_str(
+            r#"{"seq":0,"ts_unix_ms":1,"agent":"mcpdef","server":"(config)","method":"bundle","decision":"deny","rule":"bundle-unverified","latency_ms":3,"kind":"reload","bundle":{"sha256":"sha256:24fe"},"prev_hash":"","hash":""}"#,
+        )
+        .unwrap();
+        assert_eq!(unverified.bundle.as_ref().unwrap().revision, None);
+        assert!(serde_json::from_str::<Record>(
+            r#"{"seq":0,"ts_unix_ms":1,"agent":"mcpdef","server":"(config)","decision":"allow","latency_ms":3,"bundle":{"sha256":"sha256:24fe","note":"x"},"prev_hash":"","hash":""}"#,
+        )
+        .is_err());
+    }
+
     #[test]
     fn tool_changes_hash_as_an_unknown_member_would() {
         let typed: Record = serde_json::from_str(

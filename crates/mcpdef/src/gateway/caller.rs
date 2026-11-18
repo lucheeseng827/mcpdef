@@ -18,6 +18,10 @@ pub struct Caller {
     pub certificate: Option<String>,
     /// The client's address, on a network listener.
     pub peer: Option<SocketAddr>,
+    /// The W3C trace context the request's transport carried (a
+    /// `traceparent` header): its trace and the caller's span. A request's
+    /// own `_meta` names the one its records keep before this.
+    pub trace: Option<(String, String)>,
 }
 
 /// The issuer of a principal a client key names: the gateway itself. No
@@ -66,6 +70,9 @@ pub(crate) struct Who<'c> {
     pub(crate) actor: Option<String>,
     /// The records' `peer`: the client's address.
     pub(crate) peer: Option<String>,
+    /// The records' `trace_id` and `parent_id`: the trace the request was
+    /// part of, and the caller's span in it.
+    pub(crate) trace: Option<(String, String)>,
     subject: Subject<'c>,
 }
 
@@ -99,6 +106,7 @@ impl<'c> Who<'c> {
             agent,
             actor,
             peer: caller.peer.map(|addr| addr.to_string()),
+            trace: caller.trace.clone(),
             subject,
         }
     }
@@ -110,6 +118,7 @@ impl<'c> Who<'c> {
             agent: agent.into(),
             actor: None,
             peer: None,
+            trace: None,
             subject: Subject::None,
         }
     }
@@ -144,15 +153,22 @@ mod tests {
     fn the_token_is_the_subject_and_the_certificate_behind_it_the_actor() {
         let mut rbac = Rbac::new();
         rbac.map_certificates("spiffe://acme/ci/*", vec!["ci".into()]);
+        let trace = (
+            "4bf92f3577b34da6a3ce929d0e0e4736".to_string(),
+            "00f067aa0ba902b7".to_string(),
+        );
         let both = Caller {
             principal: Some(alice()),
             certificate: Some("spiffe://acme/ci/bot".into()),
             peer: Some("203.0.113.7:51234".parse().unwrap()),
+            trace: Some(trace.clone()),
         };
         let who = Who::of(&both, || unreachable!());
         assert_eq!(who.agent, "sub:alice");
         assert_eq!(who.actor.as_deref(), Some("cert:spiffe://acme/ci/bot"));
         assert_eq!(who.peer.as_deref(), Some("203.0.113.7:51234"));
+        assert_eq!(who.trace, Some(trace), "the records keep its trace");
+        assert_eq!(Who::named("agent:x").trace, None);
         assert_eq!(who.grants(&rbac), Some(vec!["read", "dev"]));
 
         let certificate = Caller {

@@ -1,0 +1,49 @@
+{
+  "schema": 1,
+  "generated_at_unix": 1792051832,
+  "mcpdef_version": "mcpdef 0.4.0  ·  MCP gateway & governance plane",
+  "commit": "2117c06366b5b3ede1934e48bf1820223c360857",
+  "note": "4-vCPU cloud VM (Intel Xeon @ 2.10GHz), 15.7 GiB, ext4 on a virtio disk; static musl harness, for the sandbox",
+  "machine": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpus": 4,
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "mem_total_kb": 16479424
+  },
+  "params": {
+    "quick": false,
+    "warmup": 300,
+    "requests": 3000,
+    "concurrency": [
+      1,
+      16
+    ],
+    "slow_ms": 5000,
+    "neighbour_upstreams": 20,
+    "neighbour_concurrency": 8,
+    "neighbour_alone_ms": 5000,
+    "neighbour_beside_ms": 15000,
+    "idle_upstreams": 10,
+    "idle_load_requests": 1000
+  },
+  "scenarios": {
+    "wasm_instantiate": {
+      "component": "echo_component.wasm",
+      "component_bytes": 206125,
+      "compile_us": 679292,
+      "first_us": 141,
+      "instantiate": {
+        "n": 3000,
+        "errors": 0,
+        "min_us": 17,
+        "p50_us": 21,
+        "p90_us": 29,
+        "p99_us": 60,
+        "max_us": 303,
+        "mean_us": 23,
+        "rps": 28647.257315881667
+      }
+    }
+  }
+}

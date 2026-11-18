@@ -40,7 +40,7 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue, ACCEPT, CONTENT_TYPE};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
@@ -378,6 +378,45 @@ pub async fn post_form(
     })
 }
 
+/// What a [`post_json`] got back: the status, how long the server asked to be
+/// left before the next try, and the body, whatever the status.
+#[derive(Debug)]
+pub struct Posted {
+    pub status: u16,
+    /// `Retry-After`, when it gave one in seconds.
+    pub retry_after: Option<Duration>,
+    pub body: Vec<u8>,
+}
+
+/// `POST` `body`, JSON, to `url`, **through the egress/SSRF guard** and
+/// verified by `tls`, with `token` as its bearer when given: an OTLP/HTTP
+/// export of the gateway's spans.
+pub async fn post_json(
+    url: &str,
+    body: Vec<u8>,
+    token: Option<&str>,
+    policy: &EgressPolicy,
+    tls: &TlsProfile,
+) -> Result<Posted, TransportError> {
+    let post = |client: &reqwest::Client| {
+        let request = client
+            .post(url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.clone());
+        match token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
+    };
+    let answer = fetch(url, "POST", policy, tls, &post).await?;
+    Ok(Posted {
+        status: answer.status.as_u16(),
+        retry_after: answer.retry_after,
+        body: answer.body,
+    })
+}
+
 /// `GET` `url` with `token` as its bearer, through the egress/SSRF guard and
 /// verified by `tls`: an OpenID Connect userinfo request.
 pub async fn get_bearer(
@@ -439,6 +478,20 @@ pub async fn fetch_dated(
     })
 }
 
+/// How long a `Retry-After` of `value` asks to be left, from `now`: a number
+/// of seconds, or an HTTP date, as RFC 9110 has it. A date already past asks
+/// for nothing.
+fn retry_after(value: &str, now: SystemTime) -> Option<Duration> {
+    let value = value.trim();
+    match value.parse::<u64>() {
+        Ok(secs) => Some(Duration::from_secs(secs)),
+        Err(_) => httpdate::parse_http_date(value)
+            .ok()?
+            .duration_since(now)
+            .ok(),
+    }
+}
+
 /// What one of the gateway's own requests got back.
 pub(crate) struct Answer {
     pub(crate) status: reqwest::StatusCode,
@@ -447,6 +500,8 @@ pub(crate) struct Answer {
     /// When the request went out, and when the head of the answer was in.
     pub(crate) sent: SystemTime,
     pub(crate) received: SystemTime,
+    /// `Retry-After`, when it gave one in seconds.
+    pub(crate) retry_after: Option<Duration>,
     pub(crate) body: Vec<u8>,
 }
 
@@ -489,6 +544,11 @@ pub(crate) async fn fetch(
             .get(reqwest::header::DATE)
             .and_then(|date| date.to_str().ok())
             .and_then(|date| httpdate::parse_http_date(date).ok());
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|after| after.to_str().ok())
+            .and_then(|after| retry_after(after, received));
         // Sized to the answer when it says how long it is, so that a body
         // holding a token is not copied as it grows.
         let expected = resp.content_length().unwrap_or(0).min(MAX_BYTES as u64);
@@ -508,6 +568,7 @@ pub(crate) async fn fetch(
             date,
             sent,
             received,
+            retry_after,
             body,
         })
     };
@@ -1340,6 +1401,21 @@ fn parse_event(raw: &str) -> Option<SseEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_after_takes_seconds_or_a_date_to_come() {
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(1_760_000_000);
+        assert_eq!(retry_after(" 7 ", now), Some(Duration::from_secs(7)));
+        let later = httpdate::fmt_http_date(now + Duration::from_secs(30));
+        assert_eq!(retry_after(&later, now), Some(Duration::from_secs(30)));
+        let past = httpdate::fmt_http_date(now - Duration::from_secs(30));
+        assert_eq!(
+            retry_after(&past, now),
+            None,
+            "a date gone by asks for nothing"
+        );
+        assert_eq!(retry_after("soon", now), None);
+    }
 
     #[test]
     fn sse_parser_splits_events_across_chunks() {

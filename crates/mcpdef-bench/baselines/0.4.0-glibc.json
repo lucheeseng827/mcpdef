@@ -1,0 +1,265 @@
+{
+  "schema": 1,
+  "generated_at_unix": 1792046916,
+  "mcpdef_version": "mcpdef 0.4.0  ·  MCP gateway & governance plane",
+  "commit": "751ad46a8e170686b5d3d0b71f81727798cd2f38",
+  "note": "4-vCPU cloud VM (Intel Xeon @ 2.10GHz), 15 GB; glibc build",
+  "machine": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpus": 4,
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "mem_total_kb": 16479424
+  },
+  "params": {
+    "quick": false,
+    "warmup": 300,
+    "requests": 3000,
+    "concurrency": [
+      1,
+      16
+    ],
+    "slow_ms": 5000,
+    "neighbour_upstreams": 20,
+    "neighbour_concurrency": 8,
+    "neighbour_alone_ms": 5000,
+    "neighbour_beside_ms": 15000,
+    "idle_upstreams": 10,
+    "idle_load_requests": 1000
+  },
+  "scenarios": {
+    "allowed": [
+      {
+        "concurrency": 1,
+        "direct": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 27,
+          "p50_us": 95,
+          "p90_us": 139,
+          "p99_us": 304,
+          "max_us": 2106,
+          "mean_us": 104,
+          "rps": 9472.664413389246
+        },
+        "gateway": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 163,
+          "p50_us": 252,
+          "p90_us": 481,
+          "p99_us": 962,
+          "max_us": 3852,
+          "mean_us": 309,
+          "rps": 3226.0351046558694
+        },
+        "added_p50_us": 157,
+        "added_p99_us": 658,
+        "ratio_p50": 2.6526315789473682,
+        "ratio_p99": 3.164473684210526
+      },
+      {
+        "concurrency": 16,
+        "direct": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 107,
+          "p50_us": 398,
+          "p90_us": 561,
+          "p99_us": 777,
+          "max_us": 1094,
+          "mean_us": 411,
+          "rps": 38657.938631914105
+        },
+        "gateway": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 280,
+          "p50_us": 1371,
+          "p90_us": 2197,
+          "p99_us": 3604,
+          "max_us": 5781,
+          "mean_us": 1467,
+          "rps": 10876.474655546306
+        },
+        "added_p50_us": 973,
+        "added_p99_us": 2827,
+        "ratio_p50": 3.4447236180904524,
+        "ratio_p99": 4.638352638352639
+      }
+    ],
+    "allowed_bearer": [
+      {
+        "concurrency": 1,
+        "direct": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 29,
+          "p50_us": 88,
+          "p90_us": 134,
+          "p99_us": 345,
+          "max_us": 2190,
+          "mean_us": 101,
+          "rps": 9748.968766270114
+        },
+        "gateway": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 192,
+          "p50_us": 346,
+          "p90_us": 645,
+          "p99_us": 1274,
+          "max_us": 3984,
+          "mean_us": 410,
+          "rps": 2434.0988783638295
+        },
+        "added_p50_us": 258,
+        "added_p99_us": 929,
+        "ratio_p50": 3.9318181818181817,
+        "ratio_p99": 3.692753623188406
+      },
+      {
+        "concurrency": 16,
+        "direct": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 93,
+          "p50_us": 413,
+          "p90_us": 571,
+          "p99_us": 806,
+          "max_us": 3097,
+          "mean_us": 430,
+          "rps": 36929.82064921812
+        },
+        "gateway": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 367,
+          "p50_us": 1532,
+          "p90_us": 2400,
+          "p99_us": 4098,
+          "max_us": 6313,
+          "mean_us": 1635,
+          "rps": 9749.383168713644
+        },
+        "added_p50_us": 1119,
+        "added_p99_us": 3292,
+        "ratio_p50": 3.709443099273608,
+        "ratio_p99": 5.084367245657568
+      }
+    ],
+    "denied": [
+      {
+        "concurrency": 1,
+        "gateway": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 77,
+          "p50_us": 88,
+          "p90_us": 114,
+          "p99_us": 255,
+          "max_us": 854,
+          "mean_us": 96,
+          "rps": 10297.992175750314
+        },
+        "ratio_p50_vs_direct": 0.9263157894736842,
+        "added_p50_us": -7,
+        "added_p99_us": -49
+      },
+      {
+        "concurrency": 16,
+        "gateway": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 73,
+          "p50_us": 588,
+          "p90_us": 1043,
+          "p99_us": 2606,
+          "max_us": 8344,
+          "mean_us": 659,
+          "rps": 24173.351551875185
+        },
+        "ratio_p50_vs_direct": 1.4773869346733668,
+        "added_p50_us": 190,
+        "added_p99_us": 1829
+      }
+    ],
+    "slow_neighbour": [
+      {
+        "transport": "http",
+        "upstreams": 20,
+        "slow_ms": 5000,
+        "concurrency": 8,
+        "alone": {
+          "n": 52878,
+          "errors": 0,
+          "min_us": 113,
+          "p50_us": 679,
+          "p90_us": 1139,
+          "p99_us": 2288,
+          "max_us": 10403,
+          "mean_us": 755,
+          "rps": 10571.420734698142
+        },
+        "beside_slow": {
+          "n": 156305,
+          "errors": 0,
+          "min_us": 117,
+          "p50_us": 678,
+          "p90_us": 1160,
+          "p99_us": 2525,
+          "max_us": 70104,
+          "mean_us": 766,
+          "rps": 10418.92650180674
+        },
+        "slow_calls_completed": 4,
+        "ratio_p50": 0.9985272459499264,
+        "ratio_p99": 1.103583916083916
+      },
+      {
+        "transport": "stdio",
+        "upstreams": 20,
+        "slow_ms": 5000,
+        "concurrency": 8,
+        "alone": {
+          "n": 73940,
+          "errors": 0,
+          "min_us": 94,
+          "p50_us": 470,
+          "p90_us": 817,
+          "p99_us": 1978,
+          "max_us": 18367,
+          "mean_us": 540,
+          "rps": 14786.705820189158
+        },
+        "beside_slow": {
+          "n": 203908,
+          "errors": 0,
+          "min_us": 83,
+          "p50_us": 492,
+          "p90_us": 902,
+          "p99_us": 2325,
+          "max_us": 66920,
+          "mean_us": 587,
+          "rps": 13592.276174625458
+        },
+        "slow_calls_completed": 4,
+        "ratio_p50": 1.0468085106382978,
+        "ratio_p99": 1.1754297269969667
+      }
+    ],
+    "idle_rss": {
+      "upstreams": 10,
+      "console": true,
+      "idle_rss_kb": 11320,
+      "idle_hwm_kb": 11320,
+      "idle_anon_kb": 1440,
+      "idle_file_kb": 9880,
+      "after_load_rss_kb": 12008,
+      "after_load_hwm_kb": 12008,
+      "after_load_anon_kb": 2128,
+      "after_load_file_kb": 9880,
+      "load_requests": 1000
+    }
+  }
+}

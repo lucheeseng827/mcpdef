@@ -472,6 +472,68 @@ fn pin_then_diff_tools_detects_drift() {
     assert!(String::from_utf8_lossy(&drifted.stdout).contains("CHANGED"));
 }
 
+/// `diff-tools` grades each change, and fails only for one the gateway holds:
+/// a change of whitespace passes under the default `pin_accept`, a reworded
+/// description does not.
+#[test]
+fn diff_tools_grades_a_drift_and_fails_only_on_one_held() {
+    let dir = tempfile::tempdir().unwrap();
+    let pins = dir.path().join("pins.toml");
+    let cfg = dir.path().join("mcpdef.toml");
+    let mock = env!("CARGO_BIN_EXE_mock_mcp_server");
+    std::fs::write(
+        &cfg,
+        format!(
+            "[gateway]\naudit = \"{audit}\"\npins = \"{pins}\"\n\n[[server]]\nid = \"mock\"\n\
+             transport = \"stdio\"\ncommand = [\"{mock}\"]\n",
+            audit = dir.path().join("audit.log").display(),
+            pins = pins.display(),
+        ),
+    )
+    .unwrap();
+    let run = |args: &[&str]| Command::new(BIN).args(args).arg(&cfg).output().unwrap();
+    assert!(run(&["pin", "--config"]).status.success());
+
+    // What was pinned, as the server offered it, edited as a server would
+    // have had it before: the live definition then reads as the change.
+    let pinned = |edit: &dyn Fn(&mut serde_json::Value)| {
+        let mut store = mcpdef_pin::PinStore::load(&pins).unwrap();
+        let mut echo = store
+            .pinned_definition("mock", "echo")
+            .expect("pinned with its definition");
+        edit(&mut echo);
+        store.record_tool("mock", &echo);
+        store.save(&pins).unwrap();
+    };
+
+    pinned(&|echo| {
+        let text = echo["description"].as_str().unwrap().to_string();
+        echo["description"] = serde_json::Value::from(format!("  {text}\n"));
+    });
+    let out = run(&["diff-tools", "--config"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("~ changed, info: within [gateway] pin_accept"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("    description: changed in its whitespace only"),
+        "{stdout}"
+    );
+
+    assert!(run(&["pin", "--config"]).status.success());
+    pinned(&|echo| echo["description"] = serde_json::Value::from("Echo text."));
+    let out = run(&["diff-tools", "--config"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(!out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("~ CHANGED, breaking (held: possible rug-pull)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("    description: changed ("), "{stdout}");
+}
+
 /// Write a config fronting the stdio mock server, allowlisting only `echo`.
 fn mock_cfg(dir: &Path) -> std::path::PathBuf {
     let cfg = dir.join("mcpdef.toml");
@@ -845,6 +907,49 @@ fn call_echo(cfg: &Path) -> std::process::Output {
         .arg(cfg)
         .output()
         .unwrap()
+}
+
+/// Under `[gateway] audit_fsync`, a call is recorded as without it, in a
+/// ledger that verifies, made in a directory that did not exist yet.
+#[test]
+fn under_audit_fsync_a_call_is_recorded_in_a_ledger_that_verifies() {
+    let dir = tempfile::tempdir().unwrap();
+    let audit = dir.path().join("ledger").join("audit.log");
+    let cfg = dir.path().join("mcpdef.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            r#"
+            [gateway]
+            audit = "{audit}"
+            audit_fsync = true
+
+            [[server]]
+            id = "mock"
+            transport = "stdio"
+            command = ["{mock}"]
+            tools = ["echo"]
+            "#,
+            audit = audit.display(),
+            mock = env!("CARGO_BIN_EXE_mock_mcp_server"),
+        ),
+    )
+    .unwrap();
+    let out = call_echo(&cfg);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report = mcpdef_audit::verify(&audit).unwrap();
+    assert!(report.ok());
+    assert!(
+        mcpdef_audit::read_all(&audit)
+            .unwrap()
+            .iter()
+            .any(|r| r.tool.as_deref() == Some("echo") && r.decision == "allow"),
+        "the call is recorded"
+    );
 }
 
 /// Under `[gateway] strict`, the gateway starts whole or not at all: not with

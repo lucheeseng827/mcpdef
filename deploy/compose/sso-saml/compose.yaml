@@ -36,7 +36,7 @@ services:
   mcpdef:
     # MCPdef 0.4.0 or later. This tree's own: `make docker-build` at the
     # repository's root, then MCPDEF_IMAGE=mcpdef:dev docker compose up -d
-    image: ${MCPDEF_IMAGE:-mancube/mcpdef:v0.4.0}
+    image: ${MCPDEF_IMAGE:-mancube/mcpdef:v0.5.0}
     # On Keycloak's network, http://localhost:8080 is Keycloak for MCPdef as
     # it is for the browser: both see the one issuer the tokens name.
     network_mode: "service:keycloak"

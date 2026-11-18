@@ -5,7 +5,9 @@ the same MCP JSON-RPC 2.0 envelope: **stdio** (`mcpdef run`) and the **Streamabl
 HTTP listener** (`mcpdef run --http` / `mcpdef up`). Source of truth: the axum
 router in [`crates/mcpdef/src/listener.rs`](../crates/mcpdef/src/listener.rs) and
 the method dispatch in [`crates/mcpdef/src/gateway.rs`](../crates/mcpdef/src/gateway.rs);
-regenerate this file when they change.
+regenerate this file when they change. A third listener serves no client:
+`mcpdef filter` answers the checks of a proxy that routes MCP requests itself
+([Filter listener](#filter-listener-mcpdef-filter)).
 
 The gate table below itemises the allowlist/profiles, RBAC, pin/rug-pull, rate
 limit and upstream gates (a timeout, a downed upstream, a failed call, a
@@ -130,7 +132,7 @@ token alone names):
 | Method | Handling |
 |---|---|
 | `initialize` | Answered by the gateway itself (`protocolVersion: "2025-11-25"`, `capabilities: { tools: {} }`, plus `resources: {}` when some server's `resources` or `resource_templates` exposes any, `prompts: {}` when some server's `prompts` does, and `completions: {}` when there is a prompt or a template to complete, `serverInfo.name: "mcpdef"`). On the stdio gateway the client's `clientInfo.name` becomes the audit identity (`agent:<name>`); on the shared HTTP listener it is deliberately ignored so one client cannot rename another's audit records. Over stdio, `tools` is `{ listChanged: true }`: from the client's `notifications/initialized` on, MCPdef sends it `notifications/tools/list_changed` each time what `tools/list` shows changes ([WIRE.md](./WIRE.md#status)). |
-| `tools/list` | Aggregated across all upstreams from each one's `tools/list`, every page of it, taken when it opens and again each time it sends `notifications/tools/list_changed` ([OPERATIONS.md](./OPERATIONS.md#when-an-upstreams-tools-change)), then filtered: a tool the allowlist denies, whose definition drifted from its pin, or whose description tripped the scanner is **hidden**. Each name is listed once: a name more than one server offers is listed from the first in config order whose allowlist takes it, the server a call to it goes to (see [CONFIG.md § Tool names](./CONFIG.md#tool-names)). With `[gateway] tool_namespace = "prefix"` each is listed as `<prefix>__<name>`. Each tool names its server in `_meta["mcpdef/server"]`, over any value the server set there itself; the rest of its `_meta`, and of the tool, is as the server sent it, its `name` aside when prefixed. The pin hashes the server's definition, which this key is not part of. |
+| `tools/list` | Aggregated across all upstreams from each one's `tools/list`, every page of it, taken when it opens and again each time it sends `notifications/tools/list_changed` ([OPERATIONS.md](./OPERATIONS.md#when-an-upstreams-tools-change)), then filtered: a tool the allowlist denies, whose definition drifted from its pin worse than `[gateway] pin_accept` takes, or whose description tripped the scanner is **hidden**. Each name is listed once: a name more than one server offers is listed from the first in config order whose allowlist takes it, the server a call to it goes to (see [CONFIG.md § Tool names](./CONFIG.md#tool-names)). With `[gateway] tool_namespace = "prefix"` each is listed as `<prefix>__<name>`. Each tool names its server in `_meta["mcpdef/server"]`, over any value the server set there itself; the rest of its `_meta`, and of the tool, is as the server sent it, its `name` aside when prefixed. The pin hashes the server's definition, which this key is not part of. |
 | `tools/call` | The governed hot path — see the gate order below. |
 | `ping` | Answered by the gateway (`{}`). |
 | `resources/list`, `resources/templates/list` | Every server whose `resources` (for URIs) or `resource_templates` (for templates) exposes any is asked at once, its pages followed. What each allowlist takes is answered as **one page**, in config order, each entry naming its server in `_meta["mcpdef/server"]` and each URI in [normal form](./CONFIG.md#resource-uri-patterns). A URI or template two servers show is listed once, from the first. A server that fails to answer adds nothing. A `cursor` from the client gets `-32602`: the gateway never gives one. Not audited, as `tools/list` is not. |
@@ -154,7 +156,7 @@ below.
 | 1 | Routing — is the tool listed by a running server, or named in the `tools` of one that has not started? A name goes to the first server in config order whose allowlist takes it, else the first that lists it. With prefixes, `<prefix>__<name>` goes to that prefix's server, and from here on is `<name>`: each gate, the audit record and the upstream see the tool as its server names it. | `unknown-tool` | `no governed server exposes tool '<t>'` |
 | 2 | Allowlist / profiles (`Policy::decide_tool`) | `unknown-server`, `deny-glob`, `not-on-allowlist`, `not-in-active-profile` | e.g. `tool '<t>' matches deny pattern '<p>' for '<server>'` |
 | 3 | RBAC (HTTP callers a token or a client certificate names, and only when `[[role]]` is defined) | `rbac` | `no role grants '<t>' on '<server>'` |
-| 4 | Pin / rug-pull (when `[gateway] pins` is set) | `rug-pull` | `tool '<t>' on '<server>' changed since it was pinned (possible rug-pull); re-approve with mcpdef pin` |
+| 4 | Pin / rug-pull (when `[gateway] pins` is set) | `rug-pull` | `tool '<t>' on '<server>' changed since it was pinned (possible rug-pull, graded breaking: description: changed (32 → 88 characters)); re-approve with mcpdef pin` |
 | 5 | Rate limit (after authorization, so denied floods can't drain buckets), a bucket per server and tool | `rate-limited` | `global rate limit exceeded …` / `tool rate limit exceeded for '<t>' — retry shortly` |
 | 6 | Dispatch + per-call timeout (`[gateway] upstream_timeout_ms`) | `upstream-timeout` | `MCPdef error: upstream '<server>' did not respond to '<t>' within <n>ms` |
 | 6 | Dispatch to an upstream that is down (it did not start, or went down and is restarting) | `upstream-down` | `MCPdef error: upstream '<server>' is down (<why>); MCPdef is restarting it — retry shortly` |
@@ -253,7 +255,7 @@ origin. See [CONFIG.md § `[gateway.admin]`](./CONFIG.md#gatewayadmin--the-admin
 | `GET /api/v1/status` | `{ version, upstreams, upstreams_up, uptime_seconds }`. |
 | `GET /api/v1/servers` | The configured upstreams' effective (profile-applied) allow/deny (`id`, `transport`, `url`, `tools`, `deny`, `profile`), what each exposes of its resources and prompts (`resources`, `resource_templates`, `prompts`, each absent when it exposes none), how many of its tools are hidden for drifting from their pins (`drifted`) and for tripping the scanner (`poisoned`), `url` with any secret it holds shown as `***` (see the notes on gate 6), and `env`: for each variable its `[server.env]` sets, by name, where the value comes from, `{ scheme, from }`, never the value. `scheme` is `literal`, `env`, `file` or `exec`, and `from` is `(literal)`, `$NAME`, the file's path or `(exec PROGRAM)`. A server with `[server.auth]` also has `auth`: `{ kind, <field>: { scheme, from } }`, where `<field>` is `token`, `value`, `password` or `client_secret`, with a `header` kind's `name` and an `oauth2` kind's `token_url`, masked as `url` is, never the secret, a `basic` kind's user name or an `oauth2` client id. Each with its live `health` (`starting`, `up`, `degraded` or `down`), `restarts`, and `last_error` (`{ message, at_unix_ms }` or `null`). A server with `[server.auth]` also has `credential`, how the credentials MCPdef sends it fare: `last_ok` (`{ at_unix_ms }` or `null`), the last time the upstream answered a request that carried them; `last_error` (`{ message, at_unix_ms }` or `null`), the last time it refused them or MCPdef had none to send, and why; and `expires_at`, when the credentials it is sent now expire, in RFC 3339: an `oauth2` token's, from its `expires_in`, and `null` for another kind, until a token is fetched, and after a fetch failed. A token is fetched when a request needs one, so an upstream no one calls holds one that has expired. An HTTPS upstream that has opened also has `tls`: `{ verify, fingerprint, not_after }`, and `client_not_after` when its connection presents a certificate (`client_cert`): when that certificate expires, in RFC 3339. `verify` is how its certificate was checked: `ca` (its chain, name and dates), `pin` (its key alone, `pin_sha256`) or `disabled` (`insecure_skip_verify`). `fingerprint` is the SHA-256 of the certificate its server presented last, in the colon-separated hex `openssl x509 -fingerprint -sha256` prints, and `not_after` is when that certificate expires, in RFC 3339. A plain-HTTP, stdio or sandboxed upstream has no `tls` key, and nor does one that has not opened. A server that offers a tool name another server offers too also has `tool_collisions`: `[{ tool, servers }]`, the name as `tools/list` gives it and every server that offers it, in config order, the first being the one it is listed from and called on. Each server the gateway runs also has `listing`, what it adds to `tools/list`: `{ offered, listed, bytes }`. `offered` is how many tools its connection lists, none until it opens; `listed` how many of them `tools/list` shows, after the allowlist, the active profile, the pins and the scanner, less a name listed from another server; and `bytes` what those take up in a `tools/list` answer, each entry as it is sent, compact, by the name it is listed by and with its `_meta`, the commas between entries not counted. Every agent that lists the tools reads those bytes into its context; `bytes ÷ 4` estimates the tokens, as `mcpdef tools list --cost` prints. It follows the live list, so a re-list, a reload or a restart changes it. As of the last config reload, like `upstreams` in `/api/v1/status` and `mcpdef_upstreams`. |
 | `GET /api/v1/servers/{id}` | One server, as `/api/v1/servers` shows it; `404` for an id no server has. |
-| `GET /api/v1/servers/{id}/tools` | Each tool the server's connection offers, in the order it lists them: `[{ name, listed_as, hidden, pin, hash, description }]`. `listed_as` is the name `tools/list` gives it (with the server's prefix under `tool_namespace = "prefix"`). `hidden` is why `tools/list` does not show it, `null` when it does: `allowlist` (the server's allowlist or profile), `drift` (its definition changed since it was pinned), `inspect` (its definition tripped the scanner), `x-mcp-header` or `collision` (another server's tool of that name is listed). `pin` is `off` with no pin store, else `pinned` or `drift`. `hash` is the hex SHA-256 of the definition it offers now, over the fields a pin governs: what approving its drift names. Empty until the connection opens; `404` for an id no server has. |
+| `GET /api/v1/servers/{id}/tools` | Each tool the server's connection offers, in the order it lists them: `[{ name, listed_as, hidden, pin, hash, drift, description }]`. `listed_as` is the name `tools/list` gives it (with the server's prefix under `tool_namespace = "prefix"`). `hidden` is why `tools/list` does not show it, `null` when it does: `allowlist` (the server's allowlist or profile), `drift` (its definition changed since it was pinned), `inspect` (its definition tripped the scanner), `x-mcp-header` or `collision` (another server's tool of that name is listed). `pin` is `off` with no pin store, else `pinned` or `drift`. `hash` is the hex SHA-256 of the definition it offers now, over the fields a pin governs: what approving its drift names. `drift`, on a tool held for drifting from its pin, is how it changed, `{ grade, changes }`, as the ledger records it ([CONFIG.md § Data formats](./CONFIG.md#data-formats--compatibility)), and absent otherwise. Empty until the connection opens; `404` for an id no server has. |
 | `GET /api/v1/policy/rules` | The `[[policy]]` rules, in the order they run: `{ transform, admission }`, the transform rules, which rewrite a call's arguments before the others judge it and a result after, then the allow and deny rules, the first that matches deciding. Each with its `name`, `effect`, the globs it matches (`agents`, `servers`, `tools`, `uris`, `prompts`, `null` for any), `args` (`[{ path, op, value }]`), and a transform's `set_args` (`[{ path, op }]`, a clamp's `min` and `max` too; never a value it sets), `on_error` and `result` (`[{ op, arg }]`). |
 | `GET /api/v1/policy/rbac` | `{ roles: [{ name, grants, resource_grants, prompt_grants }], cert_map: [{ identity, roles }] }`: the `[[role]]`s and `[[identity.cert_map]]`. |
 | `GET /api/v1/policy/profiles` | `{ active, profiles: [{ name, tools, deny }] }`: `[gateway] profile`, and each `[profile.<name>]`, by name. |
@@ -270,8 +272,93 @@ origin. See [CONFIG.md § `[gateway.admin]`](./CONFIG.md#gatewayadmin--the-admin
 | `GET /api/v1/audit` | A page of the ledger's records, newest first: `?cursor=` (empty for the first page) and `limit` (1 to 500, default 50), with any of the filters `decision` (`allow` or `deny`), `server`, `tool`, `agent`, `rule`, `kind` (`call` for a governed call, `admin`, `reload`, `upstream`), `since` and `until` (milliseconds since the epoch; `since` inclusive, `until` not), all of which a record must match. Answers `{ records, next_cursor }`: hand `next_cursor` back for the next, older page; `null` when no older record can match. A page reads only its own records, from where the last one stopped; a filtered page reads at most 100,000 looking for matches and, if it finds too few, stops short with a cursor to go on from. `since` stops at the first record older than it, so a record written after the clock was set back can be missed. A cursor from another ledger, or from this one before it was cut short or replaced, is refused `400`. With `limit` alone (up to 1000, default 100), or nothing, the newest records as a bare list, as before. |
 | `GET /api/v1/audit/{seq}` | One record, by its `seq`; `404` if the ledger holds none. |
 | `GET /api/v1/audit/verify` | The hash chain checked from the first record, as `mcpdef audit verify` does, and against a point the file must still hold: how far this gateway has written, or, given `head` and `count` both, a seal kept elsewhere. `{ ok, records, head, broken_at, ambiguous, against: { kind, records, head }, reason }`: `kind` is `written` or `seal`; `broken_at` the first record broken, or the first known to be missing or changed; `reason` says which, or is `null`. A ledger cut short or replaced since that point fails though its own chain holds, and one that has grown since passes. One verify runs at a time. |
-| `GET /api/v1/audit/export` | `?format=json\|ocsf\|cef\|syslog`, with the filters above: every record they take, first to last, one line each as `mcpdef audit tail --format` writes it, streamed as it is read, as an attachment (`application/x-ndjson` for `json` and `ocsf`, `text/plain` for the others). Four exports at a time; a fifth is `503`. |
+| `GET /api/v1/audit/export` | `?format=json\|ocsf\|cef\|syslog\|otlp`, with the filters above: every record they take, first to last, one line each as `mcpdef audit tail --format` writes it, streamed as it is read, as an attachment (`application/x-ndjson` for `json`, `ocsf` and `otlp`, `text/plain` for the others). `otlp` has a line for each governed request only: its span, as an OTLP/JSON `ExportTraceServiceRequest`. Four exports at a time; a fifth is `503`. |
 | `GET /api/v1/audit/stream` | Server-Sent Events: each record as it is appended, its `id` the record's `seq` and its `data` the record. It starts after `Last-Event-ID`, else after `?after=`, else at the end of the ledger, and takes the filters above; a record they pass over still moves the `id` on, in an event with no data, so a browser that comes back resumes after it. The listener ends a stream after 10 minutes, and the browser comes back at once, its caller checked again. 64 streams at a time; one more is `503`. |
+
+## Filter listener (`mcpdef filter`)
+
+The checks of a proxy that routes MCP requests itself, as Envoy's HTTP
+`ext_authz` filter makes them, on `[gateway.filter] listen` (default
+`127.0.0.1:7880`), over plain HTTP: an address only the proxy reaches. Each
+check is the request the proxy is about to route, its method, its path with
+the proxy's `path_prefix` before it, its headers and its body. On a `200` the
+proxy routes it; on anything else it answers the client with the check's
+answer, its status, headers and body. Any method and any path is a check.
+Bodies are capped at **2 MiB**, as on `POST /mcp`; over the cap → `413`. Source
+of truth: [`crates/mcpdef/src/filter.rs`](../crates/mcpdef/src/filter.rs), and
+the judging in
+[`crates/mcpdef/src/gateway/authorize.rs`](../crates/mcpdef/src/gateway/authorize.rs).
+The proxy's side is in
+[OPERATIONS.md § Filter mode](./OPERATIONS.md#filter-mode-behind-a-proxy-that-routes).
+
+Check-processing order (each step can end the check):
+
+1. **The resource's metadata** (only with `bearer` among `[gateway.auth]
+   methods`) — a `GET` of `/.well-known/oauth-protected-resource`, with the
+   `path_prefix` before it or not → `200`, the RFC 9728 document
+   `GET /.well-known/oauth-protected-resource` serves on the listener. For
+   anyone: it is where a `401`'s challenge sends a client. As a check it
+   passes, and the proxy can route the request itself here, where it is
+   served.
+2. **The path** — the `path_prefix` taken off, by whole segments; a path that
+   does not start with it → `403`, `unknown-route`. A `.` or `..` segment, a
+   `//`, a `\`, or an escaped `/`, `\` or `.` → `403`, `path-refused`. The
+   `[[server]]` whose `filter_path` the path is at or under, the longest
+   winning, is the server the request is judged for.
+3. **Origin check** — as `POST /mcp` step 1, refused with a `403`,
+   `origin-refused`.
+4. **Auth** (only when `[gateway.auth] enabled`) — bearer tokens and client
+   keys, as `POST /mcp` step 4 checks them, with its `401` and challenge, and
+   the caller each names. A config that takes client certificates does not
+   start: the proxy holds the connection.
+5. **The message** — a `POST`'s body is one JSON-RPC message, judged as below.
+   No body → `403`, `invalid-request` (the proxy did not send it: Envoy's
+   `with_request_body`), as is one that is not one JSON-RPC message. Any other
+   method → `200` on a path that names a server, else `403`, `unknown-route`.
+
+What a message meets, in the order the same request meets it in the path:
+
+| Request | Gates |
+|---|---|
+| `tools/call` | The server's allowlist, deny list and profile; the `transform` rules, a call they would change being refused under the rule that changed it, since the proxy sends the arguments the client wrote; the `allow` and `deny` rules; RBAC; the rate limit. |
+| `resources/read`, `resources/subscribe` | The URI, refused `uri-refused` if it is not in normal form, since the server would read another than the one judged; the server's `resources`; the rules; RBAC's `resource_grants`; the reads' rate limit. |
+| `prompts/get` | The server's `prompts`; the rules; RBAC's `prompt_grants`; the prompts' rate limit. |
+| `completion/complete` | Its `ref`: a prompt by `prompts`, a resource template by `resource_templates`; the rules, with `context.arguments`; RBAC; the completions' rate limit. |
+| Any other request, a notification, a response | Nothing: `200`, and nothing recorded. |
+
+Each of the first four is recorded in the ledger as the gateway records its
+own decisions, with `hook = "ext_authz"` and no `peer` (the check's peer is
+the proxy), under the server `(unrouted)` when its path names none, which
+refuses it (`unknown-route`). One that does not say what it asks for, a
+`tools/call` without its `params.name`, is refused `invalid-request` with no
+record. What only the path sees is not judged: the pins and the scan of a
+server's tool definitions, and what a call returns.
+
+| Answer | Headers | Body |
+|---|---|---|
+| `200`: the proxy routes the request | `x-mcpdef-decision: allow`; `x-mcpdef-record: <seq>`, the record's, when one was written | none |
+| `403`: refused | `content-type: application/json`; `x-mcpdef-decision: deny`; `x-mcpdef-rule: <rule>`; `x-mcpdef-record: <seq>` when a record was written | A JSON-RPC error: the request's `id` (`null` before the message is read), `code` `-32001`, `message` `MCPdef denied (<rule>): <reason>`, `data.rule` |
+| `401`: no credential, or one refused | `WWW-Authenticate`, as on `POST /mcp` | `missing or invalid bearer token` |
+| `413`: a body over the cap | | |
+
+A refused call is an error, not the tool-execution result the gateway in the
+path answers one with: the proxy hands the client the answer as it is, and a
+`200` would let the request through. `x-mcpdef-record` on a `200` is for a
+proxy that hands it to the upstream (Envoy's `allowed_upstream_headers`).
+
+```sh
+$ curl -s -D - -d '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"delete_repo","arguments":{}}}' \
+    http://127.0.0.1:7880/github/mcp
+HTTP/1.1 403 Forbidden
+content-type: application/json
+x-mcpdef-decision: deny
+x-mcpdef-rule: not-on-allowlist
+x-mcpdef-record: 0
+content-length: 185
+date: Sun, 18 Oct 2026 08:16:10 GMT
+
+{"error":{"code":-32001,"data":{"rule":"not-on-allowlist"},"message":"MCPdef denied (not-on-allowlist): tool 'delete_repo' is not on the allowlist for 'github'"},"id":9,"jsonrpc":"2.0"}
+```
 
 ## Auditability
 
@@ -280,4 +367,7 @@ JSON line — schema and verification in
 [CONFIG.md § Data formats](./CONFIG.md#data-formats--compatibility) and
 [OPERATIONS.md](./OPERATIONS.md#audit-ledger-verification). Export for SIEM
 ingestion with `mcpdef audit tail --format json|ocsf|cef|syslog`, or from the
-admin API's `GET /api/v1/audit/export`.
+admin API's `GET /api/v1/audit/export`. With
+[`[gateway.otel]`](./CONFIG.md#gatewayotel--spans-to-an-opentelemetry-endpoint),
+each governed request also goes to an OTLP/HTTP endpoint as a span
+([OPERATIONS.md § Traces](./OPERATIONS.md#traces-each-call-as-an-opentelemetry-span)).

@@ -1,0 +1,152 @@
+{
+  "schema": 1,
+  "generated_at_unix": 1792051813,
+  "mcpdef_version": "mcpdef 0.4.0  ·  MCP gateway & governance plane",
+  "commit": "2117c06366b5b3ede1934e48bf1820223c360857",
+  "note": "4-vCPU cloud VM (Intel Xeon @ 2.10GHz), 15.7 GiB, ext4 on a virtio disk; static musl gateway",
+  "machine": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpus": 4,
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "mem_total_kb": 16479424
+  },
+  "params": {
+    "quick": false,
+    "warmup": 300,
+    "requests": 3000,
+    "concurrency": [
+      1,
+      16
+    ],
+    "slow_ms": 5000,
+    "neighbour_upstreams": 20,
+    "neighbour_concurrency": 8,
+    "neighbour_alone_ms": 5000,
+    "neighbour_beside_ms": 15000,
+    "idle_upstreams": 10,
+    "idle_load_requests": 1000
+  },
+  "scenarios": {
+    "allowed_bearer": [
+      {
+        "concurrency": 1,
+        "direct": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 27,
+          "p50_us": 99,
+          "p90_us": 158,
+          "p99_us": 323,
+          "max_us": 7563,
+          "mean_us": 115,
+          "rps": 8601.571155532574
+        },
+        "gateway": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 265,
+          "p50_us": 508,
+          "p90_us": 891,
+          "p99_us": 1734,
+          "max_us": 18978,
+          "mean_us": 590,
+          "rps": 1690.2941990352217
+        },
+        "added_p50_us": 409,
+        "added_p99_us": 1411,
+        "ratio_p50": 5.1313131313131315,
+        "ratio_p99": 5.368421052631579
+      },
+      {
+        "concurrency": 16,
+        "direct": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 63,
+          "p50_us": 385,
+          "p90_us": 531,
+          "p99_us": 700,
+          "max_us": 1627,
+          "mean_us": 395,
+          "rps": 40217.48651487569
+        },
+        "gateway": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 930,
+          "p50_us": 2948,
+          "p90_us": 4107,
+          "p99_us": 5938,
+          "max_us": 9595,
+          "mean_us": 3025,
+          "rps": 5277.757449615334
+        },
+        "added_p50_us": 2563,
+        "added_p99_us": 5238,
+        "ratio_p50": 7.6571428571428575,
+        "ratio_p99": 8.482857142857142
+      }
+    ],
+    "allowed_bearer_fsync": [
+      {
+        "concurrency": 1,
+        "direct": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 27,
+          "p50_us": 104,
+          "p90_us": 154,
+          "p99_us": 258,
+          "max_us": 4145,
+          "mean_us": 114,
+          "rps": 8682.372924934576
+        },
+        "gateway": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 518,
+          "p50_us": 1358,
+          "p90_us": 1960,
+          "p99_us": 4271,
+          "max_us": 156101,
+          "mean_us": 1544,
+          "rps": 647.1518982477893
+        },
+        "added_p50_us": 1254,
+        "added_p99_us": 4013,
+        "ratio_p50": 13.057692307692308,
+        "ratio_p99": 16.55426356589147
+      },
+      {
+        "concurrency": 16,
+        "direct": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 119,
+          "p50_us": 384,
+          "p90_us": 557,
+          "p99_us": 1071,
+          "max_us": 4579,
+          "mean_us": 410,
+          "rps": 38776.89453921668
+        },
+        "gateway": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 765,
+          "p50_us": 3415,
+          "p90_us": 4905,
+          "p99_us": 8605,
+          "max_us": 15497,
+          "mean_us": 3579,
+          "rps": 4460.634870503994
+        },
+        "added_p50_us": 3031,
+        "added_p99_us": 7534,
+        "ratio_p50": 8.893229166666666,
+        "ratio_p99": 8.034547152194211
+      }
+    ]
+  }
+}

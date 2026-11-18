@@ -266,6 +266,12 @@ fn meta(msg: &Message) -> Option<&Value> {
     msg.params.as_ref()?.get("_meta")
 }
 
+/// The W3C `traceparent` a request carries in its `_meta`, unprefixed, as
+/// SEP-414 and the OpenTelemetry conventions for MCP put it there.
+pub fn traceparent(msg: &Message) -> Option<&str> {
+    meta(msg)?.get("traceparent")?.as_str()
+}
+
 /// The protocol version a modern request declares, from its `_meta`.
 pub fn protocol_version(msg: &Message) -> Option<&str> {
     meta(msg)?.get(meta_key::PROTOCOL_VERSION)?.as_str()

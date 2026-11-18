@@ -55,7 +55,8 @@ impl Client {
         }
     }
 
-    fn title(self) -> &'static str {
+    /// The client's own name, as its maker writes it.
+    pub fn title(self) -> &'static str {
         match self {
             Client::ClaudeCode => "Claude Code",
             Client::ClaudeDesktop => "Claude Desktop",
@@ -478,6 +479,13 @@ pub enum Wrote {
 /// guess. JSON comes back with its keys in order; the `.bak` holds the file
 /// as it was. TOML keeps its comments and layout.
 pub fn write(entry: &Entry, file: &Path) -> Result<Wrote> {
+    write_replacing(entry, file, &[])
+}
+
+/// [`write`], and take the servers named in `remove` out of the same file:
+/// those the gateway fronts now, so that the client reaches each of them
+/// through the gateway only. The entry itself is never taken out.
+pub fn write_replacing(entry: &Entry, file: &Path, remove: &[String]) -> Result<Wrote> {
     if entry.server.is_null() {
         bail!(
             "{} has no file to write to: add the entry it shows by hand",
@@ -489,9 +497,14 @@ pub fn write(entry: &Entry, file: &Path) -> Result<Wrote> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e).with_context(|| format!("reading {}", file.display())),
     };
+    let remove: Vec<&str> = remove
+        .iter()
+        .map(String::as_str)
+        .filter(|name| *name != entry.name)
+        .collect();
     let after = match &entry.format {
-        Format::Json { root } => merge_json(entry, root, before.as_deref(), file)?,
-        Format::Toml => merge_toml(entry, before.as_deref(), file)?,
+        Format::Json { root } => merge_json(entry, root, before.as_deref(), file, &remove)?,
+        Format::Toml => merge_toml(entry, before.as_deref(), file, &remove)?,
     };
     if before.as_deref() == Some(after.as_str()) {
         return Ok(Wrote::Unchanged);
@@ -503,7 +516,7 @@ pub fn write(entry: &Entry, file: &Path) -> Result<Wrote> {
     let wrote = match &before {
         Some(old) => {
             let backup = backup_path(file);
-            std::fs::write(&backup, old)
+            write_like(&backup, old, file)
                 .with_context(|| format!("writing the backup {}", backup.display()))?;
             Wrote::Updated { backup }
         }
@@ -513,13 +526,45 @@ pub fn write(entry: &Entry, file: &Path) -> Result<Wrote> {
     Ok(wrote)
 }
 
-fn backup_path(file: &Path) -> PathBuf {
+/// Write `text` to `path`, readable by whom `like` is: the backup of a file
+/// only its owner can read, one holding a token say, is its owner's alone too.
+pub(crate) fn write_like(path: &Path, text: &str, like: &Path) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let mode = std::fs::metadata(like)?.permissions().mode() & 0o777;
+        options.mode(mode);
+        mode
+    };
+    #[cfg(not(unix))]
+    let _ = like;
+    let mut out = options.open(path)?;
+    // A mode given at opening applies to a file it creates, not to a backup
+    // there from before.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        out.set_permissions(std::fs::Permissions::from_mode(mode))?;
+    }
+    out.write_all(text.as_bytes())
+}
+
+pub(crate) fn backup_path(file: &Path) -> PathBuf {
     let mut name = file.as_os_str().to_owned();
     name.push(".bak");
     PathBuf::from(name)
 }
 
-fn merge_json(entry: &Entry, root: &str, before: Option<&str>, file: &Path) -> Result<String> {
+fn merge_json(
+    entry: &Entry,
+    root: &str,
+    before: Option<&str>,
+    file: &Path,
+    remove: &[&str],
+) -> Result<String> {
     let mut doc: Value = match before {
         None => json!({}),
         Some(text) if text.trim().is_empty() => json!({}),
@@ -545,6 +590,9 @@ fn merge_json(entry: &Entry, root: &str, before: Option<&str>, file: &Path) -> R
         );
     };
     servers.insert(entry.name.clone(), entry.server.clone());
+    for name in remove {
+        servers.remove(*name);
+    }
     if !entry.inputs.is_empty() {
         let inputs = top.entry("inputs").or_insert_with(|| json!([]));
         let Some(inputs) = inputs.as_array_mut() else {
@@ -569,13 +617,21 @@ fn merge_json(entry: &Entry, root: &str, before: Option<&str>, file: &Path) -> R
     Ok(serde_json::to_string_pretty(&doc)? + "\n")
 }
 
-fn merge_toml(entry: &Entry, before: Option<&str>, file: &Path) -> Result<String> {
+fn merge_toml(entry: &Entry, before: Option<&str>, file: &Path, remove: &[&str]) -> Result<String> {
     let mut doc: toml_edit::DocumentMut = before
         .unwrap_or_default()
         .parse()
         .with_context(|| format!("{} is not TOML: left as it is", file.display()))?;
     let unchanged = doc.to_string();
     put_toml(&mut doc, &entry.name, &entry.server);
+    if let Some(servers) = doc
+        .get_mut("mcp_servers")
+        .and_then(toml_edit::Item::as_table_mut)
+    {
+        for name in remove {
+            servers.remove(name);
+        }
+    }
     let after = doc.to_string();
     // The same entry written again renders identically: hand back the file's
     // own text, so `write` sees nothing to do.
@@ -630,7 +686,7 @@ fn toml_value(v: &Value) -> Option<toml_edit::Value> {
 }
 
 /// A command line, with each argument quoted when it has to be.
-fn shell_line(program: &str, args: &[String]) -> String {
+pub(crate) fn shell_line(program: &str, args: &[String]) -> String {
     std::iter::once(program)
         .chain(args.iter().map(String::as_str))
         .map(|a| {

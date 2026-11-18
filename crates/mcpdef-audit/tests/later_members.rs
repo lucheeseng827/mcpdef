@@ -1,16 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The members a record gained after v1 (`kind`, `uri`, `transforms`, `actor`,
-//! `peer`): how they are written, what the hash covers, and what each export
-//! carries.
+//! `peer`, `trace_id`, `parent_id`, `tool_digest`, `hook`): how they are
+//! written, what the hash covers, and what each export carries.
 
 use mcpdef_audit::{
-    read_all, verify, Attrs, AuditError, Entry, ExportFormat, Kind, Ledger, Record, ToolChanges,
+    read_all, verify, Attrs, AuditError, BundleRef, Drift, Entry, ExportFormat, Kind, Ledger,
+    Record, ToolChanges,
 };
 use mcpdef_core::Decision;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
-const LATER: [&str; 5] = ["kind", "uri", "transforms", "actor", "peer"];
+const LATER: [&str; 9] = [
+    "kind",
+    "uri",
+    "transforms",
+    "actor",
+    "peer",
+    "trace_id",
+    "parent_id",
+    "tool_digest",
+    "hook",
+];
+
+const TRACE: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
+const PARENT: &str = "00f067aa0ba902b7";
+const DIGEST: &str = "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
 
 fn full() -> Attrs {
     Attrs {
@@ -19,6 +34,10 @@ fn full() -> Attrs {
         transforms: vec!["clamp-limit".into(), "redact-secrets".into()],
         actor: Some("oidc:alice@example.com".into()),
         peer: Some("203.0.113.7:51234".into()),
+        trace_id: Some(TRACE.into()),
+        parent_id: Some(PARENT.into()),
+        tool_digest: Some(DIGEST.into()),
+        hook: Some("claude-code".into()),
         ..Attrs::default()
     }
 }
@@ -238,7 +257,7 @@ fn a_member_named_twice_is_corrupt() {
 #[test]
 fn ocsf_carries_the_later_members() {
     let (_dir, _path, written) = ledger(vec![full(), Attrs::default()]);
-    let v: Value = serde_json::from_str(&written[0].export(ExportFormat::Ocsf)).unwrap();
+    let v: Value = serde_json::from_str(&written[0].export(ExportFormat::Ocsf).unwrap()).unwrap();
     assert_eq!(
         v["src_endpoint"],
         serde_json::json!({ "ip": "203.0.113.7", "port": 51234 })
@@ -256,9 +275,14 @@ fn ocsf_carries_the_later_members() {
         unmapped["transforms"],
         serde_json::json!(["clamp-limit", "redact-secrets"])
     );
+    assert_eq!(unmapped["trace_id"], TRACE);
+    assert_eq!(unmapped["parent_id"], PARENT);
+    assert_eq!(unmapped["tool_digest"], DIGEST);
+    assert_eq!(unmapped["hook"], "claude-code");
 
     // A plain call gains nothing.
-    let plain: Value = serde_json::from_str(&written[1].export(ExportFormat::Ocsf)).unwrap();
+    let plain: Value =
+        serde_json::from_str(&written[1].export(ExportFormat::Ocsf).unwrap()).unwrap();
     assert!(plain.get("src_endpoint").is_none() && plain.get("resources").is_none());
     for member in LATER {
         assert!(plain["unmapped"].get(member).is_none(), "{member}");
@@ -267,14 +291,14 @@ fn ocsf_carries_the_later_members() {
     // A member this release does not know rides along in `unmapped`.
     let mut later = written[1].clone();
     later.extra = serde_json::from_value(serde_json::json!({ "config": "sha256:abc" })).unwrap();
-    let v: Value = serde_json::from_str(&later.export(ExportFormat::Ocsf)).unwrap();
+    let v: Value = serde_json::from_str(&later.export(ExportFormat::Ocsf).unwrap()).unwrap();
     assert_eq!(v["unmapped"]["config"], "sha256:abc");
 }
 
 #[test]
 fn cef_carries_the_later_members() {
     let (_dir, _path, written) = ledger(vec![full()]);
-    let c = written[0].export(ExportFormat::Cef);
+    let c = written[0].export(ExportFormat::Cef).unwrap();
     for part in [
         " cs3Label=kind cs3=admin",
         " cs4Label=actor cs4=oidc:alice@example.com",
@@ -299,7 +323,7 @@ fn cef_carries_the_later_members() {
             peer: Some(peer.into()),
             ..Attrs::default()
         }]);
-        let c = written[0].export(ExportFormat::Cef);
+        let c = written[0].export(ExportFormat::Cef).unwrap();
         assert!(c.contains(part), "{peer}: {part:?} missing from {c}");
         assert_eq!(c.contains(" spt="), has_port, "{peer}: {c}");
     }
@@ -308,9 +332,11 @@ fn cef_carries_the_later_members() {
 #[test]
 fn syslog_carries_the_later_members() {
     let (_dir, _path, written) = ledger(vec![full()]);
-    let s = written[0].export(ExportFormat::Syslog);
-    let part = r#" latencyMs="3" kind="admin" uri="file:///etc/hosts" actor="oidc:alice@example.com" peer="203.0.113.7:51234" transforms="[\"clamp-limit\",\"redact-secrets\"\]" hash=""#;
-    assert!(s.contains(part), "{part:?} missing from {s}");
+    let s = written[0].export(ExportFormat::Syslog).unwrap();
+    let part = format!(
+        r#" latencyMs="3" kind="admin" uri="file:///etc/hosts" actor="oidc:alice@example.com" peer="203.0.113.7:51234" trace_id="{TRACE}" parent_id="{PARENT}" tool_digest="{DIGEST}" hook="claude-code" transforms="[\"clamp-limit\",\"redact-secrets\"\]" hash=""#
+    );
+    assert!(s.contains(&part), "{part:?} missing from {s}");
 }
 
 /// The CWE-117 guard covers the later members: CR/LF cannot split a CEF or
@@ -327,12 +353,12 @@ fn the_later_members_cannot_split_a_siem_line() {
     }]);
     let rec = &written[0];
     for format in [ExportFormat::Cef, ExportFormat::Syslog] {
-        let line = rec.export(format);
+        let line = rec.export(format).unwrap();
         assert!(!line.contains('\n') && !line.contains('\r'), "{line:?}");
     }
-    let c = rec.export(ExportFormat::Cef);
+    let c = rec.export(ExportFormat::Cef).unwrap();
     assert!(c.contains(r"cs4=alice  bob\=eve"), "{c}");
-    let s = rec.export(ExportFormat::Syslog);
+    let s = rec.export(ExportFormat::Syslog).unwrap();
     assert!(
         s.contains(r#"uri="file:///x  CEF:0|forged|\"\] [fake@0 a=\"b\"\]""#),
         "{s}"
@@ -381,15 +407,15 @@ fn every_export_carries_the_config_digests() {
         format!("sha256:{}", "a".repeat(64)),
         format!("sha256:{}", "b".repeat(64)),
     );
-    let ocsf: Value = serde_json::from_str(&rec.export(ExportFormat::Ocsf)).unwrap();
+    let ocsf: Value = serde_json::from_str(&rec.export(ExportFormat::Ocsf).unwrap()).unwrap();
     assert_eq!(ocsf["unmapped"]["config_from"], from.as_str());
     assert_eq!(ocsf["unmapped"]["config_to"], to.as_str());
-    let cef = rec.export(ExportFormat::Cef);
+    let cef = rec.export(ExportFormat::Cef).unwrap();
     assert!(
         cef.contains(&format!(" oldFileHash={from} fileHash={to}")),
         "{cef}"
     );
-    let syslog = rec.export(ExportFormat::Syslog);
+    let syslog = rec.export(ExportFormat::Syslog).unwrap();
     assert!(
         syslog.contains(&format!(" config_from=\"{from}\" config_to=\"{to}\"")),
         "{syslog}"
@@ -474,19 +500,19 @@ fn a_count_named_twice_or_one_it_lacks_is_corrupt() {
 fn every_export_carries_the_tool_changes() {
     let (_dir, _path, written) = ledger(vec![tools_changed(), Attrs::default()]);
     let rec = &written[0];
-    let ocsf: Value = serde_json::from_str(&rec.export(ExportFormat::Ocsf)).unwrap();
+    let ocsf: Value = serde_json::from_str(&rec.export(ExportFormat::Ocsf).unwrap()).unwrap();
     assert_eq!(
         ocsf["unmapped"]["tool_changes"],
         serde_json::json!({ "added": 1, "removed": 2, "changed": 3, "drifted": 1 })
     );
-    let cef = rec.export(ExportFormat::Cef);
+    let cef = rec.export(ExportFormat::Cef).unwrap();
     assert!(
         cef.contains(
             r#" cs6Label=toolChanges cs6={"added":1,"changed":3,"drifted":1,"removed":2}"#
         ),
         "{cef}"
     );
-    let syslog = rec.export(ExportFormat::Syslog);
+    let syslog = rec.export(ExportFormat::Syslog).unwrap();
     assert!(
         syslog.contains(
             r#" tool_changes="{\"added\":1,\"changed\":3,\"drifted\":1,\"removed\":2}" hash=""#
@@ -496,8 +522,159 @@ fn every_export_carries_the_tool_changes() {
 
     // A plain call carries none of it.
     let plain = &written[1];
-    let ocsf: Value = serde_json::from_str(&plain.export(ExportFormat::Ocsf)).unwrap();
+    let ocsf: Value = serde_json::from_str(&plain.export(ExportFormat::Ocsf).unwrap()).unwrap();
     assert!(ocsf["unmapped"].get("tool_changes").is_none());
-    assert!(!plain.export(ExportFormat::Cef).contains("cs6"));
-    assert!(!plain.export(ExportFormat::Syslog).contains("tool_changes"));
+    assert!(!plain.export(ExportFormat::Cef).unwrap().contains("cs6"));
+    assert!(!plain
+        .export(ExportFormat::Syslog)
+        .unwrap()
+        .contains("tool_changes"));
+}
+
+/// The attributes of a record about a tool whose definition drifted from its
+/// pin: graded, with what changed.
+fn drifted() -> Attrs {
+    Attrs {
+        kind: Kind::Upstream,
+        drift: Some(Drift {
+            grade: "info".into(),
+            changes: vec![
+                "inputSchema.required: reordered".into(),
+                "description: changed in its whitespace only".into(),
+            ],
+        }),
+        ..Attrs::default()
+    }
+}
+
+#[test]
+fn a_drift_is_written_with_its_grade_and_changes_and_the_hash_covers_them() {
+    let (_dir, path, written) = ledger(vec![drifted(), Attrs::default()]);
+    assert!(verify(&path).unwrap().ok());
+    assert_eq!(read_all(&path).unwrap(), written);
+    let line = &lines(&path)[0];
+    assert!(
+        line.contains(
+            r#""drift":{"grade":"info","changes":["inputSchema.required: reordered","description: changed in its whitespace only"]}"#
+        ),
+        "{line}"
+    );
+    assert!(!lines(&path)[1].contains("drift"), "a plain call has none");
+
+    // The grade, each change and the member itself are all in the hash.
+    let edits: [fn(&mut serde_json::Map<String, Value>); 3] = [
+        |obj| obj["drift"]["grade"] = Value::from("breaking"),
+        |obj| obj["drift"]["changes"][1] = Value::from("description: changed"),
+        |obj| {
+            obj.remove("drift");
+        },
+    ];
+    for (n, edit) in edits.into_iter().enumerate() {
+        let (_dir, path, _) = ledger(vec![drifted()]);
+        edit_line(&path, 0, edit);
+        assert_eq!(verify(&path).unwrap().broken_at, Some(0), "edit {n}");
+    }
+}
+
+/// A member a drift does not have would be dropped from what a SIEM reads, and
+/// one it lacks would leave the grade unsaid.
+#[test]
+fn a_drift_with_a_member_it_lacks_or_one_it_has_not_is_corrupt() {
+    let bad = [
+        (
+            r#""drift":{"grade":"info","changes":[],"why":"x"},"#,
+            "unknown field",
+        ),
+        (r#""drift":{"grade":"info"},"#, "missing field"),
+        (
+            r#""drift":{"grade":"info","grade":"breaking","changes":[]},"#,
+            "duplicate field",
+        ),
+    ];
+    for (members, why) in bad {
+        let (_dir, path, _) = ledger(vec![Attrs::default()]);
+        splice_line(&path, 0, members);
+        let err = verify(&path).expect_err(members);
+        assert!(
+            matches!(&err, AuditError::Corrupt { detail, .. } if detail.contains(why)),
+            "{members}: {err}"
+        );
+    }
+}
+
+#[test]
+fn the_json_ocsf_and_syslog_exports_carry_a_drift_and_cef_leaves_it() {
+    let (_dir, _path, written) = ledger(vec![drifted()]);
+    let rec = &written[0];
+    let ocsf: Value = serde_json::from_str(&rec.export(ExportFormat::Ocsf).unwrap()).unwrap();
+    assert_eq!(
+        ocsf["unmapped"]["drift"]["grade"],
+        Value::from("info"),
+        "{ocsf}"
+    );
+    let syslog = rec.export(ExportFormat::Syslog).unwrap();
+    assert!(
+        syslog.contains(
+            r#" drift="{\"changes\":[\"inputSchema.required: reordered\",\"description: changed in its whitespace only\"\],\"grade\":\"info\"}" hash=""#
+        ),
+        "{syslog}"
+    );
+    let json: Value = serde_json::from_str(&rec.export(ExportFormat::Json).unwrap()).unwrap();
+    assert_eq!(
+        json["drift"]["changes"][0],
+        "inputSchema.required: reordered"
+    );
+    assert!(!rec.export(ExportFormat::Cef).unwrap().contains("drift"));
+}
+
+/// The attributes of the record of a policy bundle a node applied.
+fn bundled() -> Attrs {
+    Attrs {
+        kind: Kind::Reload,
+        bundle: Some(BundleRef {
+            sha256: "sha256:24fe".into(),
+            revision: Some(7),
+            kid: Some("mcpdef:bundle:3UZupYMhdcKC".into()),
+        }),
+        ..Attrs::default()
+    }
+}
+
+#[test]
+fn a_bundle_is_written_with_its_revision_and_key_and_the_hash_covers_them() {
+    let (_dir, path, written) = ledger(vec![bundled(), Attrs::default()]);
+    assert!(verify(&path).unwrap().ok());
+    assert_eq!(read_all(&path).unwrap(), written);
+    let line = &lines(&path)[0];
+    assert!(
+        line.contains(
+            r#""bundle":{"sha256":"sha256:24fe","revision":7,"kid":"mcpdef:bundle:3UZupYMhdcKC"}"#
+        ),
+        "{line}"
+    );
+    assert!(!lines(&path)[1].contains("bundle"), "a plain call has none");
+    let edits: [fn(&mut serde_json::Map<String, Value>); 3] = [
+        |obj| obj["bundle"]["revision"] = Value::from(6),
+        |obj| obj["bundle"]["kid"] = Value::from("mcpdef:bundle:other"),
+        |obj| {
+            obj.remove("bundle");
+        },
+    ];
+    for (n, edit) in edits.into_iter().enumerate() {
+        let (_dir, path, _) = ledger(vec![bundled()]);
+        edit_line(&path, 0, edit);
+        assert_eq!(verify(&path).unwrap().broken_at, Some(0), "edit {n}");
+    }
+
+    let rec = &written[0];
+    let ocsf: Value = serde_json::from_str(&rec.export(ExportFormat::Ocsf).unwrap()).unwrap();
+    assert_eq!(ocsf["unmapped"]["bundle"]["revision"], 7, "{ocsf}");
+    let syslog = rec.export(ExportFormat::Syslog).unwrap();
+    assert!(
+        syslog.contains(
+            r#" bundle="{\"kid\":\"mcpdef:bundle:3UZupYMhdcKC\",\"revision\":7,\"sha256\":\"sha256:24fe\"}" hash=""#
+        ),
+        "{syslog}"
+    );
+    assert!(!rec.export(ExportFormat::Cef).unwrap().contains("bundle"));
 }

@@ -11,6 +11,7 @@
 //! - Codex's TOML keeps its comments and its other settings.
 //! - A token is named by its variable, never its value; a client certificate
 //!   makes any client's entry a `mcpdef bridge` one.
+//! - `--replace` takes out of the client's file the servers the gateway fronts.
 //!
 //! Every run sets `HOME` and the working directory to temporary ones, so no
 //! test can touch the real config files of the machine it runs on.
@@ -244,6 +245,126 @@ fn codex_toml_keeps_its_comments_and_settings() {
 
     let again = f.connect_ok(&["codex", "--write"]);
     assert!(again.contains("nothing written"), "{again}");
+}
+
+/// With `--replace`, a server the gateway fronts (the same command) is taken
+/// out of the client's file, and one it does not front stays. The backup holds
+/// the file as it was, and a second run has nothing left to take out.
+#[test]
+fn replace_takes_out_what_the_gateway_fronts_and_keeps_the_rest() {
+    let f = Fixture::new();
+    let file = f.work().join(".mcp.json");
+    let original = format!(
+        r#"{{"mcpServers":{{"mock":{{"command":{MOCK:?}}},"other":{{"command":"other-mcp"}}}}}}"#
+    );
+    std::fs::write(&file, &original).unwrap();
+
+    let out = f.connect_ok(&["claude-code", "--write", "--replace"]);
+    assert!(out.contains("took mock out of"), "{out}");
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let mut names: Vec<_> = doc["mcpServers"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["mcpdef", "other"]);
+    assert_eq!(
+        std::fs::read_to_string(f.work().join(".mcp.json.bak")).unwrap(),
+        original
+    );
+
+    let again = f.connect_ok(&["claude-code", "--write", "--replace"]);
+    assert!(again.contains("nothing written"), "{again}");
+    assert!(again.contains("nothing else in"), "{again}");
+}
+
+/// Codex's TOML too: the fronted server's table goes, its comments and the
+/// rest stay.
+#[test]
+fn replace_takes_a_fronted_server_out_of_codex_toml() {
+    let f = Fixture::new();
+    let file = f.home().join(".codex/config.toml");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(
+        &file,
+        format!(
+            "# my settings\nmodel = \"gpt-5\"\n\n[mcp_servers.mock]\ncommand = {MOCK:?}\n\n\
+             [mcp_servers.keep]\ncommand = \"keep-mcp\"\n"
+        ),
+    )
+    .unwrap();
+
+    let out = f.connect_ok(&["codex", "--write", "--replace"]);
+    assert!(out.contains("took mock out of"), "{out}");
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(text.contains("# my settings"), "{text}");
+    let doc: toml::Table = toml::from_str(&text).unwrap();
+    let servers = doc["mcp_servers"].as_table().unwrap();
+    let mut names: Vec<_> = servers.keys().map(String::as_str).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["keep", "mcpdef"], "{text}");
+}
+
+/// The same command with other variables is another server: a read-only
+/// token and an admin one, say. Only the one the gateway runs is taken out.
+/// The client's other files are left as they are, and a fronted server in one
+/// is named. The backup is as private as the file was.
+#[test]
+fn replace_takes_out_only_the_same_server_and_names_one_left_elsewhere() {
+    let f = Fixture::new();
+    let file = f.work().join(".mcp.json");
+    let original = format!(
+        r#"{{"mcpServers":{{"mock":{{"command":{MOCK:?}}},"mock-admin":{{"command":{MOCK:?},"env":{{"TOKEN":"admin"}}}}}}}}"#
+    );
+    std::fs::write(&file, &original).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let user = f.home().join(".claude.json");
+    std::fs::write(
+        &user,
+        format!(r#"{{"mcpServers":{{"mock-user":{{"command":{MOCK:?}}}}}}}"#),
+    )
+    .unwrap();
+
+    let out = f.connect_ok(&["claude-code", "--write", "--replace"]);
+    assert!(out.contains("took mock out of"), "{out}");
+    assert!(out.contains("mock-user is in ~/.claude.json too"), "{out}");
+    let doc: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let mut names: Vec<_> = doc["mcpServers"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["mcpdef", "mock-admin"]);
+    assert!(
+        std::fs::read_to_string(&user)
+            .unwrap()
+            .contains("mock-user"),
+        "another file is not changed"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let backup = f.work().join(".mcp.json.bak");
+        let mode = std::fs::metadata(&backup).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "the backup is as private as the file");
+    }
+}
+
+/// `--replace` changes the client's file, so it goes with `--write` only.
+#[test]
+fn replace_needs_write() {
+    let f = Fixture::new();
+    let out = f.connect(&["claude-code", "--replace"]);
+    assert!(!out.status.success(), "{out:?}");
+    assert!(!f.work().join(".mcp.json").exists());
 }
 
 /// A token is referred to by its variable; its value never reaches the

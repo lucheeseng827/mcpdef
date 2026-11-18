@@ -13,12 +13,12 @@ use crate::metrics::Metrics;
 use crate::redact::redact_urls;
 use anyhow::{anyhow, bail, Context, Result};
 use arc_swap::{ArcSwap, ArcSwapOption};
-use mcpdef_audit::{Attrs, Entry, Kind, Ledger, LedgerHandle};
+use mcpdef_audit::{Attrs, BundleRef, Drift, Entry, Kind, Ledger, LedgerHandle};
 use mcpdef_auth::Principal;
 use mcpdef_core::wire::{self, SpecSetting, UpstreamSpec, WireMode, WireModel};
 use mcpdef_core::{method, Decision, Id, Message};
 use mcpdef_inspect::{Category, Finding, Scanner};
-use mcpdef_pin::{tool_hash, PinCheck, PinStore};
+use mcpdef_pin::{tool_hash, Grading, Judgement, PinStore, Severity};
 use mcpdef_policy::{
     redact_result, Detected, Policy, PolicyContext, PolicyRules, Rbac, Target, Transformed,
     Unredacted,
@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, watch};
 
 mod actions;
+mod authorize;
 mod caller;
 mod completion;
 mod input;
@@ -47,6 +48,7 @@ mod relist;
 mod resources;
 mod supervise;
 pub use self::actions::Refused;
+pub use self::authorize::Authorization;
 use self::caller::Who;
 pub use self::caller::{issued, Caller, IssuedKey};
 use self::lists::Listing;
@@ -60,7 +62,7 @@ use self::supervise::{Health, Tenure, UpstreamEvent};
 
 /// The `agent` of a record the gateway writes about itself, such as an
 /// upstream going down, rather than about a caller's request.
-const GATEWAY_AGENT: &str = "mcpdef";
+const GATEWAY_AGENT: &str = mcpdef_audit::GATEWAY_AGENT;
 
 /// How many upstream connections have opened: the next one's `serial`.
 static CONNECTIONS: AtomicU64 = AtomicU64::new(0);
@@ -169,9 +171,10 @@ struct Slot {
     /// The connection, once one has opened. After it goes down it stays until a
     /// restart replaces it, and its handle fails every call at once meanwhile.
     conn: Option<Arc<Upstream>>,
-    /// Tools whose definition drifted from its pin: a suspected rug-pull. They
-    /// are hidden from `tools/list`, and a call to one is denied and audited.
-    drifted: Arc<HashSet<String>>,
+    /// Tools whose definition drifted from its pin, held: a suspected
+    /// rug-pull, each with its grade. They are hidden from `tools/list`, and a
+    /// call to one is denied and audited.
+    drifted: Arc<Drifted>,
     /// Tools whose description tripped the injection rule pack when the
     /// connection opened (tool poisoning). In enforce mode they are hidden and
     /// denied, the description-side analog of `drifted`.
@@ -184,6 +187,62 @@ struct Pins {
     path: PathBuf,
     /// True if connect recorded new pins that should be written back.
     dirty: bool,
+    /// The worst drift taken without an approval (`[gateway] pin_accept`).
+    accept: Severity,
+}
+
+/// Each tool held for drifting from its pin, with its grade: `None` when its
+/// pin holds the hash alone, so the change cannot be graded.
+pub(crate) type Drifted = HashMap<String, Option<Grading>>;
+
+/// What judging an upstream's tools against the pin store found.
+#[derive(Default)]
+struct PinVerdicts {
+    /// The drifts held, hidden and denied until someone approves them.
+    held: Drifted,
+    /// The drifts taken under `[gateway] pin_accept`: already re-pinned, and
+    /// to be recorded.
+    accepted: Vec<(String, Grading)>,
+}
+
+/// At most this many of a drift's changes go in a record, and a line that
+/// counts the rest.
+const DRIFT_LINES: usize = 20;
+
+/// A drift as the ledger records it.
+fn drift_record(grading: Option<&Grading>) -> Drift {
+    match grading {
+        Some(grading) => Drift {
+            grade: grading.severity.as_str().to_string(),
+            changes: grading.lines(DRIFT_LINES),
+        },
+        None => Drift {
+            grade: "ungraded".to_string(),
+            changes: vec![
+                "its pin holds the hash alone, from before pins kept the definition: \
+                 approve it to grade the next change"
+                    .to_string(),
+            ],
+        },
+    }
+}
+
+/// A drift in a few words, for a denial: its grade, and its first change.
+fn drift_said(grading: Option<&Grading>) -> String {
+    match grading {
+        Some(grading) => {
+            let first = grading.changes.first().map(ToString::to_string);
+            let more = grading.changes.len().saturating_sub(1);
+            match (first, more) {
+                (Some(first), 0) => format!("graded {}: {first}", grading.severity),
+                (Some(first), more) => {
+                    format!("graded {}: {first}, and {more} more", grading.severity)
+                }
+                (None, _) => format!("graded {}", grading.severity),
+            }
+        }
+        None => "ungraded".to_string(),
+    }
 }
 
 /// Everything a call is judged against, as one version.
@@ -694,8 +753,20 @@ impl Gateway {
     /// (trust-on-first-use records unseen tools; a changed definition is flagged
     /// as drift), and TOFU additions are written back to `path` by
     /// [`persist_pins`](Gateway::persist_pins).
+    /// The worst drift a pin takes without an approval: one graded no worse
+    /// is pinned again and recorded, any other held as a rug-pull. `Info`
+    /// unless this says otherwise; it applies to the pins
+    /// [`with_pins`](Gateway::with_pins) set.
+    pub fn with_pin_accept(self, accept: Severity) -> Self {
+        if let Some(pins) = write(&self.inner.pins).as_mut() {
+            pins.accept = accept;
+        }
+        self
+    }
+
     pub fn with_pins(self, store: PinStore, path: impl Into<PathBuf>) -> Self {
         *write(&self.inner.pins) = Some(Pins {
+            accept: Severity::Info,
             store,
             path: path.into(),
             dirty: false,
@@ -850,7 +921,8 @@ impl Gateway {
             // connection that says so is on the record.
             self.audit_upstream(id, UpstreamEvent::Unverified).await;
         }
-        let drifted = self.pin_check(id, &tools);
+        let verdicts = self.pin_check(id, &tools);
+        self.audit_accepted(id, &verdicts.accepted).await;
         let poisoned = self.inspect_check(scanner, id, &tools, "connect").await;
         let (tls, auth) = (transport.tls(), transport.auth());
         // Before the handle takes the transport, and so before any call can
@@ -878,7 +950,7 @@ impl Gateway {
                 params,
                 offers,
             }),
-            drifted: Arc::new(drifted),
+            drifted: Arc::new(verdicts.held),
             poisoned: Arc::new(poisoned),
             notices,
             changed,
@@ -948,7 +1020,8 @@ impl Gateway {
         let tools = up.tools.iter().filter_map(|t| {
             let name = t.get("name")?.as_str()?;
             let listed_as = listed_tool_name(g.prefix(slot), name);
-            let drifted = slot.drifted.contains(name);
+            let drift = slot.drifted.get(name);
+            let drifted = drift.is_some();
             // In the order `listed` hides them.
             let hidden = if !g.offers(slot, name) {
                 Some("allowlist")
@@ -973,6 +1046,7 @@ impl Gateway {
                     (true, false) => "pinned",
                 },
                 hash: tool_hash(t),
+                drift: drift.map(|grading| drift_record(grading.as_ref())),
                 description: t
                     .get("description")
                     .and_then(|d| d.as_str())
@@ -1062,37 +1136,71 @@ impl Gateway {
             .collect()
     }
 
-    /// Classify each tool against the pin store (no-op if pinning is off):
-    /// trust-on-first-use records an unseen tool; a changed governed definition
-    /// is flagged as drift (a suspected rug-pull), and its name returned so the
-    /// tool is hidden + denied.
-    fn pin_check(&self, server: &str, tools: &[serde_json::Value]) -> HashSet<String> {
+    /// Judge each tool against the pin store (no-op if pinning is off):
+    /// trust-on-first-use records an unseen tool, with its definition; a drift
+    /// graded no worse than `[gateway] pin_accept` is pinned again, and
+    /// returned to be recorded; any other drift, a suspected rug-pull, is held:
+    /// returned with its grade, so the tool is hidden and denied.
+    fn pin_check(&self, server: &str, tools: &[serde_json::Value]) -> PinVerdicts {
         let mut pins = write(&self.inner.pins);
         let Some(pins) = pins.as_mut() else {
-            return HashSet::new();
+            return PinVerdicts::default();
         };
         // Judge the whole list against the store as it was, then record.
-        let mut to_record: Vec<(String, String)> = Vec::new();
-        let mut drift = HashSet::new();
+        let mut to_record: Vec<&serde_json::Value> = Vec::new();
+        let mut verdicts = PinVerdicts::default();
         for t in tools {
-            if let Some(name) = t.get("name").and_then(|n| n.as_str()) {
-                let h = tool_hash(t);
-                match pins.store.check(server, name, &h) {
-                    PinCheck::Match => {}
-                    PinCheck::New => to_record.push((name.to_string(), h)),
-                    PinCheck::Drift => {
-                        drift.insert(name.to_string());
-                    }
+            let Some(name) = t.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            match pins.store.judge(server, t) {
+                Judgement::Match => {}
+                Judgement::New => to_record.push(t),
+                Judgement::Drift(Some(grading)) if grading.severity <= pins.accept => {
+                    to_record.push(t);
+                    verdicts.accepted.push((name.to_string(), grading));
+                }
+                Judgement::Drift(grading) => {
+                    verdicts.held.insert(name.to_string(), grading);
                 }
             }
         }
         if !to_record.is_empty() {
-            for (name, h) in to_record {
-                pins.store.record(server, &name, h);
+            for t in to_record {
+                pins.store.record_tool(server, t);
             }
             pins.dirty = true;
         }
-        drift
+        verdicts
+    }
+
+    /// Record each drift [`pin_check`](Self::pin_check) took under `[gateway]
+    /// pin_accept`: its pin moved with no one asked, so the ledger says how.
+    async fn audit_accepted(&self, server: &str, accepted: &[(String, Grading)]) {
+        for (tool, grading) in accepted {
+            eprintln!(
+                "mcpdef: upstream '{server}': '{tool}' changed since it was pinned, \
+                 {}, within [gateway] pin_accept: pinned again",
+                drift_said(Some(grading))
+            );
+            let entry = Entry {
+                agent: GATEWAY_AGENT.to_string(),
+                server: server.to_string(),
+                method: Some("pin".to_string()),
+                tool: Some(tool.clone()),
+                decision: Decision::Allow,
+                latency_ms: 0,
+                attrs: Attrs {
+                    kind: Kind::Upstream,
+                    rule: Some("drift-accepted".to_string()),
+                    drift: Some(drift_record(Some(grading))),
+                    ..Attrs::default()
+                },
+            };
+            if let Err(e) = self.inner.ledger.append(entry).await {
+                eprintln!("mcpdef: audit append failed: {e}");
+            }
+        }
     }
 
     /// Scan each tool's definition against the injection rule pack (no-op if
@@ -1225,7 +1333,14 @@ impl Gateway {
         // and threaded into `audit` — never stored on `self` — so one request's
         // identity can never bleed into the audit record of another running
         // alongside it.
-        let who = Who::of(caller, || read(&self.inner.agent).clone());
+        let mut who = Who::of(caller, || read(&self.inner.agent).clone());
+        // The trace the request is part of: the one its own `_meta` names, as
+        // the OpenTelemetry conventions for MCP have a server take it, else
+        // the one its transport carried. One that does not read is ignored,
+        // as W3C Trace Context says.
+        if let Some(trace) = wire::traceparent(&msg).and_then(mcpdef_audit::otlp::traceparent) {
+            who.trace = Some(trace);
+        }
         let method = msg.method().unwrap_or_default().to_string();
         // The era the request was sent in shapes the results the gateway writes
         // itself, never how a call is governed. It comes off the message by the
@@ -1388,7 +1503,7 @@ fn listed(g: &Governance) -> Vec<(&Slot, &serde_json::Value, String)> {
                 continue;
             };
             if !g.offers(slot, name)
-                || slot.drifted.contains(name)
+                || slot.drifted.contains_key(name)
                 || slot.poisoned.contains(name)
                 || up.mirroring.refused.contains_key(name)
             {
@@ -1628,11 +1743,12 @@ impl Gateway {
 
         // Rug-pull gate: a tool whose definition drifted from its pin is denied
         // even if the allowlist permits it — the server changed it post-approval.
-        if slot.drifted.contains(&tool) {
+        if let Some(grading) = slot.drifted.get(&tool) {
             let dec = Decision::Deny {
                 rule: "rug-pull".into(),
                 reason: format!(
-                    "tool '{tool}' on '{server_id}' changed since it was pinned (possible rug-pull); re-approve with `mcpdef pin`"
+                    "tool '{tool}' on '{server_id}' changed since it was pinned (possible rug-pull, {}); re-approve with `mcpdef pin`",
+                    drift_said(grading.as_ref())
                 ),
             };
             self.audit_with(
@@ -1643,7 +1759,10 @@ impl Gateway {
                 Some(&tool),
                 &server_id,
                 started,
-                attrs(),
+                Attrs {
+                    drift: Some(drift_record(grading.as_ref())),
+                    ..attrs()
+                },
             )
             .await;
             return Ok(Message::tool_error_result(
@@ -2090,7 +2209,7 @@ impl Gateway {
     }
 
     /// [`audit`](Self::audit), with the record's optional members, such as the
-    /// URI a `resources/read` named.
+    /// URI a `resources/read` named. The record's `seq`, once written.
     #[allow(clippy::too_many_arguments)]
     async fn audit_with(
         &self,
@@ -2102,7 +2221,7 @@ impl Gateway {
         server: &str,
         started: Instant,
         attrs: Attrs,
-    ) {
+    ) -> Option<u64> {
         let latency_ms = started.elapsed().as_millis() as u64;
         // Only the governed `tools/call` hot path counts toward mcpdef_tools_calls_total —
         // the pin/rug-pull `connect`-time inspection, reads, prompt gets, completions and
@@ -2131,6 +2250,18 @@ impl Gateway {
         if attrs.peer.is_none() {
             attrs.peer = who.peer.clone();
         }
+        if let (None, Some((trace, parent))) = (&attrs.trace_id, &who.trace) {
+            attrs.trace_id = Some(trace.clone());
+            attrs.parent_id = Some(parent.clone());
+        }
+        // A tool call is judged against the definition its pin holds: the
+        // record names it, so a call can be tied to the definition it ran on.
+        if let (Some(method::TOOLS_CALL), Some(tool), None) = (method, tool, &attrs.tool_digest) {
+            attrs.tool_digest = read(&self.inner.pins)
+                .as_ref()
+                .and_then(|pins| pins.store.pinned_hash(server, tool))
+                .map(|hash| format!("sha256:{hash}"));
+        }
         let entry = Entry {
             agent: who.agent.clone(),
             server: server.to_string(),
@@ -2140,8 +2271,12 @@ impl Gateway {
             latency_ms,
             attrs,
         };
-        if let Err(e) = self.inner.ledger.append(entry).await {
-            eprintln!("mcpdef: audit append failed: {e}");
+        match self.inner.ledger.append(entry).await {
+            Ok(record) => Some(record.seq),
+            Err(e) => {
+                eprintln!("mcpdef: audit append failed: {e}");
+                None
+            }
         }
     }
 
@@ -2188,7 +2323,9 @@ impl Gateway {
 
     /// Record a reload: applied when `refused` is `None`, or refused under that
     /// rule. `trigger` names what asked for it; `from` and `to` are the digests
-    /// of the configuration in effect before it and of the one it read.
+    /// of the configuration in effect before it and of the one it read, and
+    /// `bundle`, under `--bundle-trust`, the bundle beside the config.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn audit_reload(
         &self,
         trigger: &str,
@@ -2196,6 +2333,7 @@ impl Gateway {
         refused: Option<&str>,
         from: String,
         to: String,
+        bundle: Option<BundleRef>,
         took: Duration,
     ) {
         let decision = match refused {
@@ -2218,6 +2356,7 @@ impl Gateway {
                 peer: peer.map(str::to_string),
                 config_from: Some(from),
                 config_to: Some(to),
+                bundle,
                 ..Attrs::default()
             },
         };
@@ -2607,6 +2746,10 @@ pub struct ToolState {
     /// fields a pin governs: approving its drift names it, so that only the
     /// definition looked at is taken as its pin.
     pub hash: String,
+    /// When it is held for drifting from its pin: the grade of the change,
+    /// and each change, as the ledger records them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub drift: Option<Drift>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 }
@@ -2640,7 +2783,7 @@ impl ToolCost {
 /// A freshly opened upstream: its connection, and what its tools were judged.
 struct Opened {
     upstream: Arc<Upstream>,
-    drifted: Arc<HashSet<String>>,
+    drifted: Arc<Drifted>,
     poisoned: Arc<HashSet<String>>,
     /// Its notifications, from the moment its handle took the transport over.
     /// Once it is in place, [`Gateway::watch_tools`] listens on them.

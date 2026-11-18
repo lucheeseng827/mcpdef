@@ -40,6 +40,8 @@ pub struct Load {
     pub expect: Expect,
     pub concurrency: usize,
     pub budget: Budget,
+    /// A bearer token sent with every call, for a gateway that asks for one.
+    pub bearer: Option<Arc<str>>,
 }
 
 /// Latencies of the calls that came back correct, and a count of those that did not.
@@ -52,11 +54,15 @@ pub struct Samples {
 
 /// The load generator's HTTP client. Never proxied: every target is loopback, and
 /// a proxy configured in the environment would otherwise sit in the timed path.
+/// It trusts no certificate authority: every target is plain HTTP, and reqwest
+/// would otherwise load the host's store, and fail where the host has none, as
+/// an air-gapped one may not.
 pub fn client(timeout: Duration) -> reqwest::Result<Client> {
     // reqwest needs a crypto provider installed before it builds a client.
     let _ = rustls::crypto::ring::default_provider().install_default();
     Client::builder()
         .no_proxy()
+        .tls_certs_only([])
         .timeout(timeout)
         .pool_max_idle_per_host(512)
         .build()
@@ -84,7 +90,15 @@ impl Load {
                     }
                     let tool = &load.tools[i % load.tools.len()];
                     let t0 = Instant::now();
-                    let ok = call(&load.client, &load.url, i as u64 + 1, tool, load.expect).await;
+                    let ok = call(
+                        &load.client,
+                        &load.url,
+                        load.bearer.as_deref(),
+                        i as u64 + 1,
+                        tool,
+                        load.expect,
+                    )
+                    .await;
                     let us = u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
                     if ok {
                         micros.push(us);
@@ -114,15 +128,23 @@ pub async fn keep_busy(client: Client, url: String, tool: String, stop: Arc<Atom
     let mut id = 1_000_000_000u64;
     while !stop.load(Ordering::Relaxed) {
         id += 1;
-        if call(&client, &url, id, &tool, Expect::Success).await {
+        if call(&client, &url, None, id, &tool, Expect::Success).await {
             done += 1;
         }
     }
     done
 }
 
-/// Send one `tools/call` and check the reply.
-pub async fn call(client: &Client, url: &str, id: u64, tool: &str, expect: Expect) -> bool {
+/// Send one `tools/call`, with `bearer` as its token if there is one, and check
+/// the reply.
+pub async fn call(
+    client: &Client,
+    url: &str,
+    bearer: Option<&str>,
+    id: u64,
+    tool: &str,
+    expect: Expect,
+) -> bool {
     let body = json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -130,14 +152,14 @@ pub async fn call(client: &Client, url: &str, id: u64, tool: &str, expect: Expec
         "params": { "name": tool, "arguments": { "text": "mcpdef-bench" } }
     })
     .to_string();
-    let Ok(resp) = client
+    let mut request = client
         .post(url)
         .header(CONTENT_TYPE, "application/json")
-        .header(ACCEPT, "application/json, text/event-stream")
-        .body(body)
-        .send()
-        .await
-    else {
+        .header(ACCEPT, "application/json, text/event-stream");
+    if let Some(token) = bearer {
+        request = request.bearer_auth(token);
+    }
+    let Ok(resp) = request.body(body).send().await else {
         return false;
     };
     if !resp.status().is_success() {
@@ -171,6 +193,7 @@ mod tests {
             expect: Expect::Success,
             concurrency: 4,
             budget: Budget::Requests(40),
+            bearer: None,
         };
         let samples = load.run().await;
         assert_eq!(samples.micros.len(), 40);
@@ -189,6 +212,7 @@ mod tests {
             expect: Expect::ToolError,
             concurrency: 2,
             budget: Budget::Requests(10),
+            bearer: None,
         };
         let samples = load.run().await;
         assert!(samples.micros.is_empty());
@@ -205,6 +229,7 @@ mod tests {
             expect: Expect::Success,
             concurrency: 2,
             budget: Budget::For(Duration::from_millis(200)),
+            bearer: None,
         };
         let samples = load.run().await;
         assert!(!samples.micros.is_empty());

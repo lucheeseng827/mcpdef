@@ -8,6 +8,16 @@ license.workspace = true
 repository.workspace = true
 default-run = "mcpdef"
 
+# `cargo binstall mcpdef` installs the release binary, the static build the release
+# signs, in seconds, where `cargo install` compiles it for minutes. The public
+# mirror's release names each archive by its target and holds the binary at its
+# root. Linux has musl builds only: on a glibc host, cargo-binstall falls back to
+# them. Elsewhere, it compiles, as `cargo install` would.
+[package.metadata.binstall]
+pkg-url = "https://github.com/lucheeseng827/mcpdef/releases/download/v{ version }/{ name }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+
 [lints]
 workspace = true
 
@@ -16,6 +26,8 @@ default = ["console"]
 # The console: its built files, embedded, served at the admin listener's `/`.
 # Without it, `/` is the built-in status page, a few kilobytes of vanilla JS.
 console = ["dep:mcpdef-console"]
+# The demo and test upstream, `mock_mcp_server`.
+mock = []
 
 [dependencies]
 mcpdef-core.workspace = true
@@ -63,8 +75,21 @@ base64.workspace = true
 # `mcpdef doctor` opens the upstreams with a ledger and a pin store it then
 # throws away, in a directory of its own.
 tempfile.workspace = true
+# One `mcpdef bundle apply` at a time, under a lock beside the config.
+fd-lock.workspace = true
+
+# The allocator of a static musl build: see the global allocator in main.rs.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc.workspace = true
+
+[[bin]]
+name = "mock_mcp_server"
+path = "src/bin/mock_mcp_server.rs"
+required-features = ["mock"]
 
 [dev-dependencies]
+# This crate, with the mock built for its integration tests.
+mcpdef = { path = ".", default-features = false, features = ["mock"] }
 # An identity provider whose clock is off, for `mcpdef doctor`: the `Date` it
 # answers with.
 httpdate.workspace = true

@@ -152,14 +152,47 @@ impl Setup {
         }
     }
 
+    /// The `x-mcp-header` a client is shown on `tool`'s `property` in
+    /// `tools/list`, if it is listed with one.
+    async fn annotation(&self, tool: &str, property: &str) -> Option<String> {
+        let result = self.send(method::TOOLS_LIST, None).await.result?;
+        let listed = result["tools"]
+            .as_array()?
+            .iter()
+            .find(|t| t["name"] == tool)?;
+        listed["inputSchema"]["properties"][property]["x-mcp-header"]
+            .as_str()
+            .map(str::to_string)
+    }
+
+    /// Wait until `tools/list` shows `tool`'s `property` annotated `header`.
+    async fn annotation_becomes(&self, tool: &str, property: &str, header: &str) {
+        let until = Instant::now() + PATIENCE;
+        loop {
+            let shown = self.annotation(tool, property).await;
+            if shown.as_deref() == Some(header) {
+                return;
+            }
+            assert!(
+                Instant::now() < until,
+                "'{tool}' still lists '{property}' annotated {shown:?}, not {header:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Call `tool` with `arguments`, over stdio, as a modern client would:
     /// the gateway stamps what it sends upstream either way.
     async fn call(&self, tool: &str, arguments: Value) -> Value {
         let params = json!({ "name": tool, "arguments": arguments });
-        self.send(method::TOOLS_CALL, Some(params))
-            .await
-            .result
-            .expect("a result")
+        let reply = self.send(method::TOOLS_CALL, Some(params)).await;
+        match reply.result {
+            Some(result) => result,
+            None => panic!(
+                "a result for '{tool}', not the error {}",
+                reply.error.unwrap_or_default()
+            ),
+        }
     }
 
     /// The `tools/call` records in the ledger.
@@ -471,39 +504,35 @@ set_args = [{ path = "region", set = "eu-west1" }]
 }
 
 /// After the upstream re-annotates `region` and says its tools changed, the
-/// next call goes out by the new annotation, and not by the old one. A copy
-/// taken at the opening would send `Mcp-Param-Region`, which the upstream now
-/// refuses.
+/// first call once MCPdef lists the new annotation goes out by it, and not by
+/// the old one. A copy taken at the opening would send `Mcp-Param-Region`,
+/// which the upstream now refuses.
+///
+/// The wait is on MCPdef's own listing, not on the upstream having been asked
+/// for its tools: between the upstream answering and MCPdef applying the
+/// answer, a call still goes by the old annotation and is refused, rightly.
+/// The transport is told of the new annotation before the listing changes, so
+/// from the moment the listing shows it there is no such window, and one call
+/// is all this takes: no retrying past refusals that would hide a gateway
+/// that listed one annotation and sent another.
 #[tokio::test]
 async fn a_call_after_a_re_list_is_sent_by_the_annotation_it_brought() {
     let (url, spanner) = Spanner::start("Region").await;
     let s = Setup::http(&url, "").await;
     let r = s.call("execute_sql", json!({ "region": "us-west1" })).await;
     assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(
+        s.annotation("execute_sql", "region").await.as_deref(),
+        Some("Region")
+    );
 
     spanner.annotate("Zone");
-    let lists = spanner.lists.load(SeqCst);
     assert_eq!(text(&s.call("poke", json!({})).await), "poked");
-    let until = Instant::now() + PATIENCE;
-    while spanner.lists.load(SeqCst) == lists {
-        assert!(Instant::now() < until, "the tools were never listed again");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    s.annotation_becomes("execute_sql", "region", "Zone").await;
 
-    // The re-list is in force once a call goes out by it.
-    let until = Instant::now() + PATIENCE;
-    loop {
-        let r = s.call("execute_sql", json!({ "region": "us-west1" })).await;
-        if r["isError"] == false {
-            assert_eq!(text(&r), "us-west1");
-            break;
-        }
-        assert!(
-            Instant::now() < until,
-            "never sent by the new annotation: {r}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    let r = s.call("execute_sql", json!({ "region": "us-west1" })).await;
+    assert_eq!(r["isError"], false, "{r}");
+    assert_eq!(text(&r), "us-west1");
     assert_eq!(
         spanner.last_received(),
         [("mcp-param-zone".to_string(), "us-west1".to_string())]

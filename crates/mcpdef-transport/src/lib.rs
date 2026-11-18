@@ -34,8 +34,8 @@ pub use self::cert::{
 };
 pub use self::egress::{check_connect_to, check_socket_ip, EgressPolicy};
 pub use self::http::{
-    fetch_dated, fetch_text, get_bearer, post_form, Dated, HttpClient, HttpKind, ParamHeaders,
-    Replied, RequestAuth,
+    fetch_dated, fetch_text, get_bearer, post_form, post_json, Dated, HttpClient, HttpKind,
+    ParamHeaders, Posted, Replied, RequestAuth,
 };
 pub use self::mux::{CallError, DownWatch, HandleOptions, UpstreamHandle, DEFAULT_MAX_INFLIGHT};
 pub use self::oauth::{ClientAuth, ClientCredentials, TokenAuth};

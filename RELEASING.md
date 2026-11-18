@@ -60,6 +60,7 @@ publish `0.4.0-alpha.1`. So is a tag with build metadata, such as `v0.4.0+b1`: c
 | Channel | Source of truth |
 |---|---|
 | `cargo install mcpdef` | crates.io (engine crates published by the release workflow on each real tag) |
+| `cargo binstall mcpdef` | the release tarballs below, which `crates/mcpdef/Cargo.toml`'s `[package.metadata.binstall]` names (from 0.5.0; on glibc Linux, the musl build) |
 | `brew install mcpdef` | `Formula/mcpdef.rb` (this repo is its own tap) |
 | `docker run … mancube/mcpdef` | `Dockerfile.release` (distroless, from the prebuilt static binary) |
 | release tarballs | the GitHub release (`mcpdef-<target>.tar.gz` + `.sha256` + `.sig` + `.pem`) |

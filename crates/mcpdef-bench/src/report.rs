@@ -62,12 +62,38 @@ pub struct Params {
 pub struct Scenarios {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed: Vec<Allowed>,
+    /// The allowed call again, through a gateway that checks a bearer token on
+    /// every call. Absent from reports made before it was measured.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_bearer: Vec<Allowed>,
+    /// The bearer call again, through a gateway that `fsync`s each audit record
+    /// before the reply. Absent from reports made before it was measured.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_bearer_fsync: Vec<Allowed>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub denied: Vec<Denied>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub slow_neighbour: Vec<SlowNeighbour>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_rss: Option<IdleRss>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wasm_instantiate: Option<WasmInstantiate>,
+}
+
+/// How long a fresh instance of a compiled WASM component takes to make, timed
+/// in-process through the sandbox's own API.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WasmInstantiate {
+    /// The component's file name, and its size.
+    pub component: String,
+    pub component_bytes: u64,
+    /// Compiling it, once.
+    pub compile_us: u64,
+    /// The first instance made after compiling it.
+    pub first_us: u64,
+    /// Every instance after the warm-up: each with a store, a memory and a WASI
+    /// context of its own.
+    pub instantiate: Summary,
 }
 
 /// An allowlisted call, straight to the upstream and through the gateway, at one
@@ -101,11 +127,31 @@ impl Allowed {
 /// A call the allowlist refuses. No upstream is involved, so its cost is the
 /// gateway's alone; `ratio_p50_vs_direct` sets it against a direct upstream call
 /// at the same client count, to be comparable across machines.
+///
+/// `added_*` is how much longer it takes than that direct call: the floor of a
+/// round trip on this machine, a request and an answer over loopback, which a
+/// refusal costs too. Absent from reports made before it was recorded.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Denied {
     pub concurrency: usize,
     pub gateway: Summary,
     pub ratio_p50_vs_direct: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_p50_us: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_p99_us: Option<i64>,
+}
+
+impl Denied {
+    pub fn new(concurrency: usize, direct: &Summary, gateway: Summary) -> Self {
+        Denied {
+            concurrency,
+            ratio_p50_vs_direct: ratio(gateway.p50_us, direct.p50_us),
+            added_p50_us: Some(signed_diff(gateway.p50_us, direct.p50_us)),
+            added_p99_us: Some(signed_diff(gateway.p99_us, direct.p99_us)),
+            gateway,
+        }
+    }
 }
 
 /// Calls to fast upstreams with no slow call in flight (`alone`), and while one
@@ -203,43 +249,44 @@ impl Report {
         let sc = &self.scenarios;
 
         if !sc.allowed.is_empty() {
-            let _ = writeln!(
-                s,
-                "\n### allowed — what the gateway adds to an allowlisted call\n\n\
-                 | clients | direct p50 | direct p99 | via gateway p50 | via gateway p99 | added p50 | added p99 | gateway calls/s | errors |\n\
-                 |---|---|---|---|---|---|---|---|---|"
+            allowed_table(
+                &mut s,
+                "allowed — what the gateway adds to an allowlisted call",
+                &sc.allowed,
             );
-            for a in &sc.allowed {
-                let _ = writeln!(
-                    s,
-                    "| {} | {} | {} | {} | {} | {} | {} | {:.0} | {} |",
-                    a.concurrency,
-                    fmt_us(a.direct.p50_us),
-                    fmt_us(a.direct.p99_us),
-                    fmt_us(a.gateway.p50_us),
-                    fmt_us(a.gateway.p99_us),
-                    fmt_signed_us(a.added_p50_us),
-                    fmt_signed_us(a.added_p99_us),
-                    a.gateway.rps,
-                    a.direct.errors + a.gateway.errors,
-                );
-            }
+        }
+        if !sc.allowed_bearer.is_empty() {
+            allowed_table(
+                &mut s,
+                "allowed-bearer — the same, with an RS256 bearer token checked on every call",
+                &sc.allowed_bearer,
+            );
+        }
+        if !sc.allowed_bearer_fsync.is_empty() {
+            allowed_table(
+                &mut s,
+                "allowed-bearer-fsync — the same, with each audit record fsynced before the reply",
+                &sc.allowed_bearer_fsync,
+            );
         }
 
         if !sc.denied.is_empty() {
             let _ = writeln!(
                 s,
                 "\n### denied — a call the allowlist refuses (no upstream involved)\n\n\
-                 | clients | p50 | p99 | calls/s | p50 vs a direct call | errors |\n\
-                 |---|---|---|---|---|---|"
+                 | clients | p50 | p99 | over a direct call, p50 | over a direct call, p99 | calls/s | p50 vs a direct call | errors |\n\
+                 |---|---|---|---|---|---|---|---|"
             );
+            let added = |us: Option<i64>| us.map(fmt_signed_us).unwrap_or_else(|| "—".into());
             for d in &sc.denied {
                 let _ = writeln!(
                     s,
-                    "| {} | {} | {} | {:.0} | {:.2}× | {} |",
+                    "| {} | {} | {} | {} | {} | {:.0} | {:.2}× | {} |",
                     d.concurrency,
                     fmt_us(d.gateway.p50_us),
                     fmt_us(d.gateway.p99_us),
+                    added(d.added_p50_us),
+                    added(d.added_p99_us),
                     d.gateway.rps,
                     d.ratio_p50_vs_direct,
                     d.gateway.errors,
@@ -308,7 +355,53 @@ impl Report {
                 kb(r.after_load_hwm_kb.or(r.idle_hwm_kb)),
             );
         }
+
+        if let Some(w) = &sc.wasm_instantiate {
+            let i = &w.instantiate;
+            let _ = writeln!(
+                s,
+                "\n### wasm-instantiate — a fresh instance of a compiled component ({}, {:.0} KiB)\n\n\
+                 | compiling it, once | the first instance | instances after: p50 | p90 | p99 | max | errors |\n\
+                 |---|---|---|---|---|---|---|\n\
+                 | {} | {} | {} | {} | {} | {} | {} |",
+                w.component,
+                w.component_bytes as f64 / 1024.0,
+                fmt_us(w.compile_us),
+                fmt_us(w.first_us),
+                fmt_us(i.p50_us),
+                fmt_us(i.p90_us),
+                fmt_us(i.p99_us),
+                fmt_us(i.max_us),
+                i.errors,
+            );
+        }
         s
+    }
+}
+
+/// One allowed scenario's table: each client count, direct and through the
+/// gateway.
+fn allowed_table(s: &mut String, title: &str, rows: &[Allowed]) {
+    let _ = writeln!(
+        s,
+        "\n### {title}\n\n\
+         | clients | direct p50 | direct p99 | via gateway p50 | via gateway p99 | added p50 | added p99 | gateway calls/s | errors |\n\
+         |---|---|---|---|---|---|---|---|---|"
+    );
+    for a in rows {
+        let _ = writeln!(
+            s,
+            "| {} | {} | {} | {} | {} | {} | {} | {:.0} | {} |",
+            a.concurrency,
+            fmt_us(a.direct.p50_us),
+            fmt_us(a.direct.p99_us),
+            fmt_us(a.gateway.p50_us),
+            fmt_us(a.gateway.p99_us),
+            fmt_signed_us(a.added_p50_us),
+            fmt_signed_us(a.added_p99_us),
+            a.gateway.rps,
+            a.direct.errors + a.gateway.errors,
+        );
     }
 }
 
@@ -360,6 +453,65 @@ mod tests {
         assert_eq!((a.added_p50_us, a.added_p99_us), (50, 300));
         assert!((a.ratio_p50 - 1.5).abs() < 1e-9);
         assert!((a.ratio_p99 - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn denied_says_how_much_longer_a_refusal_takes_than_a_direct_call() {
+        let direct = Summary {
+            p50_us: 80,
+            p99_us: 200,
+            ..Summary::default()
+        };
+        let refused = Summary {
+            p50_us: 90,
+            p99_us: 250,
+            ..Summary::default()
+        };
+        let d = Denied::new(1, &direct, refused);
+        assert_eq!((d.added_p50_us, d.added_p99_us), (Some(10), Some(50)));
+        let mut r: Report =
+            serde_json::from_str(include_str!("../baselines/serialized.json")).unwrap();
+        let old = r.render();
+        r.scenarios = Scenarios {
+            denied: vec![d],
+            ..Scenarios::default()
+        };
+        let md = r.render();
+        assert!(
+            md.contains("| 1 | 90 µs | 250 µs | +10 µs | +50 µs |"),
+            "{md}"
+        );
+        // A report made before the difference was recorded still renders.
+        assert!(old.contains(" | — | — | "), "{old}");
+    }
+
+    #[test]
+    fn allowed_bearer_has_its_own_table() {
+        let mut r: Report =
+            serde_json::from_str(include_str!("../baselines/serialized.json")).unwrap();
+        let summary = |p50_us, p99_us| Summary {
+            p50_us,
+            p99_us,
+            ..Summary::default()
+        };
+        r.scenarios = Scenarios {
+            allowed_bearer: vec![Allowed::new(1, summary(80, 200), summary(280, 900))],
+            ..Scenarios::default()
+        };
+        let md = r.render();
+        assert!(md.contains("### allowed-bearer — "), "{md}");
+        assert!(md.contains("| +200 µs | +700 µs |"), "{md}");
+        assert!(!md.contains("### allowed — "), "{md}");
+        assert!(!md.contains("### allowed-bearer-fsync — "), "{md}");
+
+        r.scenarios = Scenarios {
+            allowed_bearer_fsync: vec![Allowed::new(1, summary(80, 200), summary(1_080, 2_200))],
+            ..Scenarios::default()
+        };
+        let md = r.render();
+        assert!(md.contains("### allowed-bearer-fsync — "), "{md}");
+        assert!(md.contains("| +1.00 ms | +2.00 ms |"), "{md}");
+        assert!(!md.contains("### allowed-bearer — "), "{md}");
     }
 
     #[test]

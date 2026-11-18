@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `LedgerHandle`: many tasks appending to one ledger.
 
-use mcpdef_audit::{read_all, verify, Attrs, Entry, Ledger, LedgerHandle, Record, GENESIS};
+use mcpdef_audit::{
+    read_all, verify, Attrs, Durability, Entry, Ledger, LedgerHandle, Record, GENESIS,
+};
 use mcpdef_core::Decision;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -167,4 +169,149 @@ fn the_chain_resumes_after_the_last_handle_is_gone() {
         .unwrap();
     assert_eq!((rec.seq, rec.prev_hash), (3, prev));
     assert!(verify(&path).unwrap().ok());
+}
+
+/// Writers that each open the file themselves, as hooks in processes of their
+/// own do, take turns on its lock: with a gateway's long-lived writer
+/// appending beside them, the file is still one chain.
+#[test]
+fn writers_with_files_of_their_own_make_one_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.log");
+    let mut gateway = Ledger::open(&path).unwrap();
+    let hooks: Vec<_> = (0..8)
+        .map(|h| {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                (0..40)
+                    .map(|n| {
+                        let mut hook = Ledger::attach(&path, Durability::Os).unwrap();
+                        hook.append(entry(&format!("hook:{h}"), n)).unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect();
+    let mut returned: Vec<Record> = (0..80)
+        .map(|n| gateway.append(entry("gateway", n)).unwrap())
+        .collect();
+    for hook in hooks {
+        returned.extend(hook.join().unwrap());
+    }
+    assert_one_chain(&path, &returned, 8 * 40 + 80);
+    // The long-lived writer knows where the chain is, too.
+    let last = gateway.append(entry("gateway", 80)).unwrap();
+    assert_eq!(last.seq, 8 * 40 + 80);
+    assert_one_chain(&path, &[last], 8 * 40 + 81);
+}
+
+/// A writer that attaches reads nothing until it writes, and then goes on
+/// from the last record, however long the ledger is.
+#[test]
+fn an_attached_writer_goes_on_from_the_last_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.log");
+    let mut first = Ledger::open(&path).unwrap();
+    let written: Vec<Record> = (0..5)
+        .map(|n| first.append(entry("a", n)).unwrap())
+        .collect();
+    let mut hook = Ledger::attach(&path, Durability::Os).unwrap();
+    assert_eq!(
+        (hook.head(), hook.next_seq()),
+        (GENESIS, 0),
+        "nothing read yet"
+    );
+    let rec = hook.append(entry("hook", 5)).unwrap();
+    assert_eq!(rec.seq, 5);
+    assert_eq!(rec.prev_hash, written[4].hash);
+    // An empty ledger, attached to, starts the chain.
+    let empty = dir.path().join("empty.log");
+    let first = Ledger::attach(&empty, Durability::Os)
+        .unwrap()
+        .append(entry("hook", 0))
+        .unwrap();
+    assert_eq!((first.seq, first.prev_hash.as_str()), (0, GENESIS));
+}
+
+/// A last line with no newline, from a writer that stopped part way, is never
+/// joined to the next record: that one is a line of its own.
+#[test]
+fn a_record_never_joins_a_line_that_has_no_newline() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.log");
+    let mut first = Ledger::open(&path).unwrap();
+    first.append(entry("a", 0)).unwrap();
+    let mut text = std::fs::read(&path).unwrap();
+    text.pop();
+    std::fs::write(&path, &text).unwrap();
+    // Read whole, as a reopened gateway does, and attached, as a hook does.
+    let mut reopened = Ledger::open(&path).unwrap();
+    let rec = reopened.append(entry("a", 1)).unwrap();
+    assert_eq!(rec.seq, 1);
+    let hook = Ledger::attach(&path, Durability::Os)
+        .unwrap()
+        .append(entry("hook", 2))
+        .unwrap();
+    assert_eq!(hook.seq, 2);
+    assert_one_chain(&path, &[rec, hook], 3);
+}
+
+/// A ledger cut short under a running writer stays cut: the writer goes on
+/// from its own head, so a check finds the break.
+#[test]
+fn a_ledger_cut_short_under_a_writer_stays_broken() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.log");
+    let mut gateway = Ledger::open(&path).unwrap();
+    for n in 0..3 {
+        gateway.append(entry("a", n)).unwrap();
+    }
+    let text = std::fs::read_to_string(&path).unwrap();
+    let first_line = text.lines().next().unwrap().to_string() + "\n";
+    std::fs::write(&path, first_line).unwrap();
+    let rec = gateway.append(entry("a", 3)).unwrap();
+    assert_eq!(rec.seq, 3, "the chain this writer holds");
+    // Its `seq`: the record that does not follow the one before it.
+    let report = verify(&path).unwrap();
+    assert_eq!(report.broken_at, Some(3));
+}
+
+/// A ledger opened while another writer is halfway through a line waits for
+/// the line, rather than taking it for a corrupt one: a gateway starting
+/// beside hooks that are writing.
+#[test]
+fn a_ledger_opened_mid_line_waits_for_the_line() {
+    use std::io::Write as _;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit.log");
+    let mut first = Ledger::open(&path).unwrap();
+    for n in 0..3 {
+        first.append(entry("a", n)).unwrap();
+    }
+    drop(first);
+    // The third line, written again under a writer's lock, in two halves.
+    let text = std::fs::read_to_string(&path).unwrap();
+    let third = text.lines().nth(2).unwrap().to_string() + "\n";
+    std::fs::write(&path, &text[..text.len() - third.len()]).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    let mut lock = fd_lock::RwLock::new(file);
+    let mut writing = lock.write().unwrap();
+    let (half, rest) = third.split_at(third.len() / 2);
+    writing.write_all(half.as_bytes()).unwrap();
+
+    let opening = std::thread::spawn({
+        let path = path.clone();
+        move || Ledger::open(&path)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(!opening.is_finished(), "it waits for the writer");
+    writing.write_all(rest.as_bytes()).unwrap();
+    drop(writing);
+
+    let opened = opening.join().unwrap().unwrap();
+    assert_eq!(opened.next_seq(), 3);
+    assert_eq!(opened.head(), read_all(&path).unwrap()[2].hash);
 }

@@ -63,6 +63,7 @@ fn plan(policy: Policy, upstreams: Vec<Planned>) -> Reconfig {
         rate_limit: None,
         inspect: None,
         pins: None,
+        pin_accept: mcpdef_pin::Severity::Info,
         tool_prefixes: None,
         upstreams,
     }

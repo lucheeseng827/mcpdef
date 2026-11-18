@@ -463,6 +463,67 @@ impl Config {
     }
 }
 
+/// `[gateway.otel]` — where the ledger's governed requests go as
+/// OpenTelemetry spans: an OTLP/HTTP endpoint, such as evald's.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct OtelConfig {
+    /// The OTLP/HTTP endpoint, as `OTEL_EXPORTER_OTLP_ENDPOINT` names one:
+    /// the spans go to its `/v1/traces`. A URL whose path already ends in
+    /// `/v1/traces` is used as it is.
+    pub endpoint: String,
+    /// The bearer token the endpoint takes, when it takes one.
+    #[serde(default)]
+    pub token: Option<SecretRef>,
+    /// The `service.name` of the spans' resource.
+    #[serde(default = "default_service_name")]
+    pub service_name: String,
+}
+
+fn default_service_name() -> String {
+    mcpdef_audit::otlp::SERVICE.to_string()
+}
+
+impl OtelConfig {
+    /// Where the spans are posted: the endpoint's `/v1/traces`, in its path,
+    /// before any query it has.
+    pub fn traces_url(&self) -> String {
+        let endpoint = self.endpoint.trim();
+        let Ok(mut url) = url::Url::parse(endpoint) else {
+            return format!("{}/v1/traces", endpoint.trim_end_matches('/'));
+        };
+        let path = url.path().trim_end_matches('/').to_string();
+        if !path.ends_with("/v1/traces") {
+            url.set_path(&format!("{path}/v1/traces"));
+        }
+        url.to_string()
+    }
+
+    /// What is wrong with it, if anything.
+    fn problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        match url::Url::parse(self.endpoint.trim()) {
+            Ok(url) if matches!(url.scheme(), "http" | "https") && url.host().is_some() => {
+                if !url.username().is_empty() || url.password().is_some() {
+                    problems.push(
+                        "[gateway.otel] endpoint holds credentials: give them as `token` \
+                         instead"
+                            .to_string(),
+                    );
+                }
+            }
+            _ => problems.push(format!(
+                "[gateway.otel] endpoint = {:?} is not an http:// or https:// URL",
+                self.endpoint
+            )),
+        }
+        if self.service_name.trim().is_empty() {
+            problems.push("[gateway.otel] service_name is empty".to_string());
+        }
+        problems
+    }
+}
+
 /// `[[role]]` — an RBAC role: a set of `"server:tool"` glob grants. A caller
 /// holds the role when its `name` appears among the token's scopes or `roles`.
 #[derive(Debug, Deserialize, Clone, PartialEq)]
@@ -488,6 +549,16 @@ pub struct GatewayConfig {
     pub listen: String,
     #[serde(default = "default_audit")]
     pub audit: String,
+    /// `fsync` each audit record before the reply to its call, so that a reply
+    /// means the record is on disk. Off, the operating system writes it to disk
+    /// in its own time: a crash of the machine can lose the last records.
+    #[serde(default)]
+    pub audit_fsync: bool,
+    /// Each governed request in the ledger, sent as an OpenTelemetry span to
+    /// an OTLP/HTTP endpoint such as evald's (`[gateway.otel]`). Unset, none
+    /// is sent.
+    #[serde(default)]
+    pub otel: Option<OtelConfig>,
     /// Reserved for the Phase-3 policy directory; unused in Phase 1.
     #[serde(default)]
     pub policy: Option<String>,
@@ -496,6 +567,11 @@ pub struct GatewayConfig {
     /// later definition drifts. Unset = pinning off.
     #[serde(default)]
     pub pins: Option<String>,
+    /// The worst drift a pin takes without an approval (`[gateway]
+    /// pin_accept`): one graded no worse is re-pinned and recorded, any other
+    /// held as a rug-pull until approved.
+    #[serde(default)]
+    pub pin_accept: PinAccept,
     /// The active named profile (`[profile.<name>]`) layered over every server,
     /// scoping the whole tool surface an agent sees. `None` = no extra filter.
     /// Overridable at launch with `mcpdef run --profile <name>`.
@@ -534,6 +610,10 @@ pub struct GatewayConfig {
     /// OSS read-only admin / observability server (`[gateway.admin]`).
     #[serde(default)]
     pub admin: AdminConfig,
+    /// Filter mode (`[gateway.filter]`): where `mcpdef filter` answers the
+    /// checks of a proxy that routes MCP requests itself.
+    #[serde(default)]
+    pub filter: FilterConfig,
     /// Which MCP wire models the downstream listener serves: `legacy`
     /// (2025-11-25, the default), `modern` (the stateless 2026-07-28), or
     /// `dual`. Defaulting to `legacy` means upgrading MCPdef never changes what
@@ -988,6 +1068,30 @@ fn hostname_problem(name: &str) -> Option<String> {
     }
 }
 
+/// `[gateway] pin_accept`: the worst grade of drift a pin takes in its stride.
+/// There is no `breaking`: a gateway that takes those is not pinning.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PinAccept {
+    /// A change that means nothing: an array whose order means nothing
+    /// reordered, whitespace in a text.
+    #[default]
+    Info,
+    /// That, and a definition that takes less than it did: a call that worked
+    /// may fail now, but the tool can do no more than it could.
+    Risky,
+}
+
+impl PinAccept {
+    /// As the grading names it.
+    pub fn severity(self) -> mcpdef_pin::Severity {
+        match self {
+            PinAccept::Info => mcpdef_pin::Severity::Info,
+            PinAccept::Risky => mcpdef_pin::Severity::Risky,
+        }
+    }
+}
+
 /// `[gateway] tool_namespace`: how `tools/list` names each tool.
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -1162,6 +1266,79 @@ impl AdminConfig {
 /// The roles the console knows, which a role map may give besides the
 /// `[[role]]`s the MCP listener judges.
 pub const CONSOLE_ROLES: [&str; 3] = ["console:viewer", "console:operator", "console:admin"];
+
+/// `[gateway.filter]`: filter mode, `mcpdef filter`. A proxy in front of the
+/// servers routes each MCP request itself, and asks MCPdef first whether it
+/// may pass, as Envoy's `ext_authz` filter asks an HTTP authorization service.
+/// Each `[[server]]`'s `filter_path` says which requests are its.
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FilterConfig {
+    /// Where the proxy sends its checks: an address only the proxy reaches,
+    /// such as loopback beside it.
+    #[serde(default = "default_filter_listen")]
+    pub listen: String,
+    /// What the proxy puts before a request's path in the check it sends,
+    /// Envoy's `http_service.path_prefix`: taken off before the path is
+    /// routed. A check whose path does not start with it is refused.
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+}
+
+impl Default for FilterConfig {
+    fn default() -> Self {
+        FilterConfig {
+            listen: default_filter_listen(),
+            path_prefix: None,
+        }
+    }
+}
+
+fn default_filter_listen() -> String {
+    "127.0.0.1:7880".to_string()
+}
+
+/// What is wrong with `path` as a `filter_path` or a `path_prefix`, if
+/// anything: it must be an absolute path, with nothing in it that a proxy and
+/// MCPdef could read two ways.
+pub fn filter_path_problem(path: &str) -> Option<&'static str> {
+    if !path.starts_with('/') {
+        return Some("must start with `/`");
+    }
+    if path.contains(['?', '#']) {
+        return Some("must be a path alone, with no query or fragment");
+    }
+    if path_is_ambiguous(path) {
+        return Some(
+            "holds what a proxy may read otherwise: a `.` or `..` segment, a `//`, a `\\`, \
+             or an escaped `/`, `\\` or `.`",
+        );
+    }
+    None
+}
+
+/// `path` without a trailing `/`, but `/` itself: how two filter paths are
+/// compared, and how one is matched.
+pub fn normal_filter_path(path: &str) -> String {
+    match path.trim_end_matches('/') {
+        "" => "/".to_string(),
+        trimmed => trimmed.to_string(),
+    }
+}
+
+/// Whether `path` could be routed two ways: by a proxy that resolves `.` and
+/// `..` segments, merges `//`, decodes an escaped separator or takes `\` for
+/// `/`, and by one that does not. Filter mode judges a request by the server
+/// its path names, so it refuses a path that might name another to the proxy.
+pub fn path_is_ambiguous(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    path.contains('\\')
+        || path.contains("//")
+        || ["%2f", "%5c", "%2e"].iter().any(|e| lower.contains(e))
+        || path
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
+}
 
 fn default_admin_listen() -> String {
     "127.0.0.1:7879".to_string()
@@ -2143,8 +2320,11 @@ fn cleartext_host(url: &str) -> Option<String> {
     (!this_machine).then(|| url.host_str().unwrap_or_default().to_string())
 }
 
+/// Where the MCP listener listens when `[gateway] listen` is not set.
+pub const DEFAULT_LISTEN: &str = "127.0.0.1:7878";
+
 fn default_listen() -> String {
-    "127.0.0.1:7878".to_string()
+    DEFAULT_LISTEN.to_string()
 }
 fn default_audit() -> String {
     "./mcpdef-audit/audit.log".to_string()
@@ -2215,6 +2395,13 @@ pub struct ServerConfig {
     /// names start with, before `__`. Unset means the server's id.
     #[serde(default)]
     pub prefix: Option<String>,
+    /// Filter mode (`mcpdef filter`): the path, at the proxy in front, under
+    /// which the proxy routes requests to this server, such as `/github`. A
+    /// request the proxy asks about is this server's when its path is this one
+    /// or below it, the longest that fits winning; `/` takes any path. Unset,
+    /// filter mode routes nothing here.
+    #[serde(default)]
+    pub filter_path: Option<String>,
     /// `wasm` transport: path to the `.wasm` module to run in the in-path sandbox
     /// (Phase 4). Required when `transport = "wasm"`.
     #[serde(default)]
@@ -2258,9 +2445,9 @@ pub const HTTP_TRIP_AFTER: u32 = 5;
 
 impl ServerConfig {
     /// This entry with only what says how to reach the upstream: everything
-    /// but its allowlist, denies, profile, resources, prompts and tool prefix.
-    /// Two entries whose connections are equal reach the same upstream the
-    /// same way.
+    /// but its allowlist, denies, profile, resources, prompts, tool prefix and
+    /// filter path. Two entries whose connections are equal reach the same
+    /// upstream the same way.
     pub fn connection(&self) -> ServerConfig {
         ServerConfig {
             tools: None,
@@ -2270,6 +2457,7 @@ impl ServerConfig {
             resource_templates: None,
             prompts: None,
             prefix: None,
+            filter_path: None,
             ..self.clone()
         }
     }
@@ -2518,6 +2706,14 @@ impl Config {
                     s.id
                 ))
             });
+        let cleartext_otel = self.gateway.otel.iter().filter_map(|otel| {
+            otel.token.as_ref()?;
+            let host = cleartext_host(otel.endpoint.trim())?;
+            Some(format!(
+                "[gateway.otel] sends its token over plain HTTP to {host}, where anyone on the \
+                 path can read it: use https://"
+            ))
+        });
         let cleartext_secret = self.servers.iter().filter_map(|s| {
             let host = cleartext_host(s.auth.as_ref()?.token_url.as_deref()?)?;
             Some(format!(
@@ -2546,6 +2742,13 @@ impl Config {
                 s.id
             ))
         });
+        let otel_in_url = self.gateway.otel.iter().filter_map(|otel| {
+            let what = url_secret(otel.endpoint.trim())?;
+            Some(format!(
+                "[gateway.otel] endpoint holds {what}, so every copy of the config holds it \
+                 too: send it as `token` instead, if the endpoint takes a bearer token"
+            ))
+        });
         let in_command = self.servers.iter().flat_map(|s| {
             s.command.iter().enumerate().filter_map(move |(i, arg)| {
                 let shape = mcpdef_inspect::secret_pattern(arg)?;
@@ -2562,10 +2765,12 @@ impl Config {
             .chain(self.exposed_in_the_clear())
             .chain(self.trusts_every_address())
             .chain(cleartext)
+            .chain(cleartext_otel)
             .chain(cleartext_secret)
             .chain(readable)
             .chain(literal)
             .chain(in_url)
+            .chain(otel_in_url)
             .chain(in_command)
             .chain(self.resource_overlaps())
             .chain(self.prompt_overlaps())
@@ -3097,12 +3302,22 @@ impl Config {
         gateway.chain(admin).chain(session).chain(oidc)
     }
 
-    /// Every `[server.auth]` secret this config names, with where it names it.
+    /// Every `[server.auth]` secret this config names, with where it names
+    /// it, and `[gateway.otel]`'s token: the credentials the gateway sends.
     fn auth_secrets(&self) -> impl Iterator<Item = (String, &SecretRef)> + '_ {
-        self.servers.iter().filter_map(|s| {
-            let (field, secret) = s.auth.as_ref()?.secret()?;
-            Some((format!("server '{}': [server.auth] {field}", s.id), secret))
-        })
+        let otel = self
+            .gateway
+            .otel
+            .iter()
+            .filter_map(|otel| otel.token.as_ref())
+            .map(|token| ("[gateway.otel] token".to_string(), token));
+        self.servers
+            .iter()
+            .filter_map(|s| {
+                let (field, secret) = s.auth.as_ref()?.secret()?;
+                Some((format!("server '{}': [server.auth] {field}", s.id), secret))
+            })
+            .chain(otel)
     }
 
     /// Every client key this config names, with where it names it.
@@ -3165,11 +3380,24 @@ impl Config {
             );
         }
         let mut seen = HashSet::new();
+        let mut filter_paths = HashSet::new();
         for s in &self.servers {
             if s.id.trim().is_empty() {
                 errs.push("a [[server]] has an empty `id`".to_string());
             } else if !seen.insert(s.id.clone()) {
                 errs.push(format!("duplicate server id '{}'", s.id));
+            }
+            if let Some(path) = &s.filter_path {
+                match filter_path_problem(path) {
+                    Some(problem) => {
+                        errs.push(format!("server '{}': filter_path '{path}' {problem}", s.id))
+                    }
+                    None if !filter_paths.insert(normal_filter_path(path)) => errs.push(format!(
+                        "server '{}': filter_path '{path}' is another server's too",
+                        s.id
+                    )),
+                    None => {}
+                }
             }
             if !SUPPORTED_TRANSPORTS.contains(&s.transport.as_str()) {
                 errs.push(format!(
@@ -3277,6 +3505,9 @@ impl Config {
             errs.extend(tls.problems("[gateway.admin.tls]", false));
         }
         errs.extend(self.gateway.admin_problems());
+        if let Some(otel) = &self.gateway.otel {
+            errs.extend(otel.problems());
+        }
         if let Some(proxy) = proxy {
             errs.extend(proxy.problems(&self.gateway.tls.client_auth));
         }
@@ -3577,6 +3808,11 @@ impl Config {
                         r.name, a.path
                     ));
                 }
+            }
+        }
+        if let Some(prefix) = &self.gateway.filter.path_prefix {
+            if let Some(problem) = filter_path_problem(prefix) {
+                errs.push(format!("[gateway.filter] path_prefix '{prefix}' {problem}"));
             }
         }
         errs
@@ -3982,6 +4218,7 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.gateway.listen, "127.0.0.1:7878");
         assert_eq!(cfg.gateway.audit, "./mcpdef-audit/audit.log");
+        assert!(!cfg.gateway.audit_fsync);
         assert!(cfg.validate().is_empty());
     }
 
@@ -4303,6 +4540,61 @@ mod tests {
         let errs = cfg.validate();
         assert!(errs.iter().any(|e| e.contains("per_tool_per_sec")));
         assert!(errs.iter().any(|e| e.contains("global_burst")));
+    }
+
+    #[test]
+    fn a_filter_path_is_an_unambiguous_path_no_other_server_has() {
+        let errors = |extra: &str, paths: [&str; 2]| {
+            let cfg: Config = toml::from_str(&format!(
+                "[gateway]\n{extra}\n\
+                 [[server]]\nid = \"a\"\ntransport = \"stdio\"\ncommand = [\"a\"]\nfilter_path = {:?}\n\
+                 [[server]]\nid = \"b\"\ntransport = \"stdio\"\ncommand = [\"b\"]\nfilter_path = {:?}\n",
+                paths[0], paths[1]
+            ))
+            .unwrap();
+            cfg.validate()
+        };
+        assert!(errors("", ["/a", "/b"]).is_empty());
+        assert!(errors("", ["/", "/b/c/"]).is_empty());
+        let start = errors("", ["a", "/b"]);
+        assert!(
+            start
+                .iter()
+                .any(|e| e.contains("server 'a'") && e.contains("must start with")),
+            "{start:?}"
+        );
+        // The same path twice, however it ends.
+        let twice = errors("", ["/a", "/a/"]);
+        assert!(
+            twice
+                .iter()
+                .any(|e| e.contains("server 'b'") && e.contains("another server's")),
+            "{twice:?}"
+        );
+        for ambiguous in ["/a/../b", "/a//b", "/a%2Fb", "/a/%2e", "/a\\b"] {
+            let errs = errors("", [ambiguous, "/b"]);
+            assert!(
+                errs.iter()
+                    .any(|e| e.contains("server 'a'") && e.contains("read otherwise")),
+                "{ambiguous}: {errs:?}"
+            );
+        }
+        let query = errors("", ["/a?x=1", "/b"]);
+        assert!(query.iter().any(|e| e.contains("no query")), "{query:?}");
+        let prefix = errors("[gateway.filter]\npath_prefix = \"authz\"\n", ["/a", "/b"]);
+        assert!(
+            prefix
+                .iter()
+                .any(|e| e.contains("[gateway.filter] path_prefix")),
+            "{prefix:?}"
+        );
+        let cfg: Config = toml::from_str(
+            "[gateway]\n[gateway.filter]\npath_prefix = \"/authz\"\n\
+             [[server]]\nid = \"a\"\ntransport = \"stdio\"\ncommand = [\"a\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.gateway.filter.listen, "127.0.0.1:7880");
+        assert!(cfg.validate().is_empty(), "{:?}", cfg.validate());
     }
 
     #[test]
@@ -6966,5 +7258,119 @@ mod tests {
             ]
         );
         assert!(!warnings[0].contains(&token));
+    }
+
+    #[test]
+    fn otel_takes_an_endpoint_and_posts_to_its_traces() {
+        let cfg = |otel: &str| Config::parse(&format!("[gateway.otel]\n{otel}\n{ONE_SERVER}"));
+        let url = |endpoint: &str| {
+            cfg(&format!("endpoint = {endpoint:?}"))
+                .unwrap()
+                .gateway
+                .otel
+                .unwrap()
+                .traces_url()
+        };
+        assert_eq!(
+            url("http://127.0.0.1:4318"),
+            "http://127.0.0.1:4318/v1/traces"
+        );
+        assert_eq!(
+            url("http://127.0.0.1:4318/"),
+            "http://127.0.0.1:4318/v1/traces"
+        );
+        assert_eq!(
+            url("https://otel.example/tenant/a"),
+            "https://otel.example/tenant/a/v1/traces"
+        );
+        assert_eq!(
+            url("http://127.0.0.1:4318/v1/traces"),
+            "http://127.0.0.1:4318/v1/traces",
+            "used as it is"
+        );
+        assert_eq!(
+            url("https://otel.example/otlp?tenant=a"),
+            "https://otel.example/otlp/v1/traces?tenant=a",
+            "the path goes before the query"
+        );
+
+        let otel = cfg("endpoint = \"http://127.0.0.1:4318\"").unwrap();
+        assert_eq!(otel.validate(), Vec::<String>::new());
+        assert_eq!(otel.gateway.otel.unwrap().service_name, "mcpdef");
+        let none = Config::parse(&format!("[gateway]\n{ONE_SERVER}")).unwrap();
+        assert!(none.gateway.otel.is_none());
+
+        for (otel, problem) in [
+            (
+                "endpoint = \"127.0.0.1:4318\"",
+                "is not an http:// or https:// URL",
+            ),
+            (
+                "endpoint = \"ftp://h/x\"",
+                "is not an http:// or https:// URL",
+            ),
+            (
+                "endpoint = \"http://u:p@h:4318\"",
+                "endpoint holds credentials",
+            ),
+            (
+                "endpoint = \"http://h\"\nservice_name = \" \"",
+                "service_name is empty",
+            ),
+        ] {
+            let errors = cfg(otel).unwrap().validate();
+            assert!(
+                errors.iter().any(|e| e.contains(problem)),
+                "{otel}: {errors:?}"
+            );
+        }
+        // A key it does not take is an error, not a setting dropped.
+        assert!(cfg("endpoint = \"http://h\"\nheaders = {}").is_err());
+        assert!(
+            cfg("token = { env = \"T\" }").is_err(),
+            "endpoint is required"
+        );
+    }
+
+    #[test]
+    fn an_otel_token_is_a_secret_the_config_warns_of_as_any() {
+        let warnings = |otel: &str| {
+            Config::parse(&format!("[gateway.otel]\n{otel}\n{ONE_SERVER}"))
+                .unwrap()
+                .warnings()
+        };
+        let clear = warnings("endpoint = \"http://evald.internal:4318\"\ntoken = { env = \"T\" }");
+        assert!(
+            clear.iter().any(|w| w
+                .starts_with("[gateway.otel] sends its token over plain HTTP to evald.internal")),
+            "{clear:?}"
+        );
+        let literal =
+            warnings("endpoint = \"https://evald.internal\"\ntoken = \"a-literal-token\"");
+        assert!(
+            literal
+                .iter()
+                .any(|w| w.starts_with("[gateway.otel] token is a secret written in the config")),
+            "{literal:?}"
+        );
+        assert!(
+            !literal.iter().any(|w| w.contains("a-literal-token")),
+            "{literal:?}"
+        );
+        let in_url =
+            warnings("endpoint = \"https://otel.example/v1/traces?api_key=k3y-0123456789abcdef\"");
+        assert!(
+            in_url
+                .iter()
+                .any(|w| w.starts_with("[gateway.otel] endpoint holds a secret")),
+            "{in_url:?}"
+        );
+        // On this machine, or without a token, there is nothing to read on the way.
+        for quiet in [
+            "endpoint = \"http://127.0.0.1:4318\"\ntoken = { env = \"T\" }",
+            "endpoint = \"http://evald.internal:4318\"",
+        ] {
+            assert_eq!(warnings(quiet), Vec::<String>::new(), "{quiet}");
+        }
     }
 }

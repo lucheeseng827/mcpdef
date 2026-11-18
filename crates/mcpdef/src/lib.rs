@@ -9,14 +9,19 @@
 
 pub mod admin;
 pub mod bridge;
+pub mod bundle;
 pub mod clients;
 pub mod config;
 pub mod connect;
 pub mod discovery;
 pub mod doctor;
+pub mod filter;
 pub mod gateway;
+pub mod hook;
+pub mod import;
 pub mod listener;
 pub mod metrics;
+pub mod otel;
 pub mod redact;
 pub mod reload;
 pub mod sso;

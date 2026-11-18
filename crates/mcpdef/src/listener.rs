@@ -362,7 +362,7 @@ impl Connected<IncomingStream<'_, TlsListener>> for Peer {
 /// axum's own default; we declare it explicitly so the bound is intentional and
 /// easy to find. JSON-RPC requests are small; a tool whose arguments exceed this
 /// is the rare case to revisit.
-const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
 /// Bind `cfg.listen` and serve until shutdown. `auth` enables OAuth 2.1 bearer
 /// validation on every request when `Some`.
@@ -472,6 +472,17 @@ fn router(gw: Gateway, cfg: HttpConfig, auth: Option<AuthState>, tls: Option<Tls
         .with_state(state)
 }
 
+/// The trace a request's `traceparent` header names: one header, that reads,
+/// as W3C Trace Context has a server take it. Its own `_meta` comes first.
+pub(crate) fn traceparent(headers: &HeaderMap) -> Option<(String, String)> {
+    let mut values = headers.get_all("traceparent").iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    mcpdef_audit::otlp::traceparent(value.to_str().ok()?)
+}
+
 async fn handle_post(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<Peer>,
@@ -534,6 +545,7 @@ async fn handle_post(
         principal,
         certificate,
         peer: Some(peer.addr),
+        trace: traceparent(&headers),
     };
 
     // 5. Parse one JSON-RPC message.
@@ -737,7 +749,7 @@ pub(crate) fn certified(
 
 /// What a request lacks that `[gateway.auth]` requires.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Missing {
+pub(crate) enum Missing {
     /// A token that checks out: none was presented, or the one presented
     /// does not.
     Token,
@@ -748,13 +760,23 @@ enum Missing {
 impl AuthState {
     /// The answer to a request that lacks `missing`: for a token, the
     /// challenge that says where to get one, and for a certificate, `403`.
-    fn refusal(&self, missing: Missing) -> Response {
+    pub(crate) fn refusal(&self, missing: Missing) -> Response {
         match (missing, &self.bearer) {
             (Missing::Token, Some(bearer)) => bearer.unauthorized(),
             // Client keys alone: no metadata to point at.
             (Missing::Token, None) if self.keys => unauthorized("Bearer"),
             _ => forbidden("a client certificate is required".to_string()),
         }
+    }
+
+    /// Where the resource's metadata is served, and the document, when a
+    /// bearer token is taken: what a `401`'s challenge points a client at.
+    pub(crate) fn metadata(&self) -> Option<(&str, serde_json::Value)> {
+        let verifier = &self.bearer.as_ref()?.verifier;
+        Some((
+            verifier.metadata_path(),
+            verifier.protected_resource_metadata(),
+        ))
     }
 }
 
@@ -764,7 +786,7 @@ impl AuthState {
 /// says whether the request came with a client certificate that gave an
 /// identity. A token that is presented and does not check out is lacking
 /// whatever else the request carries.
-async fn authenticated(
+pub(crate) async fn authenticated(
     auth: &AuthState,
     gw: &Gateway,
     headers: &HeaderMap,
@@ -851,7 +873,7 @@ fn unauthorized(challenge: &str) -> Response {
 
 /// Whether a request `Origin` is allowed. No Origin (non-browser clients) passes;
 /// loopback origins always pass; anything else must be explicitly allowlisted.
-fn origin_allowed(origin: Option<&str>, allowed: &[String]) -> bool {
+pub(crate) fn origin_allowed(origin: Option<&str>, allowed: &[String]) -> bool {
     let Some(origin) = origin else {
         return true; // CLI / agent clients send no Origin
     };

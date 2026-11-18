@@ -47,7 +47,7 @@ docker compose logs -f mcpdef           # "mcpdef X.Y.Z ready · N upstream(s) �
   that user (`sudo chown 65532:65532 <dir>`).
 
 Upgrade: bump the `image:` tag in `compose.yaml` (a release's tag is its version
-with a `v`: `v0.4.0`), `docker compose pull && docker compose up -d`.
+with a `v`: `v0.5.0`), `docker compose pull && docker compose up -d`.
 State (the ledger) survives.
 
 Secrets and certificates on a VM:
@@ -322,6 +322,246 @@ Metrics live on the admin listener, so enable it first: `--set admin.enabled=tru
   `extraVolumes` (a `LoadBalancer` Service passing TCP through), and enable
   `[gateway.auth]` (OAuth 2.1) in `config`. Do **not** expose `:7879` without
   a sign-in: the identity provider's (above), or an auth proxy's.
+
+## On a network with no route out
+
+MCPdef needs no network of its own. It has no update check, no telemetry and
+no license check, and it connects only to what its config names. With stdio
+upstreams and pinned keys, that is nothing past loopback. On an air-gapped
+host it installs, runs and takes a policy update as it does anywhere else.
+
+### What to carry across
+
+From the GitHub release of the version you want, on a machine with a network:
+
+- **The binary:** `mcpdef-<target>.tar.gz` for the host, with its `.sha256`,
+  its cosign signature (`.sig`) and its certificate (`.pem`). The Linux builds,
+  `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`, are static, so
+  the host needs nothing else.
+- **The SBOM:** `*.cdx.json`, for the scanner on the other side.
+- **For containers, the image, saved to a file:** `docker pull
+  mancube/mcpdef:vX.Y.Z`, then `docker save mancube/mcpdef:vX.Y.Z -o
+  mcpdef-vX.Y.Z.tar`. On the other side, `docker load -i mcpdef-vX.Y.Z.tar`, or
+  push it to the registry there.
+- **For Kubernetes, the chart:** `helm package deploy/helm/mcpdef` at the
+  release's tag. Install it with `--set image.repository=<your
+  registry>/mcpdef`.
+
+Check the signature on that machine. The check needs a network, since cosign
+looks the signature up in the transparency log:
+
+```bash
+cosign verify-blob \
+  --certificate mcpdef-x86_64-unknown-linux-musl.tar.gz.pem \
+  --signature  mcpdef-x86_64-unknown-linux-musl.tar.gz.sig \
+  --certificate-identity-regexp '^https://github\.com/lucheeseng827/mcpdef/\.github/workflows/release\.yml@refs/tags/v.+$' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  mcpdef-x86_64-unknown-linux-musl.tar.gz
+```
+
+On the host, the checksum can be checked again with nothing but the files you
+carried:
+
+```bash
+sha256sum -c mcpdef-x86_64-unknown-linux-musl.tar.gz.sha256
+tar -xzf mcpdef-x86_64-unknown-linux-musl.tar.gz
+install -m 0755 mcpdef /usr/local/bin/mcpdef
+mcpdef version
+```
+
+### What it connects to, and only when its config says so
+
+| What | Config | With no route out |
+|---|---|---|
+| An HTTP upstream | `[[server]] url` | A server inside the network. |
+| The keys an access token is checked against | `[gateway.auth] jwks_uri` or `discovery` | Pin them with `jwks`, inline or in a file, and nothing is fetched. |
+| A token towards an upstream | `[server.auth] kind = "oauth2"` | An authorization server inside the network. |
+| Spans | `[gateway.otel]` | A collector inside the network. Or leave the table out, and export from the ledger with `mcpdef audit tail --format otlp`. |
+| Signing people in to the console | `[gateway.admin.oidc]` | An identity provider inside the network, or client certificates, or break-glass. |
+| A WASM component's outbound TCP | `wasm_allow_egress` | The addresses it lists, and nothing else. |
+
+`mcpdef doctor` opens what the config names, as `run` would. Of the other
+commands, only `mcpdef bridge <url>` and `mcpdef tls pin <url>` reach out, to
+the URL they are given. A stdio upstream is a process of its own: what it
+reaches is its own doing.
+
+The host needs no CA bundle either. An HTTPS upstream is verified against
+Mozilla's roots, built into the binary, and the host's store only when
+`[gateway.upstream_tls] roots` says `"system"` or `"both"`. A server on a
+private CA inside the network has that CA in `ca`.
+
+### A policy update
+
+A policy update is a new `mcpdef.toml`, carried in as the binary was. Check it,
+then send the running gateway a `SIGHUP` (`kill -HUP <pid>`, or `docker kill
+--signal HUP <container>`), or let `[gateway] watch_config = true` pick it up:
+
+```bash
+mcpdef validate --config mcpdef.toml
+kill -HUP <the gateway's pid>
+mcpdef audit tail --config mcpdef.toml -n 5
+```
+
+The ledger records the reload, who asked for it, and the config's hash before
+and after. A change only a restart can apply is refused, recorded, and the
+gateway keeps the config it had: see
+[OPERATIONS.md](./OPERATIONS.md#reloading-the-config). The new file is checked
+by `validate`. For the host to check where it came from as well, carry it in
+signed, as a bundle.
+
+### A signed policy update
+
+A bundle is a config at a revision, signed with Ed25519 where the policy is
+made. The host takes one only if a key it was given signed it, and never one
+older than the last it took. Where the policy is made, once:
+
+```bash
+mcpdef bundle key --out mcpdef-bundle.jwk                # the signing key: it stays here
+mcpdef bundle jwks --key mcpdef-bundle.jwk > keys.json   # its public half, for each host
+```
+
+For each update, sign the config at a revision higher than any before it:
+
+```bash
+mcpdef bundle sign --config mcpdef.toml --key mcpdef-bundle.jwk --revision 8 --out mcpdef-8.bundle
+```
+
+Carry the bundle in as the binary was. On the host, read what it holds, apply
+it, and reload:
+
+```bash
+mcpdef bundle verify mcpdef-8.bundle --trust keys.json --config-out review.toml
+mcpdef bundle apply mcpdef-8.bundle --trust keys.json --config mcpdef.toml
+kill -HUP <the gateway's pid>
+```
+
+- **What `apply` refuses:**
+  - a bundle that no key in `keys.json` signed, or that was changed after it
+    was signed (`bundle-unverified`);
+  - a revision lower than the last the host applied, or that revision again
+    with another config (`bundle-older`);
+  - a config that does not validate, or that names a file the host does not
+    have, such as a key or a secret's file (`bundle-invalid`): carry the files
+    in first.
+
+  A refusal changes nothing, and the ledger records it. The bundle applied
+  last, applied again, changes nothing either, unless the config was changed
+  by hand since: then it puts the bundle's back.
+- **The floor:** the last revision applied is kept in
+  `<state_dir>/bundle.json`. Back it up with the rest of the state: without
+  it, the host takes any revision again.
+- **A rollback** is the earlier config signed again at a revision above the
+  last. An old bundle replayed is refused like any other older one.
+- **The ledger** records each bundle applied or refused: `kind = "reload"`,
+  `method = "bundle"`, the config before and after it (`config_from` and
+  `config_to`), and `bundle`. That is the digest of the bundle's file, and,
+  when its signature verified, its revision and the key that signed it. The
+  gateway's reload records the config it then runs.
+- **In place, at once:** `apply` raises the floor, then writes the config
+  beside the old one and moves it over it, readable by whom the old one was. A
+  gateway with `watch_config` sees the old file or the new one, never half of
+  one. Stopped between the two, the host is a revision behind its floor, and
+  applying the bundle again puts it right. Run it in the directory the gateway
+  runs in, so that the paths in the config mean the same to both. Applies take
+  turns on a lock beside the config, `.mcpdef.toml.lock`.
+
+The host holds the key's public half only: the signing key never needs to
+reach it.
+
+### Holding the gateway to its bundle
+
+`apply` checks a bundle before it writes the config. A hand that can write
+`mcpdef.toml` can still write it without one, and a gateway with
+`watch_config`, or the next `SIGHUP`, takes what it wrote. For the gateway to
+refuse that too, start it (`up`, `run`, or `filter` behind a proxy), or install
+the hook (`mcpdef hook install`), with the keys a bundle may be signed with:
+
+```bash
+mcpdef up --config mcpdef.toml --bundle-trust /etc/mcpdef/bundle-keys.json
+# or, where the command is fixed and the environment is not:
+MCPDEF_BUNDLE_TRUST=/etc/mcpdef/bundle-keys.json mcpdef up --config mcpdef.toml
+```
+
+`apply` keeps the bundle it applied beside the config, as
+`mcpdef.toml.bundle`. At the start and at each reload, the gateway reads it,
+and runs the config only when:
+
+- a key in the file `--bundle-trust` names signed it, as it is;
+- `mcpdef.toml` is, byte for byte, the config it holds;
+- its revision is no lower than the floor, nor than the revision running, and
+  at the same revision, its config is the same.
+
+Otherwise a gateway starting does not start, and says why. A running one
+keeps the configuration it had, logs `config reload refused (…),
+bundle-unverified: …` or `bundle-older: …`, and records the refusal as it does
+any other, with the bundle beside the config as its `bundle`. The ready line,
+and each reload, name the revision running: `· bundle r8`.
+
+- **The switch is in the command, not in the config,** so no config can turn
+  it off. Put the flag, or the variable, in the service's unit, and the keys
+  where only the service's own setup writes. Kept beside the config, they
+  could be replaced by whoever can replace the config, and the gateway warns
+  when they are.
+- **A bundle carried in whole,** the config and `mcpdef.toml.bundle` together,
+  as an image or a config map carries them, runs too, and the gateway raises
+  the floor to its revision as it runs it. So does the first bundle on a host
+  with no floor.
+- **From an earlier release,** a host has no `mcpdef.toml.bundle` yet: apply
+  the last bundle again, which puts it there, then restart with
+  `--bundle-trust`.
+- **With `watch_config`,** a change to `mcpdef.toml.bundle` is a change as
+  one to the config is: the same config signed again at a new revision is
+  taken at the next check, and recorded.
+- **Filter mode** reads its config once, as it starts, so that is where
+  `mcpdef filter --bundle-trust` holds it: a config changed since stops its
+  next start. Apply a bundle, then restart it to take the bundle.
+- **The hook** reads its config afresh at each call, so each call is held as
+  a start is. `mcpdef hook install --bundle-trust <keys>` writes a hook that
+  runs `mcpdef hook --bundle-trust`, and writes none that would refuse every
+  call. Until a bundle is applied:
+  - a config changed by hand, by the user or by an agent with a tool that
+    writes files, refuses every MCP call as `bundle-unverified`;
+  - an older bundle put back refuses it as `bundle-older`.
+
+  The hook runs as its user. A floor kept where that user cannot write is
+  raised by `apply`, run as whoever can; where the hook cannot raise it to a
+  bundle carried in, it refuses the call. And in the user's own settings,
+  the user can still take the hook out:
+  [OPERATIONS.md § Hook mode](./OPERATIONS.md#hook-mode-no-proxy-in-the-path)
+  says where it stays in.
+- **What it does not hold:** `mcpdef call` reads the config as it is. The
+  gateway trusts the keys, the `state_dir` that keeps the floor, and the
+  command it runs under, as it trusts its binary: keep them where the
+  config's writers cannot write.
+
+### Checking it yourself
+
+On Linux, `mcpdef-bench offline`, in the source tree's `crates/mcpdef-bench`,
+runs README.md's commands and a policy update in a scratch home directory:
+
+1. `mcpdef up` with no config, `connect`, and a call through the gateway;
+2. `validate` and `doctor`;
+3. the config signed at revision 1 and applied, and the gateway started again
+   with `--bundle-trust`, the keys kept outside the project;
+4. a tool denied in a bundle signed at revision 2 and applied, revision 1
+   replayed and refused, and a `SIGHUP`; then the call refused through the
+   gateway;
+5. revision 1's config written over `mcpdef.toml` by hand, then its bundle put
+   back beside it, each refused at a `SIGHUP`, the call still refused, and
+   revision 2 applied again;
+6. the call refused through the hook, and `audit verify`.
+
+With `--strace`, it runs them under `strace -f`, and fails on any network call
+to an address past loopback, or to port 53:
+
+```bash
+cargo build --release -p mcpdef-bench
+target/release/mcpdef-bench offline --mcpdef "$(command -v mcpdef)" --strace
+```
+
+Every change to MCPdef runs it before it merges. CI runs the static build in a
+container with no network and nothing in it but the binary, its checksum and
+the harness.
 
 ## HTTPS on the listener
 

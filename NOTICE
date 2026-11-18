@@ -36,6 +36,11 @@ authoritative, version-pinned list). Notable runtime dependencies include:
                                                  — WASM sandbox for untrusted
                                                    MCP servers
   - jsonwebtoken               (MIT)            — OAuth 2.1 JWT/JWKS validation
+  - mimalloc                   (MIT)            — the allocator of the static
+                                                   musl build
+                                                   Copyright (c) 2018-2025
+                                                   Microsoft Corporation, Daan
+                                                   Leijen
 
 The console embedded in the binary bundles, each under its own license, whose
 text is in crates/mcpdef-console/licenses/:

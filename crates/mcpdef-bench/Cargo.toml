@@ -13,6 +13,12 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# The wasm-instantiate scenario. It links the sandbox, and with it Wasmtime, into
+# the harness, so it is off by default: the per-PR gate builds the harness without
+# it, and `make bench` with it.
+wasm = ["dep:mcpdef-sandbox"]
+
 [dependencies]
 # Everything here is already in the workspace's lockfile through the engine crates; the
 # harness adds no new third-party crate to the tree.
@@ -20,6 +26,9 @@ anyhow.workspace = true
 # In-process mock MCP upstreams speaking Streamable HTTP.
 axum.workspace = true
 clap.workspace = true
+# Signs the RS256 token the allowed-bearer scenario calls with, as an identity
+# provider would; the auth crate already depends on it.
+jsonwebtoken.workspace = true
 # The load generator's client. Same TLS/feature set as the engine.
 reqwest.workspace = true
 # The crypto provider that client needs installed: ring, as in the engine.
@@ -28,4 +37,9 @@ serde.workspace = true
 serde_json.workspace = true
 # A scratch directory per scenario: generated config, the gateway's ledger, its log.
 tempfile.workspace = true
+# `offline`'s policy update: one key added to the config `mcpdef up` wrote, the rest
+# of it kept as it was.
+toml_edit.workspace = true
+# wasm-instantiate: the component path's own compile-then-instantiate API.
+mcpdef-sandbox = { workspace = true, optional = true }
 tokio.workspace = true

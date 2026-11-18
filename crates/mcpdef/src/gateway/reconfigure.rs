@@ -5,9 +5,9 @@
 use super::supervise::{
     reach, secs, Backoff, Health, Next, Supervised, Tenure, Together, UpstreamEvent,
 };
-use super::{write, Budget, Gateway, Opened, Pins, Slot, Upstream};
+use super::{write, Budget, Drifted, Gateway, Opened, Pins, Slot, Upstream};
 use mcpdef_inspect::Scanner;
-use mcpdef_pin::PinStore;
+use mcpdef_pin::{PinStore, Severity};
 use mcpdef_policy::{Policy, PolicyRules, Rbac};
 use mcpdef_ratelimit::RateLimiter;
 use std::cell::RefCell;
@@ -36,6 +36,9 @@ pub struct Reconfig {
     /// The pin store as it now stands, and where to save it. `None` turns
     /// pinning off.
     pub pins: Option<(PinStore, PathBuf)>,
+    /// The worst drift a pin takes without an approval (`[gateway]
+    /// pin_accept`).
+    pub pin_accept: Severity,
     /// Each server's tool prefix by its id, with `tool_namespace = "prefix"`;
     /// `None` lists each tool as its server names it.
     pub tool_prefixes: Option<HashMap<String, String>>,
@@ -97,6 +100,7 @@ impl Gateway {
             rate_limit,
             inspect,
             pins,
+            pin_accept,
             tool_prefixes,
             upstreams,
         } = new;
@@ -112,6 +116,7 @@ impl Gateway {
             store,
             path,
             dirty: false,
+            accept: pin_accept,
         });
         let current = self.inner.governance.load_full();
         let scanner_changed = inspect.is_some();
@@ -159,7 +164,9 @@ impl Gateway {
             let Some(up) = had.get(id).and_then(|slot| slot.conn.as_ref()) else {
                 continue;
             };
-            let drifted = Arc::new(self.pin_check(id, &up.tools));
+            let verdicts = self.pin_check(id, &up.tools);
+            self.audit_accepted(id, &verdicts.accepted).await;
+            let drifted = Arc::new(verdicts.held);
             let poisoned = match scanner_changed {
                 true => Some(Arc::new(
                     self.inspect_check(scanner.as_deref(), id, &up.tools, "connect")
@@ -365,7 +372,7 @@ impl Gateway {
 /// A kept upstream's connection, and what its tools were judged on it.
 struct Judged {
     conn: Arc<Upstream>,
-    drifted: Arc<HashSet<String>>,
+    drifted: Arc<Drifted>,
     /// Only when the scanner changed; otherwise its findings stand.
     poisoned: Option<Arc<HashSet<String>>>,
 }

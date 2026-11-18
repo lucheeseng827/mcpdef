@@ -6,7 +6,7 @@ use crate::config::{Config, ServerConfig, UpstreamAuth};
 use crate::gateway::{Connect, Gateway, Startup, Supervised, UpstreamOptions};
 use crate::listener::Fetching;
 use anyhow::{Context, Result};
-use mcpdef_audit::Ledger;
+use mcpdef_audit::{Durability, Ledger};
 use mcpdef_pin::PinStore;
 use mcpdef_sandbox::{WasmComponentUpstream, WasmUpstream};
 use mcpdef_secrets::SecretString;
@@ -30,7 +30,11 @@ pub async fn build_gateway(cfg: &Config) -> Result<Gateway> {
             std::fs::create_dir_all(parent).ok();
         }
     }
-    let ledger = Ledger::open(&cfg.gateway.audit)
+    let durability = match cfg.gateway.audit_fsync {
+        true => Durability::Fsync,
+        false => Durability::Os,
+    };
+    let ledger = Ledger::open_with(&cfg.gateway.audit, durability)
         .with_context(|| format!("opening audit ledger {}", cfg.gateway.audit))?;
     let mut gw = assemble(cfg, ledger, None)?;
     // Every upstream opens at once. One that does not start is logged, audited
@@ -55,6 +59,29 @@ pub async fn build_gateway(cfg: &Config) -> Result<Gateway> {
     // Persist any trust-on-first-use pin additions made during connect.
     gw.persist_pins().context("saving pin store")?;
     Ok(gw)
+}
+
+/// The gateway `mcpdef filter` judges with: the one [`build_gateway`] builds,
+/// writing to the same ledger, with no upstream opened, since the proxy in
+/// front reaches them. Nor is a pin store read: filter mode never sees a
+/// tool's definition, so no record of it may name a pinned one as the
+/// definition its call was judged against.
+pub fn build_filter(cfg: &Config) -> Result<Gateway> {
+    warn(cfg);
+    if let Some(parent) = Path::new(&cfg.gateway.audit).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).ok();
+        }
+    }
+    let durability = match cfg.gateway.audit_fsync {
+        true => Durability::Fsync,
+        false => Durability::Os,
+    };
+    let ledger = Ledger::open_with(&cfg.gateway.audit, durability)
+        .with_context(|| format!("opening audit ledger {}", cfg.gateway.audit))?;
+    let mut unpinned = cfg.clone();
+    unpinned.gateway.pins = None;
+    assemble(&unpinned, ledger, None)
 }
 
 /// The gateway `mcpdef doctor` looks at: the one [`build_gateway`] builds,
@@ -89,7 +116,9 @@ fn assemble(cfg: &Config, ledger: Ledger, pins_to: Option<&Path>) -> Result<Gate
         let store =
             PinStore::load(pins_path).with_context(|| format!("loading pin store {pins_path}"))?;
         let saved = pins_to.map_or_else(|| Path::new(pins_path).to_path_buf(), Path::to_path_buf);
-        gw = gw.with_pins(store, saved);
+        gw = gw
+            .with_pins(store, saved)
+            .with_pin_accept(cfg.gateway.pin_accept.severity());
     }
     let (rl_per_tool, rl_global) = cfg.gateway.rate_limit_settings();
     Ok(gw

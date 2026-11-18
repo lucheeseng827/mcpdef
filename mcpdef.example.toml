@@ -20,6 +20,8 @@
 [gateway]
 listen = "127.0.0.1:7878"          # bind addr for `mcpdef run --http` (loopback by default)
 audit  = "./mcpdef-audit/audit.log"  # append-only, hash-linked ledger
+# audit_fsync = true               # fsync each record before its call is answered (default:
+                                   #   false, the OS writes it to disk in its own time)
 # profile = "readonly"             # active gateway profile (defined below): layers over EVERY
                                    #   server so an agent sees only that slice. `mcpdef run --profile
                                    #   <name>` overrides this. Must live HERE, under [gateway].
@@ -32,8 +34,12 @@ audit  = "./mcpdef-audit/audit.log"  # append-only, hash-linked ledger
 # state_dir = "./mcpdef-state"     # what MCPdef makes for itself: the local CA of [gateway.tls]
 # pins = "./mcpdef-pins.toml"        # enable tool-def pinning + rug-pull detection:
                                    #   on connect MCPdef pins each tool's definition (TOFU); if a
-                                   #   server later changes a tool, the call is denied + audited
-                                   #   as `rug-pull`. Manage with `mcpdef pin` / `mcpdef diff-tools`.
+                                   #   server later changes a tool, the change is graded, and unless
+                                   #   pin_accept takes it the call is denied + audited as `rug-pull`.
+                                   #   Manage with `mcpdef pin` / `mcpdef diff-tools`.
+# pin_accept = "info"              # the worst drift pinned again unasked: "info" (a list reordered,
+                                   #   whitespace) or "risky" (also a tool that takes less). A
+                                   #   reworded description is always held.
 # upstream_timeout_ms = 30000      # fail a tools/call whose upstream doesn't reply in time
                                    #   (audited as `upstream-timeout`) instead of hanging the gateway.
                                    #   Also bounds each upstream's opening, at startup and on every

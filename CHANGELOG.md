@@ -9,6 +9,507 @@ MCP spec revision(s) it supports (see [docs/WIRE.md](./docs/WIRE.md)).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-18
+
+The release that meets an agent where it already runs, and holds a node to the
+policy it was handed. MCPdef fronts the MCP servers a machine's clients run with
+no config to write, judges the MCP calls of Claude Code and Codex with no proxy
+in the path, answers a proxy you already run, and hands its record on: as
+receipts anyone with the public key can check, and as spans in the agent's own
+trace.
+
+`mcpdef up` with no config reads the MCP servers that Claude Code, Claude
+Desktop, Cursor, VS Code and Codex run, writes a config that fronts them,
+letting everything through and auditing every call, and starts it. `mcpdef
+import` writes the same config, and `mcpdef connect --write --replace` points a
+client at the gateway and takes the servers it now fronts out of the client's
+file. `mcpdef hook` is the `PreToolUse` hook of Claude Code and, with
+`--client codex`, of Codex, on Windows too: the gateway's own config judges each
+MCP tool call before the client makes it, and each decision goes to the ledger,
+which hooks, a gateway and `mcpdef call` in other processes now share as one
+chain. `mcpdef filter` answers Envoy's `ext_authz` checks, so a proxy that
+routes MCP itself keeps its routing and asks MCPdef about each request.
+
+`mcpdef bundle` signs a config at a revision, and `--bundle-trust` holds a
+gateway, a filter or a hook to the signed bundle beside its config, never an
+older one. A tool that drifts from its pin is graded `info`, `risky` or
+`breaking`, and `[gateway] pin_accept` serves the drifts that change nothing
+an agent relies on.
+
+`mcpdef receipts` signs the ledger's tool calls as receipts of the IETF draft
+`draft-farley-acta-signed-receipts-03`, which anyone with the public key checks
+offline. With `[gateway.otel]`, each governed call goes to an OpenTelemetry
+endpoint, such as evald's, as a span in the trace its caller named. What the
+gateway adds to a call is measured and published in
+[docs/PERFORMANCE.md](./docs/PERFORMANCE.md), the rows it does not meet yet
+included, and `[gateway] audit_fsync` makes an answer mean that its record is
+on disk. `cargo binstall mcpdef` installs the release binary in seconds.
+
+A 0.4.0 config runs unchanged, and 0.4.0 still verifies a ledger 0.5.0 writes.
+What to know before upgrading is below.
+
+### Upgrading
+- **Each process that writes a ledger takes a lock on its file while it
+  appends** (`flock`, on Unix). A gateway whose ledger is on a file system that
+  refuses the lock, as a network share without locking can, does not start:
+  keep the ledger on a local disk. A writer before 0.5.0 takes no lock, so
+  upgrade every process that writes one ledger together: a 0.4.0 writer beside
+  a 0.5.0 one forks the chain, as two 0.4.0 writers do.
+- **A record keeps the trace its request was part of, and a tool call's record
+  the definition it was judged against.** A request that carries a W3C
+  `traceparent`, in `params._meta` or as an HTTP header, has records that name
+  its trace, as `trace_id` and `parent_id`, whether `[gateway.otel]` is set or
+  not. With a pin store, a tool call's record names the pinned digest of the
+  tool's definition, as `tool_digest`, and a drift's record its grade and
+  changes, as `drift`; a bundle applied or refused has a `bundle` member. A
+  ledger reader, the JSON and syslog exports, and OCSF's `unmapped` see these
+  members set; CEF leaves them out. They are later members, so 0.4.0 still
+  verifies the ledger.
+- **A drift that changes nothing is served, where every drift was held.** With
+  a pin store, a tool whose definition changed only in whitespace or in the
+  order of an array whose order means nothing is pinned again and served, and
+  recorded with `rule = "drift-accepted"`: `[gateway] pin_accept` is `info` by
+  default. Any other drift is held as before. There is no setting that holds
+  an `info` drift.
+- **The pin store gains each tool's definition.** A store from 0.4.0 loads, and
+  a drift from one of its pins is held, ungraded, as before. Once 0.5.0 has
+  written the store, 0.4.0 cannot load it: to go back, put back the store from
+  before the upgrade.
+- **`mcpdef up` with no `mcpdef.toml` here writes one.** With no `--config`, it
+  read `mcpdef.toml` and failed where there was none. Now it writes
+  `mcpdef.toml` from the MCP servers this machine's clients run, as `mcpdef
+  import` does, and starts it. It fails as before only when no client runs
+  one. A script that counts on the failure gives `--config mcpdef.toml`.
+- **`cargo install mcpdef` no longer installs `mock_mcp_server`.** It builds
+  only with the crate's new `mock` feature: `cargo install mcpdef --features
+  mock`, or `cargo build -p mcpdef --bins --features mock` from a checkout.
+- **The static musl build allocates with mimalloc.** An idle gateway holds
+  about 1 MiB more. On a kernel set to hand out transparent huge pages always,
+  `MIMALLOC_ALLOW_THP=0` keeps them off.
+
+### Security
+- **The WASM sandbox runs on Wasmtime 36.0.19.** 0.4.0 shipped 36.0.17, which
+  four advisories cover:
+  - RUSTSEC-2026-0352 (2026-10-14): on macOS and FreeBSD, renaming a symlink
+    whose name ends in a slash could escape WASI's filesystem sandbox. MCPdef
+    gives a component no filesystem, so its sandbox was not exposed;
+  - RUSTSEC-2026-0363 (2026-10-14): the component model's handle tables were
+    capped only per instance and charged to no limit, so a component could make
+    the host allocate memory that no limit set for it counted;
+  - RUSTSEC-2026-0379 (2026-10-19, critical): on aarch64, a large Wasm
+    `br_table` could jump to the wrong target;
+  - RUSTSEC-2026-0380 (2026-10-19, critical): bit-packing in the compiler could
+    overflow silently and miscompile.
+
+  The whole Wasmtime family moves to 36.0.19 together, and Cranelift to
+  0.123.19, on the 36 LTS line, so neither the API nor the MSRV changes.
+- **Certificates are checked with rustls-webpki 0.103.16 and
+  webpki-root-certs 1.0.10.** They were on 0.103.15 and 1.0.9, which two
+  advisories published on 2026-10-19 and 2026-10-20 cover:
+  - RUSTSEC-2026-0382: certificate verification could accept a distrusted
+    intermediate;
+  - RUSTSEC-2026-0383: the bundled roots let distrusted emSign intermediates
+    be trusted.
+- **The runtime is tokio 1.54.1.** It was on 1.52.3, which RUSTSEC-2026-0386,
+  published on 2026-10-13, covers: `AsyncFd::new` and three constructors like
+  it took any raw file descriptor in safe code, which breaks I/O safety.
+  MCPdef's own code calls none of them.
+
+### Added
+- **Signed policy bundles.** A bundle is a config at a revision, signed with
+  Ed25519, for a node that is handed its policy, such as one with no route
+  out. `mcpdef bundle key` makes the signing key, `jwks` prints its public
+  half, `sign` checks a config and signs it, and `verify` says what a bundle
+  holds.
+  - **`mcpdef bundle apply`** puts a bundle's config in place, at once, if a
+    key the node was given signed it, its revision is above the last one the
+    node applied, and its config validates. The floor is kept in
+    `<state_dir>/bundle.json`, and a running gateway takes the config at its
+    next reload.
+  - **What it refuses:** an unsigned or changed bundle (`bundle-unverified`),
+    an older revision, or the same one with another config (`bundle-older`),
+    and a config that does not validate or names a file the host lacks
+    (`bundle-invalid`). A refusal changes nothing. A rollback is the earlier
+    config signed again at a new revision.
+  - **The ledger** records each bundle applied or refused, in a new `bundle`
+    member: the digest of its file, and, once its signature verified, its
+    revision and the key that signed it.
+  - **A gateway held to its bundle:** with `--bundle-trust <keys>` on `run`
+    and `up`, or `MCPDEF_BUNDLE_TRUST`, the gateway runs only a config the
+    signed bundle beside it holds. `apply` keeps that bundle beside the
+    config, as `mcpdef.toml.bundle`. At the start and at each reload, the
+    gateway checks that a trusted key signed it, that it holds the config
+    byte for byte, and that its revision is no lower than the floor or the
+    one running.
+    - A config written by hand is refused as `bundle-unverified`, and an
+      older bundle put back as `bundle-older`. A running gateway keeps what
+      it had, and records the refusal with the bundle in it.
+    - A bundle carried in with its config, as an image carries it, runs too,
+      and the gateway raises the floor to it.
+    - The switch is in the command, so a config cannot turn it off. The ready
+      line and each reload name the revision running, `· bundle r8`.
+    - `mcpdef filter` takes `--bundle-trust` too. It reads its config once,
+      as it starts, so it is held there: a config changed since stops its
+      start.
+    - `mcpdef hook` takes `--bundle-trust` too, and `hook install
+      --bundle-trust <keys>` writes it into the hook. The hook reads its
+      config at each call, so each call is held: an agent that rewrites the
+      config to let itself a tool has every MCP call refused, as
+      `bundle-unverified`, and nothing recorded. `install` writes no hook
+      that would refuse every call.
+  - The offline check makes its policy update this way, with no network. It
+    replays the older revision to see it refused, and runs the gateway held to
+    its bundle: revision 1's config written by hand, then its bundle put back,
+    are each refused at a reload, and the denied tool stays denied.
+- **A drift from a pin is graded.** A tool whose definition drifts from its pin
+  is graded change by change, by what each could do to an agent that calls the
+  tool:
+  - `info`: nothing it says or does, such as `required` reordered, or whitespace
+    in a text;
+  - `risky`: it takes or returns less, such as a property required now, an
+    enum value gone, or a bound tightened;
+  - `breaking`: anything else, such as a reworded description, a tool that
+    takes or returns more, or a changed annotation.
+
+  A reworded description is `breaking`: the model reads it, and rewording it
+  after approval is how a tool is turned against the agent. Only a change of
+  whitespace in it is `info`.
+  - **`[gateway] pin_accept`:** the worst grade pinned again without an
+    approval, `info` by default, or `risky`. Such a drift is served, and
+    recorded with `rule = "drift-accepted"`. Any other is held, hidden and
+    denied, as every drift was.
+  - **What changed, said:** a refusal's reason names the grade and the first
+    change. Its ledger record, and an accepted drift's, carry a `drift` member
+    with the grade and each change. `GET /api/v1/servers/{id}/tools` gives a
+    held tool's. `mcpdef diff-tools` prints each, and exits non-zero only on a
+    drift the gateway holds.
+  - **The pin store keeps each definition** beside its hash, to grade the next
+    change against. A store from before still loads: a drift from a pin of the
+    hash alone is held, ungraded, and approving it keeps the definition. A
+    store this release writes does not load in an earlier one: to go back, put
+    back the store from before the upgrade.
+- **Hook mode: MCPdef with no proxy in the path.** `mcpdef hook` is the
+  `PreToolUse` hook for MCP tool calls of Claude Code and, with
+  `--client codex`, of Codex. The same config a gateway runs on judges each
+  call before the client makes it: the server's allowlist and deny list, the
+  active profile, and the policy rules over the arguments it is about to send.
+  - **What the client hears:** a refusal comes back with why, and exit status
+    2, which blocks the call whatever else the client reads. An allowed call
+    gets no answer, so the client goes on as it would, its own permissions
+    included. Any other tool is not MCPdef's.
+  - **Fail closed:** a server the config does not name, a config that does
+    not read, and a panic refuse the call. So does a hook that fails before
+    MCPdef answers, on Claude Code 2.1.295 or later: `install` writes it with
+    `"onFailure": "block"`. Codex has no such setting, and goes on with a call
+    whose hook failed.
+  - **A bounded wait:** `install` writes a `timeout`, 10 seconds unless
+    `--timeout` says otherwise, so a hook that hangs holds a call for seconds
+    rather than the clients' default of ten minutes.
+  - **The record:** each decision the config makes goes to its ledger,
+    marked `hook = "claude-code"` or `hook = "codex"`, and
+    `mcpdef receipts export` signs it as it signs the gateway's. A write that
+    fails is logged and leaves the decision as it was; a call refused because
+    the config does not read has no record.
+  - **What a hook cannot see** (a server's tool definitions, what a call
+    returns, a caller's token, call rates) needs the gateway in the path, with
+    the same config.
+
+  `mcpdef hook install --write` merges the hook into the project's
+  `.claude/settings.local.json`, or with `--client codex` its
+  `.codex/hooks.json`, keeping every other hook there and a `.bak`. Codex runs
+  a new hook only once it is trusted in `/hooks`, and `install` says so. A
+  Codex hook carries `commandWindows` too, the line `cmd.exe` reads, which
+  Codex runs on Windows in place of `command`: each path in double quotes, a
+  `\\?\` path given as the plain one. A path `cmd.exe` would expand even in
+  quotes (`%`, `!`) gets no Windows line, and on Windows no hook, since Codex
+  goes on with a call whose hook did not run. CI runs the written hook through
+  `cmd.exe` on Windows, as Codex does.
+  [docs/OPERATIONS.md](./docs/OPERATIONS.md#hook-mode-no-proxy-in-the-path)
+  has what it judges and what it does not.
+- **Filter mode: MCPdef behind the proxy you already run.** `mcpdef filter`
+  answers the checks of a proxy that routes MCP requests itself, as Envoy's
+  `ext_authz` filter asks an HTTP authorization service: the proxy keeps its
+  routing, and asks MCPdef about each request before it sends it on.
+  - **Which server:** the request's path names it: the `[[server]]` whose new
+    `filter_path` the path is at or under, the longest winning, once
+    `[gateway.filter] path_prefix` is off it. A path under none is refused,
+    and so is one a proxy could read as another (`..`, `//`, an escaped `/`).
+  - **What it judges:** what a gateway would, of what a request alone shows,
+    in the gateway's order: a `tools/call` by the allowlists and profile, the
+    argument transforms, the policy rules, RBAC and the rate limit; a
+    `resources/read` or `resources/subscribe`, a `prompts/get` and a
+    `completion/complete` by their allowlists and the same gates. A
+    transform that would change the arguments, and a URI not in normal form,
+    refuse the request, since the proxy sends it as the client wrote it.
+    What only the path sees, a server's tool definitions and what a call
+    returns, is not judged: put the gateway there for those.
+  - **The caller:** `[gateway.auth]`'s bearer tokens and client keys, checked
+    as the listener checks them, and the request's `Origin`. The resource's
+    metadata, where a `401`'s challenge sends a client, is served to anyone,
+    for the proxy to route there. A config that takes client certificates is
+    refused: the proxy holds the connection.
+  - **The answer:** a `200`, or a `403` with a JSON-RPC error, which the proxy
+    hands the client, its rule in `x-mcpdef-rule`. A `POST` without its body
+    is refused: the proxy must send it (Envoy's `with_request_body`). Lists,
+    notifications and requests other than `POST` pass.
+  - **The record:** each decision goes to the config's ledger, marked
+    `hook = "ext_authz"`, and the answer's `x-mcpdef-record` names it.
+    Receipts and spans take them as they take the gateway's.
+  - **Envoy, for real:** CI runs the Envoy configuration
+    [docs/OPERATIONS.md](./docs/OPERATIONS.md#filter-mode-behind-a-proxy-that-routes)
+    gives against `mcpdef filter`, with Envoy 1.35.
+
+  It listens on `[gateway.filter] listen`, `127.0.0.1:7880` unless set, and
+  opens no upstream. Envoy's gRPC `ext_authz`, agentgateway's ExtMCP and a
+  reload are not in it yet.
+- **Writers in other processes share a ledger.** Each writer takes an
+  exclusive lock on the ledger's file while it appends, and goes on from the
+  last record in it. So hooks running at once, a gateway and `mcpdef call`
+  keep one chain in one ledger, where two writers used to fork it. The lock
+  adds about a microsecond to an append. A ledger cut short under a running
+  writer stays cut, for a check to find, and a record is never joined to a
+  last line that has no newline. A ledger opened, as a gateway starts, reads
+  as far as the file's length under the lock, so a line another writer is
+  halfway through is never taken for a corrupt one.
+- **Traces: each governed call as an OpenTelemetry span, in the agent's own
+  trace.** With `[gateway.otel]`, the gateway sends the ledger's governed
+  requests to an OTLP/HTTP endpoint, such as evald's `:4318`, as spans in
+  OTLP/JSON. A span is in the trace the request's `traceparent` names, from
+  `params._meta`, as the OpenTelemetry conventions for MCP put it, or else
+  from the HTTP header, under the caller's span. That is how a backend puts a
+  tool call beside the model calls of the same run.
+  - **What it says:** the span is named and described as those conventions
+    describe a server's (`tools/call <tool>`, `gen_ai.operation.name =
+    execute_tool`), with the decision, the rule, the server and the record's
+    `seq` under `mcpdef.`. A refused call is an error, named by its rule.
+  - **How it goes:** the exporter follows the ledger's file, so no call waits
+    for it. An endpoint that is down or busy is tried again, up to a minute
+    apart, and gets what was written meanwhile once it is back. One that
+    refuses spans for good has them dropped, with a log line.
+  - **The same spans every time:** a span's id comes from its record's hash,
+    and `mcpdef audit tail --format otlp`, the fifth export format, gives the
+    spans the gateway sent, ids and all. The admin API's export takes `otlp`
+    too.
+  - **What the ledger gains:** each record keeps the trace it was part of, as
+    `trace_id` and `parent_id`. With a pin store, a tool call's record keeps
+    the pinned digest of the tool's definition, as `tool_digest`. Both are
+    later members, so a release that knows neither still verifies the ledger.
+
+  [docs/OPERATIONS.md](./docs/OPERATIONS.md#traces-each-call-as-an-opentelemetry-span)
+  has what a span holds and how it joins the agent's trace.
+- **Signed receipts: the ledger's tool calls, checkable offline by anyone with
+  the public key.** `mcpdef receipts export` signs each tool call in the ledger
+  as an Access Decision Receipt of the IETF Internet-Draft
+  `draft-farley-acta-signed-receipts-03`, in its envelope shape. Each receipt
+  is signed with Ed25519 over the payload's RFC 8785 (JCS) form, and links to
+  the one before. The export checks the ledger's chain as it reads it, and a
+  seal with `--head` and `--count`. Nothing is kept from a ledger that fails:
+  the receipts reach standard output, or the `--out` file, only once the
+  whole ledger has checked. The same ledger and key always give the same
+  bytes.
+  `mcpdef receipts key` makes the signing key, a private JWK only its owner
+  can read. `mcpdef receipts jwks` prints its public half to publish.
+  `mcpdef receipts verify` checks receipts against keys you trust, and with
+  `--last` and `--count` against a seal, which catches receipts taken off the
+  end. A receipt holds no caller identity, address, arguments or result.
+  [docs/OPERATIONS.md](./docs/OPERATIONS.md#signed-receipts) has the how and
+  what a receipt does and does not show.
+- **What the gateway adds to a call is measured and published.**
+  [docs/PERFORMANCE.md](./docs/PERFORMANCE.md) gives what an allowed call, an
+  allowed call whose bearer token is checked, a denied call and idle memory cost
+  on a named machine, against the bar the project holds itself to, row by row,
+  including the rows it does not meet yet, and how to run the measurement again.
+- **`mcpdef-bench` measures a gateway that checks bearer tokens.** Its new
+  `allowed-bearer` scenario calls through a gateway with `[gateway.auth]` on,
+  where an RS256 token is checked against pinned keys on every call, beside the
+  same call straight to the upstream. `denied` now also says how much longer a
+  refusal takes than a direct call does.
+- **`[gateway] audit_fsync`: an answer that means the record is on disk.** With
+  it on, each audit record is `fsync`ed before the call it records is answered,
+  and each start syncs the ledger and its directory first, records written
+  before it was on included. The directory above it is synced as well where
+  MCPdef may, for a directory just made, and skipped where it may not. Off, the
+  default, each record is written to the operating system before the answer, as
+  before: a crash of MCPdef loses no record, but a crash of the machine can lose
+  the last ones. The `fsync` runs off the async workers, after the ledger's lock
+  is let go, so calls answered together share the disk's time.
+  [docs/PERFORMANCE.md](./docs/PERFORMANCE.md) gives what it costs, and
+  `mcpdef-bench`'s new `allowed-bearer-fsync` scenario measures it.
+- **A WASM component is compiled once and instantiated as often as needed.**
+  `mcpdef-sandbox`'s new `ComponentTemplate::compile` does the slow part
+  (Cranelift, and linking WASI) once. Its `instantiate` makes a fresh instance,
+  with a store, a memory and a WASI context of its own, in about 20 µs.
+  `WasmComponentUpstream::from_bytes` is both, as before, and the instances of
+  one template share one epoch ticker. `mcpdef-bench`'s new `wasm-instantiate`
+  scenario measures it, in a harness built with its `wasm` feature.
+- **`mcpdef up` starts with no config, and `mcpdef import` writes one.** With
+  no `mcpdef.toml` in the working directory, `up` reads the MCP servers the
+  clients on this machine already run, writes a config that fronts them, and
+  starts it. It reads the config files of Claude Code (`.mcp.json` and
+  `~/.claude.json`), Claude Desktop, Cursor, VS Code and Codex.
+  - **Nothing is taken away:** every tool, resource and prompt is let through.
+  - **It adds the record:** every call is audited, and inspection warns without
+    blocking.
+  - **Variables carry over:** one the client fills in becomes one MCPdef reads
+    from its own environment.
+  - **No loops:** an entry that is MCPdef already is not fronted again: one that
+    runs `mcpdef` (`mcpdef.exe`), or the `mancube/mcpdef` image under
+    `docker run` or `podman run`, and one whose URL reaches the gateway's
+    listener. That is its own host; loopback, for a listener there or on every
+    address; and this machine's name or one of its addresses, such as its LAN
+    address, for a listener on every address (`0.0.0.0`).
+  - **Nothing a directory names runs unasked.** A server only the working
+    directory's own files name (`.mcp.json`, `.cursor/mcp.json`,
+    `.vscode/mcp.json`: a repository just cloned, say) is fronted only when a
+    client was told to run it there. Claude Code records that in
+    `~/.claude.json`, or in the user's own `~/.claude/settings.json`, and a
+    file in the directory cannot say it. `mcpdef import --project-servers`
+    fronts the rest, each said to be the directory's own.
+  - **`up` and `import` change no client file.** `mcpdef import` prints the
+    same config, or writes it with `--out`. The file is always `0600`: a value
+    a client wrote in can be anywhere in it, in an argument or a URL too.
+  - **Nothing in a client's file reaches the config but as text.** What it
+    holds, in a comment or a message, has its control characters escaped, so
+    that a line break in it cannot start TOML of its own.
+  - **Codex's credentials carry over:** `bearer_token_env_var`,
+    `http_headers` and `env_http_headers`.
+- **`mcpdef connect --write --replace` points a client at the gateway, and
+  takes out of its file the servers the gateway now fronts:** the same
+  command with the same variables, or the same URL with the same
+  credentials. The same command with another token is another server, and
+  stays. The client then sees each tool once, through the gateway.
+  - **Other files:** a fronted server the client also has in another file it
+    reads is named, to take out there.
+  - **The `.bak`** keeps what was there, as private as the file was.
+- **`mcpdef-bench compare` takes several runs a side.** Give `--current` or
+  `--baseline` more than once, and each metric is judged on its best value on
+  each side, so that no single disturbed run decides.
+  - **A gateway-over-direct ratio is judged by its parts:** the gateway's best
+    percentile over the direct call's best, each over the side's runs. The
+    lowest of the runs' ratios was the run whose direct calls were slowed,
+    which made an unchanged gateway look slower than its base.
+  - **The 16-client p99 ratios have a 100 % band**, from 50 %. On the bench
+    gate's runner, with two vCPUs, unchanged code moved them by up to +83 %.
+    All three of the gate's false failures were these: two in 26 jobs, and one
+    on the change that added `first-call`. Every other band stays as it was.
+- **`mcpdef-bench first-call` times the first governed call.** It runs this
+  README's commands from an installed `mcpdef`, each time from a fresh home
+  directory and project whose Claude Code already runs an MCP server, and checks
+  each step as well as timing it:
+  - **through the gateway:** `mcpdef up` with no config, `mcpdef connect
+    claude-code --write --replace`, then the client's first call;
+  - **through a hook:** `mcpdef import --out mcpdef.toml`, `mcpdef hook install
+    --config mcpdef.toml --write`, then the hook before the first MCP tool call.
+
+  On a 4-vCPU VM, either path takes 9–14 ms with the static musl build.
+  Installing takes 1–2 s from the release tarball, and four and a half minutes
+  with `cargo install mcpdef`, which compiles it. The bench gate runs it on
+  every engine change, and fails past 60 s.
+  [docs/PERFORMANCE.md](./docs/PERFORMANCE.md#the-first-governed-call) has each
+  step, and what the times leave out.
+- **`mcpdef-bench offline` checks an install with no route out.** It runs this
+  README's commands to a governed call, `mcpdef validate` and `mcpdef doctor`,
+  then a policy update: a tool denied in the config and a `SIGHUP`. It then
+  checks, in order:
+  - in the session already open, the tool is no longer listed, and a call to it
+    is refused, through the gateway and through the hook;
+  - `mcpdef audit verify` passes, on a ledger holding the call, the reload and
+    both refusals.
+
+  With `--strace`, it fails on any network call to an address past loopback,
+  or to port 53. CI runs it before each change merges: the static build, packed
+  with its checksum as the release packs it, installed in a container with no
+  network that holds nothing else. On a host with no network, one run made 47
+  network calls, all on loopback. [docs/DEPLOY.md](./docs/DEPLOY.md#on-a-network-with-no-route-out)
+  has what to carry across to an air-gapped host, what the gateway connects to
+  only when its config says so, and how a policy update is made there.
+- **`cargo binstall mcpdef` installs the release binary.** The crate's
+  `[package.metadata.binstall]` names the release archives, so cargo-binstall
+  fetches the static build in seconds rather than compiling it for minutes, as
+  `cargo install` does. On glibc Linux it takes the musl build, the only Linux
+  one the release has. It applies from the release after 0.4.0, the first
+  published with the metadata. The install-time workflow times it beside `cargo
+  install` and the tarball, and checks the metadata against the newest release on
+  every change to the crate's manifest.
+
+### Changed
+- **`cargo install mcpdef` installs the gateway alone.** The test upstream,
+  `mock_mcp_server`, which it installed beside the gateway, now builds only
+  with the crate's new `mock` feature, which the integration tests turn on
+  themselves. `cargo build -p mcpdef --bins --features mock` builds both, as the
+  quickstart does. cargo-binstall needs each binary the crate installs to be in
+  the release archive, and the archive holds the gateway alone.
+- **The release build: `opt-level = "s"`, and the static musl build on
+  mimalloc.** On the VM [docs/PERFORMANCE.md](./docs/PERFORMANCE.md) measures, the
+  static build, which the release tarballs and the container image carry, now
+  adds 382–489 µs to an allowed call with a bearer token at p99, under the bar's
+  500 µs in three runs of three, where it added 553–705 µs. Over runs ten times
+  as long, it sits at the bar rather than under it.
+  - **The optimization level:** `"s"` rather than `"z"`, except for Wasmtime's
+    largest crates, which stay at `"z"`. A call with a token takes 16–45 µs less
+    at the median, for a binary 5 % bigger, where `"s"` for every crate would
+    have cost 12 %.
+  - **The allocator:** a static musl build allocates with mimalloc (MIT) rather
+    than musl's own. With musl's, a call with a token took about 80 µs longer at
+    the median, and sixteen clients got half as many calls through. Idle, the
+    gateway holds about 1 MiB more. mimalloc is built without transparent huge
+    pages: with them, an idle gateway held twice as much. On a kernel set to hand
+    them out always, `MIMALLOC_ALLOW_THP=0` keeps them off. Other builds keep the
+    system's allocator.
+  - **Where the time goes:** the page now has a profile of an allowed call. The
+    gateway's own work is about 18 µs at the median, or 65 µs with a token; the
+    rest of what it adds is a second HTTP round trip, and most of the tail is
+    that round trip and the VM's.
+
+  The page now measures on another VM of the same type as 0.4.0's. On it, 0.4.0
+  itself adds about half the p99 it added on the first, so most of the
+  difference from 0.4.0's numbers is the machine. 0.4.0's reports stay
+  committed.
+
+- **The crates' Rust API.** `mcpdef-audit`: `Record` and `Attrs` gain
+  `trace_id`, `parent_id`, `tool_digest`, `hook`, `drift` and `bundle`, so a
+  struct literal must set them; `Drift`, `BundleRef` and `rfc3339_utc` are
+  new. `Record::export` returns an `Option`, `None` for a record the
+  format has no line for (`otlp` has one only for a governed request), and
+  `ExportFormat` gains `Otlp`. New: `Durability`, with `Ledger::open_with`,
+  `Ledger::attach` and `Ledger::durability`; `GATEWAY_AGENT`; the `otlp`
+  module (`span`, `request`, `traceparent`); and the `receipt` module
+  (`SigningKey`, with `generate_named` and `sign`; `Receipts`; `export`;
+  `Keys`, with a `verify` method; `verify`; `canonical`). `mcpdef-pin`: the
+  `grade` module (`grade`, `Grading`, `Change`, `Severity`), `governed`,
+  `Judgement`, and on `PinStore`, `judge`, `pinned_definition` and
+  `record_tool`. `mcpdef-core`: `wire::traceparent`. `mcpdef-transport`: `post_json` and
+  `Posted`. `mcpdef-sandbox`: `ComponentTemplate`, with `compile` and
+  `instantiate`. `mcpdef`: `GatewayConfig` gains `audit_fsync`, `otel` (an
+  `OtelConfig`), `pin_accept` (a `PinAccept`) and `filter` (a
+  `FilterConfig`), `ServerConfig` gains `filter_path`, `Reconfig` gains
+  `pin_accept`, `ToolState` gains `drift`, and `Caller` gains `trace`, so a
+  struct literal must set them. New: the `bundle`, `filter`, `hook`, `import`
+  and `otel` modules; `Gateway::authorize` and `gateway::Authorization`;
+  `Gateway::with_pin_accept`; `Reloader::with_bundle_lock`;
+  `connect::build_filter`; `clients::write_replacing`; and in `config`,
+  `DEFAULT_LISTEN`, `filter_path_problem`, `normal_filter_path` and
+  `path_is_ambiguous`. The crate's new `mock` feature builds
+  `mock_mcp_server`.
+
+### Fixed
+- **A `default` transform that put a null over a null said it had changed the
+  arguments.** `mcpdef-policy`'s `Transformed::changed` was true though they
+  were the same, which changed nothing a call sent. Now a `default` says it
+  changed them only when the value was not the default already. The property
+  tests found it.
+
+### Spec support
+- As 0.4.0: built against MCP spec **2025-11-25**, still the default on both
+  sides, and serves and speaks **2026-07-28** beside it. A request's trace is
+  read from `params._meta.traceparent`, where SEP-414 and the OpenTelemetry
+  conventions for MCP put it. Not yet implemented from 2026-07-28: forwarding a
+  `Mcp-Param-*` header no annotation names, SSE responses,
+  `subscriptions/listen` (and an upstream's own notification stream), relaying a
+  2025-11-25 server's own requests to its client, and `resultType` on results
+  relayed from a 2025-11-25 upstream and on the `tools/call` errors MCPdef
+  writes itself. See `docs/WIRE.md`.
+
 ## [0.4.0] - 2026-10-14
 
 The console release, and the first since 0.2.2 on crates.io, Homebrew and the

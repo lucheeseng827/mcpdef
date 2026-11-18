@@ -1,0 +1,169 @@
+{
+  "schema": 1,
+  "generated_at_unix": 1792051840,
+  "mcpdef_version": "mcpdef 0.4.0  ·  MCP gateway & governance plane",
+  "commit": "2117c06366b5b3ede1934e48bf1820223c360857",
+  "note": "4-vCPU cloud VM (Intel Xeon @ 2.10GHz), 15.7 GiB, ext4 on a virtio disk; glibc build",
+  "machine": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpus": 4,
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "mem_total_kb": 16479424
+  },
+  "params": {
+    "quick": false,
+    "warmup": 300,
+    "requests": 3000,
+    "concurrency": [
+      1,
+      16
+    ],
+    "slow_ms": 5000,
+    "neighbour_upstreams": 20,
+    "neighbour_concurrency": 8,
+    "neighbour_alone_ms": 5000,
+    "neighbour_beside_ms": 15000,
+    "idle_upstreams": 10,
+    "idle_load_requests": 1000
+  },
+  "scenarios": {
+    "allowed_bearer": [
+      {
+        "concurrency": 1,
+        "direct": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 27,
+          "p50_us": 107,
+          "p90_us": 167,
+          "p99_us": 274,
+          "max_us": 4182,
+          "mean_us": 113,
+          "rps": 8724.526944152864
+        },
+        "gateway": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 192,
+          "p50_us": 370,
+          "p90_us": 685,
+          "p99_us": 1786,
+          "max_us": 12826,
+          "mean_us": 444,
+          "rps": 2245.6455495580917
+        },
+        "added_p50_us": 263,
+        "added_p99_us": 1512,
+        "ratio_p50": 3.457943925233645,
+        "ratio_p99": 6.518248175182482
+      },
+      {
+        "concurrency": 16,
+        "direct": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 102,
+          "p50_us": 385,
+          "p90_us": 545,
+          "p99_us": 948,
+          "max_us": 14243,
+          "mean_us": 410,
+          "rps": 38716.52749709729
+        },
+        "gateway": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 388,
+          "p50_us": 1538,
+          "p90_us": 2634,
+          "p99_us": 5572,
+          "max_us": 7677,
+          "mean_us": 1708,
+          "rps": 9344.794150211193
+        },
+        "added_p50_us": 1153,
+        "added_p99_us": 4624,
+        "ratio_p50": 3.994805194805195,
+        "ratio_p99": 5.877637130801688
+      }
+    ],
+    "allowed_bearer_fsync": [
+      {
+        "concurrency": 1,
+        "direct": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 27,
+          "p50_us": 102,
+          "p90_us": 153,
+          "p99_us": 333,
+          "max_us": 6355,
+          "mean_us": 117,
+          "rps": 8444.65837328778
+        },
+        "gateway": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 468,
+          "p50_us": 1084,
+          "p90_us": 1686,
+          "p99_us": 3656,
+          "max_us": 48454,
+          "mean_us": 1210,
+          "rps": 825.3115567220201
+        },
+        "added_p50_us": 982,
+        "added_p99_us": 3323,
+        "ratio_p50": 10.627450980392156,
+        "ratio_p99": 10.97897897897898
+      },
+      {
+        "concurrency": 16,
+        "direct": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 84,
+          "p50_us": 409,
+          "p90_us": 593,
+          "p99_us": 1210,
+          "max_us": 8066,
+          "mean_us": 436,
+          "rps": 36399.24276471322
+        },
+        "gateway": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 574,
+          "p50_us": 2608,
+          "p90_us": 4170,
+          "p99_us": 5861,
+          "max_us": 8321,
+          "mean_us": 2777,
+          "rps": 5744.384714587488
+        },
+        "added_p50_us": 2199,
+        "added_p99_us": 4651,
+        "ratio_p50": 6.376528117359413,
+        "ratio_p99": 4.843801652892562
+      }
+    ],
+    "wasm_instantiate": {
+      "component": "echo_component.wasm",
+      "component_bytes": 206125,
+      "compile_us": 432338,
+      "first_us": 144,
+      "instantiate": {
+        "n": 3000,
+        "errors": 0,
+        "min_us": 16,
+        "p50_us": 18,
+        "p90_us": 28,
+        "p99_us": 64,
+        "max_us": 2857,
+        "mean_us": 22,
+        "rps": 29296.412952080882
+      }
+    }
+  }
+}

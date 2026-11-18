@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-//! The four scenarios. Each starts its own gateway on its own scratch directory,
+//! The scenarios. Each starts its own gateway on its own scratch directory,
 //! so one scenario's ledger, pins and upstream processes never colour another's.
 
-use crate::gateway::{Gateway, Upstream};
+use crate::gateway::{Features, Gateway, Upstream};
 use crate::load::{self, Budget, Expect, Load};
 use crate::mock::{self, HttpMock, MockTool};
-use crate::report::{ratio, Allowed, Denied, IdleRss, Params, SlowNeighbour};
+use crate::report::{Allowed, Denied, IdleRss, Params, SlowNeighbour};
 use crate::stats::{summarize, Summary};
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -59,93 +59,152 @@ impl Ctx {
             expect,
             concurrency,
             budget,
+            bearer: None,
         }
     }
 
-    /// Warm up (unmeasured), then measure.
+    /// Warm up (unmeasured), then measure, calling with `bearer` as the token
+    /// if there is one.
     async fn measure(
         &self,
         url: &str,
+        bearer: Option<&Arc<str>>,
         tools: &[&str],
         expect: Expect,
         concurrency: usize,
     ) -> Summary {
-        self.load(
-            url,
-            tools,
-            expect,
-            concurrency,
-            Budget::Requests(self.params.warmup),
-        )
-        .run()
-        .await;
-        summarize(
-            &self
-                .load(
-                    url,
-                    tools,
-                    expect,
-                    concurrency,
-                    Budget::Requests(self.params.requests),
-                )
-                .run()
-                .await,
-        )
+        let run = |budget| Load {
+            bearer: bearer.cloned(),
+            ..self.load(url, tools, expect, concurrency, budget)
+        };
+        run(Budget::Requests(self.params.warmup)).run().await;
+        summarize(&run(Budget::Requests(self.params.requests)).run().await)
     }
 }
 
-/// `allowed` and `denied` share one gateway: an HTTP upstream exposing `echo`
-/// (allowlisted) and `danger` (not). The allowed call is also made straight to
-/// the upstream, at the same client count, so the gateway's cost is a difference
-/// measured in one run.
-pub async fn allowed_and_denied(
-    ctx: &Ctx,
-    want_allowed: bool,
-    want_denied: bool,
-) -> Result<(Vec<Allowed>, Vec<Denied>)> {
+/// Which of the call scenarios to run.
+#[derive(Clone, Copy, Debug)]
+pub struct Calls {
+    pub allowed: bool,
+    pub allowed_bearer: bool,
+    pub allowed_bearer_fsync: bool,
+    pub denied: bool,
+}
+
+/// What [`allowed_and_denied`] measured.
+#[derive(Debug, Default)]
+pub struct CallResults {
+    pub allowed: Vec<Allowed>,
+    pub allowed_bearer: Vec<Allowed>,
+    pub allowed_bearer_fsync: Vec<Allowed>,
+    pub denied: Vec<Denied>,
+}
+
+/// The call scenarios share one upstream: an HTTP mock exposing `echo`
+/// (allowlisted) and `danger` (not). `allowed` and `denied` go through one
+/// gateway, `allowed-bearer` through a second that checks a bearer token on
+/// every call, and `allowed-bearer-fsync` through a third that also `fsync`s
+/// each audit record before the reply. Each allowed call is also made straight to the upstream,
+/// at the same client count and just before, so the gateway's cost is a
+/// difference measured in one run.
+pub async fn allowed_and_denied(ctx: &Ctx, want: Calls) -> Result<CallResults> {
     let upstream = mock::spawn_http(vec![MockTool::fast("echo"), MockTool::fast("danger")]).await?;
+    let fronted = [Upstream::Http {
+        id: "upstream".into(),
+        url: upstream.url.clone(),
+        allow: vec!["echo".into()],
+    }];
     let dir = tempfile::tempdir()?;
     let mut gateway = Gateway::start(
         &ctx.mcpdef,
         dir.path(),
-        &[Upstream::Http {
-            id: "upstream".into(),
-            url: upstream.url.clone(),
-            allow: vec!["echo".into()],
-        }],
-        false,
+        &fronted,
+        Features::default(),
         &ctx.client,
     )
     .await
     .context("starting the gateway for allowed/denied")?;
+    let bearer_dir = tempfile::tempdir()?;
+    let bearer = Features {
+        bearer: true,
+        ..Features::default()
+    };
+    let mut with_bearer = match want.allowed_bearer {
+        true => Some(
+            Gateway::start(
+                &ctx.mcpdef,
+                bearer_dir.path(),
+                &fronted,
+                bearer,
+                &ctx.client,
+            )
+            .await
+            .context("starting the gateway for allowed-bearer")?,
+        ),
+        false => None,
+    };
+    let fsync_dir = tempfile::tempdir()?;
+    let fsync = Features {
+        fsync: true,
+        ..bearer
+    };
+    let mut with_fsync = match want.allowed_bearer_fsync {
+        true => Some(
+            Gateway::start(&ctx.mcpdef, fsync_dir.path(), &fronted, fsync, &ctx.client)
+                .await
+                .context("starting the gateway for allowed-bearer-fsync")?,
+        ),
+        false => None,
+    };
 
-    let (mut allowed, mut denied) = (Vec::new(), Vec::new());
+    let mut out = CallResults::default();
     for &c in &ctx.params.concurrency {
-        eprintln!("  allowed/denied: {c} client(s) — straight to the upstream");
-        let direct = ctx
-            .measure(&upstream.url, &["echo"], Expect::Success, c)
-            .await;
-        if want_allowed {
+        let direct = if want.allowed || want.denied {
+            eprintln!("  allowed/denied: {c} client(s) — straight to the upstream");
+            ctx.measure(&upstream.url, None, &["echo"], Expect::Success, c)
+                .await
+        } else {
+            Summary::default()
+        };
+        if want.allowed {
             eprintln!("  allowed/denied: {c} client(s) — through the gateway");
             let via = ctx
-                .measure(&gateway.url, &["echo"], Expect::Success, c)
+                .measure(&gateway.url, None, &["echo"], Expect::Success, c)
                 .await;
-            allowed.push(Allowed::new(c, direct.clone(), via));
+            out.allowed.push(Allowed::new(c, direct.clone(), via));
         }
-        if want_denied {
+        if want.denied {
             eprintln!("  allowed/denied: {c} client(s) — denied by the allowlist");
             let refused = ctx
-                .measure(&gateway.url, &["danger"], Expect::ToolError, c)
+                .measure(&gateway.url, None, &["danger"], Expect::ToolError, c)
                 .await;
-            denied.push(Denied {
-                concurrency: c,
-                ratio_p50_vs_direct: ratio(refused.p50_us, direct.p50_us),
-                gateway: refused,
-            });
+            out.denied.push(Denied::new(c, &direct, refused));
+        }
+        for (name, gateway, rows) in [
+            ("allowed-bearer", &with_bearer, &mut out.allowed_bearer),
+            (
+                "allowed-bearer-fsync",
+                &with_fsync,
+                &mut out.allowed_bearer_fsync,
+            ),
+        ] {
+            let Some(g) = gateway else { continue };
+            eprintln!("  {name}: {c} client(s) — straight to the upstream");
+            let direct = ctx
+                .measure(&upstream.url, None, &["echo"], Expect::Success, c)
+                .await;
+            eprintln!("  {name}: {c} client(s) — through the gateway, with a token");
+            let via = ctx
+                .measure(&g.url, g.token.as_ref(), &["echo"], Expect::Success, c)
+                .await;
+            rows.push(Allowed::new(c, direct, via));
         }
     }
     gateway.stop().await;
-    Ok((allowed, denied))
+    for g in [&mut with_bearer, &mut with_fsync].into_iter().flatten() {
+        g.stop().await;
+    }
+    Ok(out)
 }
 
 /// Upstream transport for the slow-neighbour scenario.
@@ -222,14 +281,20 @@ pub async fn slow_neighbour(ctx: &Ctx, transport: Transport) -> Result<SlowNeigh
     }
 
     let dir = tempfile::tempdir()?;
-    let mut gateway = Gateway::start(&ctx.mcpdef, dir.path(), &upstreams, false, &ctx.client)
-        .await
-        .with_context(|| {
-            format!(
-                "starting the gateway for slow-neighbour ({})",
-                transport.name()
-            )
-        })?;
+    let mut gateway = Gateway::start(
+        &ctx.mcpdef,
+        dir.path(),
+        &upstreams,
+        Features::default(),
+        &ctx.client,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "starting the gateway for slow-neighbour ({})",
+            transport.name()
+        )
+    })?;
     let fast: Vec<&str> = names[1..].iter().map(String::as_str).collect();
     let c = p.neighbour_concurrency;
 
@@ -327,7 +392,11 @@ pub async fn idle_rss(ctx: &Ctx) -> Result<IdleRss> {
         })
         .collect();
     let dir = tempfile::tempdir()?;
-    let mut gateway = Gateway::start(&ctx.mcpdef, dir.path(), &upstreams, true, &ctx.client)
+    let console = Features {
+        console: true,
+        ..Features::default()
+    };
+    let mut gateway = Gateway::start(&ctx.mcpdef, dir.path(), &upstreams, console, &ctx.client)
         .await
         .context("starting the gateway for idle-rss")?;
 

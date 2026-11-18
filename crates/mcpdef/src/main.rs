@@ -13,6 +13,10 @@
 //!   mcpdef tools list   --config mcpdef.toml [--cost]   the tools the gateway lists, or their cost
 //!   mcpdef audit verify [--path F] [--head H --count N]   offline hash-chain check
 //!   mcpdef audit tail   [--path F] [-n N] [--format json|ocsf|cef|syslog]
+//!   mcpdef bundle sign  --config F --key K --revision N [--out F]   a config, signed, as a bundle
+//!   mcpdef bundle apply <bundle> --trust KEYS [--config F]   check one, then put its config in place
+//!   mcpdef up --bundle-trust KEYS            run only a config the signed bundle beside it holds
+//!   mcpdef filter       --config mcpdef.toml [--bundle-trust KEYS]   answer a proxy's ext_authz checks
 //!   mcpdef egress show  --config mcpdef.toml   the egress (SSRF) policy for HTTP upstreams
 //!   mcpdef pin          --config mcpdef.toml   approve the upstreams' current tool definitions
 //!   mcpdef diff-tools   --config mcpdef.toml   compare them to the pins; non-zero on a change
@@ -28,6 +32,7 @@ use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use clap::{Parser, Subcommand};
 use mcpdef::bridge::Bridge;
+use mcpdef::bundle;
 use mcpdef::clients::{self, Ask, Client, Target, Wrote};
 use mcpdef::config::{
     AuthConfig, AuthMethod, AuthRequire, CertIdentity, ClientAuthConfig, ListenerTlsConfig,
@@ -35,6 +40,7 @@ use mcpdef::config::{
 };
 use mcpdef::connect::{build_gateway, examine, opener, tool_findings, warn};
 use mcpdef::doctor::{self, Finding, Mark, Section};
+use mcpdef::import;
 use mcpdef::listener::{
     serve_http_on, serve_https_on, serve_proxied_on, AuthState, Fetching, JwksRefresher,
 };
@@ -46,11 +52,12 @@ use mcpdef::{
     list_tools_speaking, serve_admin_on, serve_stdio, AdminState, Config, HealthState, HttpConfig,
     Metrics, ToolCost,
 };
+use mcpdef_audit::receipt::{self, Keys, SigningKey};
 use mcpdef_audit::{tail, verify, verify_against, ExportFormat};
 use mcpdef_auth::Verifier;
 use mcpdef_core::wire::{WireMode, KNOWN_SPEC_VERSIONS};
 use mcpdef_core::{method, Id, Message};
-use mcpdef_pin::{tool_hash, DiffKind, PinStore};
+use mcpdef_pin::{tool_hash, DiffKind, Judgement, PinStore};
 use mcpdef_transport::{
     rfc3339, CertificateNames, MinVersion, PeerCertificate, Roots, TlsSettings, Verification,
 };
@@ -85,15 +92,48 @@ enum Cmd {
         /// `[gateway] listen`) instead of stdio.
         #[arg(long)]
         http: bool,
+        #[command(flatten)]
+        lock: BundleLock,
     },
     /// Bring the gateway up on the Streamable HTTP listener — shorthand for
     /// `mcpdef run --http` (the shared-gateway shape: one endpoint, govern centrally).
     Up {
-        #[arg(long, default_value = "mcpdef.toml")]
-        config: PathBuf,
+        /// The config to run [default: mcpdef.toml]. With none given and no
+        /// mcpdef.toml here, one is written first from the MCP servers this
+        /// machine's clients run, as `mcpdef import` writes it, unless
+        /// --bundle-trust is given.
+        #[arg(long)]
+        config: Option<PathBuf>,
         /// Override the active gateway profile for this run (e.g. `--profile readonly`).
         #[arg(long)]
         profile: Option<String>,
+        #[command(flatten)]
+        lock: BundleLock,
+    },
+    /// Write the gateway config that fronts the MCP servers this machine's
+    /// clients already run, read from the clients' own config files. None of
+    /// those files is changed. Every tool, resource and prompt is let through,
+    /// every call is audited, and inspection warns without blocking.
+    Import {
+        /// Read only this client's files: claude-code, claude-desktop, cursor,
+        /// vscode or codex. Repeatable; every client's when not given.
+        #[arg(long = "from")]
+        from: Vec<String>,
+        /// Write the config to this file, instead of printing it.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Replace the file --out names, if there is one.
+        #[arg(long, requires = "out")]
+        force: bool,
+        /// Where the gateway will listen. A client entry that already reaches
+        /// it is MCPdef itself, and is not fronted again.
+        #[arg(long, default_value = mcpdef::config::DEFAULT_LISTEN)]
+        listen: String,
+        /// Front the servers only this directory's own files name as well,
+        /// those no client was told to run here: a repository's `.mcp.json`,
+        /// `.cursor/mcp.json` or `.vscode/mcp.json`. Read what they run first.
+        #[arg(long)]
+        project_servers: bool,
     },
     /// Bridge a stdio MCP client to a remote MCPdef, or to any Streamable-HTTP
     /// MCP endpoint, with a private CA, a client certificate and a token file
@@ -161,6 +201,10 @@ enum Cmd {
         /// The file to merge into, in place of the client's usual one.
         #[arg(long, requires = "write")]
         file: Option<PathBuf>,
+        /// Also take out of that file each server the gateway fronts, the same
+        /// command or URL, so that the client reaches it through the gateway only.
+        #[arg(long, requires = "write")]
+        replace: bool,
     },
     /// Invoke a single governed tool through the gateway, print the result, and
     /// exit — a one-shot client for demos and scripts. The allowlist, profiles,
@@ -181,6 +225,34 @@ enum Cmd {
         /// Print the raw JSON-RPC result instead of just the text content.
         #[arg(long)]
         json: bool,
+    },
+    /// Judge one MCP tool call as an agent client's pre-tool-call hook, with
+    /// no proxy in the path: the client sends the call on standard input
+    /// before it makes it, and MCPdef answers on standard output and records
+    /// the decision in the config's ledger. `mcpdef hook install` sets a
+    /// client up to ask.
+    #[command(args_conflicts_with_subcommands = true)]
+    Hook {
+        #[command(subcommand)]
+        cmd: Option<HookCmd>,
+        #[arg(long, default_value = "mcpdef.toml")]
+        config: PathBuf,
+        /// The client whose hook this is: claude-code or codex.
+        #[arg(long, default_value = "claude-code")]
+        client: String,
+        #[command(flatten)]
+        lock: BundleLock,
+    },
+    /// Answer a proxy's checks, as Envoy's `ext_authz` filter makes them, with
+    /// the proxy routing MCP requests itself: each request it is about to
+    /// route is judged by the config, by the server its path names
+    /// (`filter_path`), and recorded in the config's ledger. Serves
+    /// `[gateway.filter] listen`.
+    Filter {
+        #[arg(long, default_value = "mcpdef.toml")]
+        config: PathBuf,
+        #[command(flatten)]
+        lock: BundleLock,
     },
     /// Validate a config file without starting the gateway.
     Validate {
@@ -220,6 +292,19 @@ enum Cmd {
         #[command(subcommand)]
         cmd: AuditCmd,
     },
+    /// Signed receipts: the ledger's tool calls as decision receipts that
+    /// anyone with the public key can check offline
+    /// (draft-farley-acta-signed-receipts-03).
+    Receipts {
+        #[command(subcommand)]
+        cmd: ReceiptsCmd,
+    },
+    /// Signed policy bundles: a config at a revision, signed, for a node to
+    /// check before it takes it, as one with no route out is given its policy.
+    Bundle {
+        #[command(subcommand)]
+        cmd: BundleCmd,
+    },
     /// Inspect the egress (SSRF) policy for HTTP upstreams.
     Egress {
         #[command(subcommand)]
@@ -232,7 +317,8 @@ enum Cmd {
         config: PathBuf,
     },
     /// Diff each upstream's current tool definitions against the pin store
-    /// (read-only); exits non-zero if any pinned tool changed (a rug-pull).
+    /// (read-only), grading each change; exits non-zero if a pinned tool
+    /// changed in a way the gateway would hold (a possible rug-pull).
     DiffTools {
         #[arg(long, default_value = "mcpdef.toml")]
         config: PathBuf,
@@ -486,11 +572,179 @@ enum AuditCmd {
         /// How many trailing records to print.
         #[arg(short = 'n', long = "lines", default_value_t = 20)]
         lines: usize,
-        /// Output format: json (default), ocsf, cef, or syslog.
+        /// Output format: json (default), ocsf, cef, syslog, or otlp.
         #[arg(long, default_value = "json")]
         format: String,
     },
 }
+
+#[derive(Subcommand)]
+enum HookCmd {
+    /// Print the hook a client needs to ask MCPdef before each MCP tool call,
+    /// or merge it into the client's settings.
+    Install {
+        #[arg(long, default_value = "mcpdef.toml")]
+        config: PathBuf,
+        /// The client: claude-code or codex.
+        #[arg(long, default_value = "claude-code")]
+        client: String,
+        /// Seconds the client waits for the hook before giving up on it. Both
+        /// clients wait 600 for a hook that names none.
+        #[arg(long, default_value_t = mcpdef::hook::DEFAULT_TIMEOUT_SECS,
+              value_parser = clap::value_parser!(u32).range(1..=600))]
+        timeout: u32,
+        /// Merge the hook into the client's settings, keeping a `.bak` of them.
+        #[arg(long)]
+        write: bool,
+        /// The settings to merge into, in place of the project's own:
+        /// `.claude/settings.local.json` for Claude Code, `.codex/hooks.json`
+        /// for Codex.
+        #[arg(long, requires = "write")]
+        file: Option<PathBuf>,
+        /// Have the hook judge only by a config the signed bundle beside it
+        /// holds, as `mcpdef hook --bundle-trust` does: the keys a bundle may
+        /// be signed with. The bundle must hold the config now.
+        #[arg(long, value_name = "KEYS")]
+        bundle_trust: Option<PathBuf>,
+    },
+}
+
+/// `--bundle-trust`, on `run`, `up`, `filter` and `hook`.
+#[derive(clap::Args)]
+struct BundleLock {
+    /// Run only a config the signed bundle beside it holds: the keys a bundle
+    /// may be signed with, as a JWK Set or one JWK. Each time the config is
+    /// read, at the start, at each reload of a gateway and at each call a
+    /// hook judges, it checks the bundle `mcpdef bundle apply` keeps beside
+    /// the config (mcpdef.toml.bundle), and refuses a config it does not
+    /// hold, or one older than the last this node ran. Keep the keys where
+    /// whoever may write the config may not.
+    #[arg(long, env = "MCPDEF_BUNDLE_TRUST", value_name = "KEYS")]
+    bundle_trust: Option<PathBuf>,
+}
+
+#[derive(Subcommand)]
+enum BundleCmd {
+    /// Make an Ed25519 key to sign bundles with, as a private JWK file only
+    /// its owner can read. A file that is there is never replaced.
+    Key {
+        #[arg(long, default_value = "mcpdef-bundle.jwk")]
+        out: PathBuf,
+    },
+    /// Print a key's public half as a JWK Set: what each node is given to
+    /// trust.
+    Jwks {
+        /// The private JWK file `mcpdef bundle key` wrote.
+        #[arg(long)]
+        key: PathBuf,
+    },
+    /// Check a config, then sign it at a revision as a bundle.
+    Sign {
+        #[arg(long, default_value = "mcpdef.toml")]
+        config: PathBuf,
+        /// The private JWK file `mcpdef bundle key` wrote.
+        #[arg(long)]
+        key: PathBuf,
+        /// Higher than any revision a node has applied: a node takes no
+        /// bundle older than its last.
+        #[arg(long)]
+        revision: u64,
+        #[arg(long, default_value = "mcpdef.bundle")]
+        out: PathBuf,
+        /// Replace the --out file if it is there.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Check a bundle against keys you trust, and say what it holds.
+    Verify {
+        bundle: PathBuf,
+        /// The keys a bundle may be signed with, as a JWK Set or one JWK,
+        /// got from somewhere other than the bundle.
+        #[arg(long)]
+        trust: PathBuf,
+        /// Write the config it holds to this file, to read before applying it.
+        #[arg(long)]
+        config_out: Option<PathBuf>,
+    },
+    /// Check a bundle against keys you trust and, if it is newer than the
+    /// last this node applied, put its config in place, and record it in the
+    /// ledger. A running gateway takes it at its next reload.
+    Apply {
+        bundle: PathBuf,
+        /// The keys a bundle may be signed with, as a JWK Set or one JWK.
+        #[arg(long)]
+        trust: PathBuf,
+        /// The config the bundle's takes the place of.
+        #[arg(long, default_value = "mcpdef.toml")]
+        config: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReceiptsCmd {
+    /// Make an Ed25519 key to sign receipts with, as a private JWK file only
+    /// its owner can read. A file that is there is never replaced.
+    Key {
+        #[arg(long, default_value = "mcpdef-receipts.jwk")]
+        out: PathBuf,
+    },
+    /// Print a key's public half as a JWK Set, to publish where whoever
+    /// checks receipts can fetch it.
+    Jwks {
+        /// The private JWK file `mcpdef receipts key` wrote.
+        #[arg(long)]
+        key: PathBuf,
+    },
+    /// Sign the ledger's tool calls as receipts, one JSON line each, after
+    /// checking its chain (and, with --head and --count, a seal).
+    Export {
+        /// The private JWK file `mcpdef receipts key` wrote.
+        #[arg(long)]
+        key: PathBuf,
+        /// Ledger file. Overrides the audit path from --config.
+        #[arg(long)]
+        path: Option<PathBuf>,
+        #[arg(long, default_value = "mcpdef.toml")]
+        config: PathBuf,
+        /// Expected head hash sealed out-of-band (use with --count).
+        #[arg(long, requires = "count")]
+        head: Option<String>,
+        /// Expected record count sealed out-of-band (use with --head).
+        #[arg(long, requires = "head")]
+        count: Option<u64>,
+        /// Write the receipts to this file, not to standard output.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Replace the --out file if it is there.
+        #[arg(long, requires = "out")]
+        force: bool,
+    },
+    /// Check receipts offline against public keys you trust: each one's
+    /// signature, issuer and link to the one before. With --last and
+    /// --count, also that none were taken off the end.
+    Verify {
+        /// The receipts, one JSON object per line.
+        receipts: PathBuf,
+        /// The issuer's public keys, as a JWK Set or one JWK, got from
+        /// somewhere other than the receipts.
+        #[arg(long)]
+        jwks: PathBuf,
+        /// The last receipt's hash, recorded somewhere else (use with --count).
+        #[arg(long, requires = "count")]
+        last: Option<String>,
+        /// How many receipts there were, recorded with --last.
+        #[arg(long, requires = "last")]
+        count: Option<u64>,
+    },
+}
+
+/// A static musl build, which the release tarballs and the container image
+/// carry, allocates with mimalloc. With musl's own allocator, an allowed call
+/// took 30–80 µs longer at the median, and sixteen clients got half as many
+/// calls a second through (docs/PERFORMANCE.md). Other builds keep the system's.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -545,8 +799,34 @@ async fn run(cmd: Cmd) -> Result<()> {
             config,
             profile,
             http,
-        } => cmd_run(&config, profile, http).await,
-        Cmd::Up { config, profile } => cmd_run(&config, profile, true).await,
+            lock,
+        } => cmd_run(&config, profile, http, lock.bundle_trust.as_deref()).await,
+        Cmd::Up {
+            config,
+            profile,
+            lock,
+        } => {
+            let config = match (config, &lock.bundle_trust) {
+                (Some(path), _) => path,
+                // One written now no bundle holds: it would not run.
+                (None, Some(_)) => PathBuf::from("mcpdef.toml"),
+                (None, None) => up_config()?,
+            };
+            cmd_run(&config, profile, true, lock.bundle_trust.as_deref()).await
+        }
+        Cmd::Import {
+            from,
+            out,
+            force,
+            listen,
+            project_servers,
+        } => {
+            let projects = match project_servers {
+                true => import::Projects::All,
+                false => import::Projects::Approved,
+            };
+            cmd_import(&from, out.as_deref(), force, &listen, projects)
+        }
         Cmd::Bridge {
             url,
             ca,
@@ -587,6 +867,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             key,
             write,
             file,
+            replace,
         } => cmd_connect(
             &client,
             &config,
@@ -601,6 +882,7 @@ async fn run(cmd: Cmd) -> Result<()> {
             },
             write,
             file,
+            replace,
         ),
         Cmd::Call {
             config,
@@ -609,6 +891,32 @@ async fn run(cmd: Cmd) -> Result<()> {
             args,
             json,
         } => cmd_call(&config, profile, &tool, &args, json).await,
+        Cmd::Hook {
+            cmd: None,
+            config,
+            client,
+            lock,
+        } => cmd_hook(&config, &client, lock.bundle_trust.as_deref()),
+        Cmd::Hook {
+            cmd:
+                Some(HookCmd::Install {
+                    config,
+                    client,
+                    timeout,
+                    write,
+                    file,
+                    bundle_trust,
+                }),
+            ..
+        } => cmd_hook_install(
+            &config,
+            &client,
+            timeout,
+            write,
+            file.as_deref(),
+            bundle_trust.as_deref(),
+        ),
+        Cmd::Filter { config, lock } => cmd_filter(&config, lock.bundle_trust.as_deref()).await,
         Cmd::Servers {
             cmd: ServersCmd::List { config },
         } => cmd_servers_list(&config),
@@ -621,6 +929,8 @@ async fn run(cmd: Cmd) -> Result<()> {
                 },
         } => cmd_tools_list(&config, profile, cost).await,
         Cmd::Audit { cmd } => cmd_audit(cmd),
+        Cmd::Receipts { cmd } => cmd_receipts(cmd),
+        Cmd::Bundle { cmd } => cmd_bundle(cmd),
         Cmd::Egress {
             cmd: EgressCmd::Show { config },
         } => cmd_egress_show(&config),
@@ -651,7 +961,7 @@ async fn run(cmd: Cmd) -> Result<()> {
 }
 
 /// Connect every upstream, collecting each server's `tool name → hash` map.
-async fn collect_tool_hashes(cfg: &Config) -> Result<Vec<(String, BTreeMap<String, String>)>> {
+async fn collect_tools(cfg: &Config) -> Result<Vec<(String, BTreeMap<String, serde_json::Value>)>> {
     warn(cfg);
     let mut out = Vec::new();
     for s in &cfg.servers {
@@ -660,9 +970,9 @@ async fn collect_tool_hashes(cfg: &Config) -> Result<Vec<(String, BTreeMap<Strin
             .await
             .with_context(|| format!("listing tools for upstream '{}'", s.id))?;
         let mut map = BTreeMap::new();
-        for t in &tools {
+        for t in tools {
             if let Some(name) = t.get("name").and_then(|n| n.as_str()) {
-                map.insert(name.to_string(), tool_hash(t));
+                map.insert(name.to_string(), t.clone());
             }
         }
         let _ = transport.close().await;
@@ -681,9 +991,10 @@ async fn cmd_pin(path: &Path) -> Result<()> {
         )?;
     let mut store = PinStore::load(&pins_path).with_context(|| format!("loading {pins_path}"))?;
     let mut recorded = 0usize;
-    for (server, tools) in collect_tool_hashes(&cfg).await? {
-        for (tool, hash) in tools {
-            store.record(&server, &tool, hash);
+    for (server, tools) in collect_tools(&cfg).await? {
+        for tool in tools.values() {
+            // With its definition, so that its next change is graded.
+            store.record_tool(&server, tool);
             recorded += 1;
         }
     }
@@ -697,36 +1008,66 @@ async fn cmd_pin(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `mcpdef diff-tools` — compare current tool definitions against the pins; exit
-/// non-zero if any pinned tool's definition changed (a suspected rug-pull).
+/// `mcpdef diff-tools` — compare current tool definitions against the pins,
+/// each change graded; exit non-zero if a pinned tool's definition changed in
+/// a way the gateway would hold: worse than `[gateway] pin_accept`, or
+/// ungraded (a suspected rug-pull).
 async fn cmd_diff_tools(path: &Path) -> Result<()> {
     let cfg = Config::load(path)?;
     let pins_path = cfg.gateway.pins.clone().context(
         "`mcpdef diff-tools` needs a pin store: set `[gateway] pins = \"…\"` (run `mcpdef pin` first)",
     )?;
     let store = PinStore::load(&pins_path).with_context(|| format!("loading {pins_path}"))?;
-    let mut rug_pull = false;
-    for (server, current) in collect_tool_hashes(&cfg).await? {
+    let accept = cfg.gateway.pin_accept.severity();
+    let mut held = 0usize;
+    for (server, tools) in collect_tools(&cfg).await? {
+        let current: BTreeMap<String, String> = tools
+            .iter()
+            .map(|(name, t)| (name.clone(), tool_hash(t)))
+            .collect();
         let diff = store.diff(&server, &current);
         if diff.is_empty() {
             println!("{server}: ok · {} tool(s) match pins", current.len());
             continue;
         }
         for d in &diff {
-            let mark = match d.kind {
-                DiffKind::Added => "+ added   (new, unpinned)",
-                DiffKind::Removed => "- removed (was pinned)",
-                DiffKind::Changed => "~ CHANGED (rug-pull!)",
+            let (mark, lines) = match d.kind {
+                DiffKind::Added => ("+ added   (new, unpinned)".to_string(), Vec::new()),
+                DiffKind::Removed => ("- removed (was pinned)".to_string(), Vec::new()),
+                DiffKind::Changed => match tools.get(&d.tool).map(|t| store.judge(&server, t)) {
+                    Some(Judgement::Drift(Some(grading))) if grading.severity <= accept => (
+                        format!(
+                            "~ changed, {}: within [gateway] pin_accept, the gateway pins it again",
+                            grading.severity
+                        ),
+                        grading.lines(20),
+                    ),
+                    Some(Judgement::Drift(Some(grading))) => {
+                        held += 1;
+                        (
+                            format!("~ CHANGED, {} (held: possible rug-pull)", grading.severity),
+                            grading.lines(20),
+                        )
+                    }
+                    _ => {
+                        held += 1;
+                        (
+                            "~ CHANGED, ungraded (held: possible rug-pull)".to_string(),
+                            vec!["its pin holds the hash alone: `mcpdef pin` keeps the definition, so the next change is graded".to_string()],
+                        )
+                    }
+                },
             };
-            if matches!(d.kind, DiffKind::Changed) {
-                rug_pull = true;
-            }
             println!("{server}: {mark}  {}", d.tool);
+            for line in lines {
+                println!("    {line}");
+            }
         }
     }
-    if rug_pull {
+    if held > 0 {
         anyhow::bail!(
-            "a pinned tool definition changed (possible rug-pull); review above, then `mcpdef pin` to re-approve"
+            "{held} pinned tool definition(s) changed in a way the gateway holds (possible rug-pull); \
+             review above, then `mcpdef pin` to re-approve"
         );
     }
     Ok(())
@@ -1411,6 +1752,151 @@ async fn cmd_bridge(bridge: Bridge, print_config: bool) -> Result<()> {
 }
 
 /// `mcpdef connect` — see [`mcpdef::clients`].
+/// The user's home directory, if there is one.
+fn home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+}
+
+/// `mcpdef import`: the config that fronts what the clients run, printed or
+/// written.
+fn cmd_import(
+    from: &[String],
+    out: Option<&Path>,
+    force: bool,
+    listen: &str,
+    projects: import::Projects,
+) -> Result<()> {
+    let clients = from
+        .iter()
+        .map(|c| c.parse::<Client>())
+        .collect::<Result<Vec<_>>>()?;
+    let found = import::discover(
+        home().as_deref(),
+        &std::env::current_dir()?,
+        &clients,
+        listen,
+        projects,
+    );
+    tell_found(&found);
+    if found.found.is_empty() {
+        anyhow::bail!("no MCP server to front was found in any client's config");
+    }
+    let text = import::render(&found, listen);
+    match out {
+        None => print!("{text}"),
+        Some(path) => {
+            write_imported(path, &text, force)?;
+            eprintln!("mcpdef: wrote {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+/// `mcpdef up` with no `--config`: `mcpdef.toml` here, and when there is none,
+/// one written first from what the clients run. A server only this directory's
+/// own files name is not started unless a client was told to run it here.
+fn up_config() -> Result<PathBuf> {
+    let path = PathBuf::from("mcpdef.toml");
+    if path.exists() {
+        return Ok(path);
+    }
+    let listen = mcpdef::config::DEFAULT_LISTEN;
+    let found = import::discover(
+        home().as_deref(),
+        &std::env::current_dir()?,
+        &[],
+        listen,
+        import::Projects::Approved,
+    );
+    if found.found.is_empty() {
+        tell_found(&found);
+        anyhow::bail!(
+            "there is no mcpdef.toml here, and no MCP server in any client's config to front: \
+             write one (mcpdef.example.toml is a start), or give --config"
+        );
+    }
+    eprintln!(
+        "mcpdef: there is no mcpdef.toml here, so one is written from what your clients run:"
+    );
+    tell_found(&found);
+    write_imported(&path, &import::render(&found, listen), false)?;
+    eprintln!(
+        "mcpdef: wrote mcpdef.toml. Point a client at the gateway with \
+         `mcpdef connect <client> --write --replace`: it also takes the servers the gateway \
+         fronts out of the file it writes, so that the client does not see their tools twice, \
+         and names any it still has in another file"
+    );
+    Ok(path)
+}
+
+/// What a search of the clients' files found, on stderr. What a client's file
+/// holds is written with its control characters escaped: none reaches the
+/// terminal as one.
+fn tell_found(found: &import::Discovered) {
+    use import::one_line;
+    for f in &found.found {
+        let what = match &f.server {
+            import::Server::Stdio { command, .. } => command.join(" "),
+            import::Server::Http { url, .. } => url.clone(),
+        };
+        let from: Vec<_> = f.sources.iter().map(|s| s.client.title()).collect();
+        eprintln!(
+            "  {}: {} (from {})",
+            one_line(&f.name),
+            one_line(&what),
+            from.join(", ")
+        );
+    }
+    for s in &found.skipped {
+        eprintln!(
+            "  not fronted: {}, from {}: {}",
+            one_line(&s.name),
+            one_line(&s.source.describe()),
+            one_line(&s.why)
+        );
+    }
+    for u in &found.unread {
+        eprintln!("  could not read {}: {}", u.source.shown, one_line(&u.why));
+    }
+}
+
+/// Write a config `mcpdef import` made: never over a file unless `force`, and
+/// readable by its owner alone, a file it replaces included. A value a client
+/// wrote in can be anywhere in it, in a server's arguments or its URL as well.
+fn write_imported(path: &Path, text: &str, force: bool) -> Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    if force {
+        options.create(true).truncate(true);
+    } else {
+        options.create_new(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).with_context(|| match force {
+        true => format!("writing {}", path.display()),
+        false => format!(
+            "writing {} (give --force to replace a file that is there)",
+            path.display()
+        ),
+    })?;
+    // A mode given at opening applies to a file it creates, not one it replaces.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restricting {}", path.display()))?;
+    }
+    file.write_all(text.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))
+}
+
 fn cmd_connect(
     client: &str,
     config: &Path,
@@ -1418,6 +1904,7 @@ fn cmd_connect(
     ask: Ask,
     write: bool,
     file: Option<PathBuf>,
+    replace: bool,
 ) -> Result<()> {
     let client: Client = client.parse()?;
     let cfg = Config::load(config)?;
@@ -1439,7 +1926,22 @@ fn cmd_connect(
             client.name()
         )
     })?;
-    match clients::write(&entry, &file)? {
+    // The servers the gateway fronts now, read from the file as import reads it.
+    let fronted: Vec<String> = match replace {
+        false => Vec::new(),
+        true => {
+            let root = match entry.format {
+                clients::Format::Json { root } => root,
+                clients::Format::Toml => "mcp_servers",
+            };
+            import::servers_in(client, &file, root, &cfg.gateway.listen)?
+                .into_iter()
+                .filter(|(name, server)| *name != entry.name && import::fronts(&cfg, server))
+                .map(|(name, _)| name)
+                .collect()
+        }
+    };
+    match clients::write_replacing(&entry, &file, &fronted)? {
         Wrote::Created => println!("wrote {} with the '{}' entry", file.display(), entry.name),
         Wrote::Updated { backup } => println!(
             "updated '{}' in {}; what it held before is in {}",
@@ -1452,6 +1954,29 @@ fn cmd_connect(
             file.display(),
             entry.name
         ),
+    }
+    if replace {
+        match fronted.as_slice() {
+            [] => println!(
+                "nothing else in {} is a server the gateway fronts",
+                file.display()
+            ),
+            names => println!(
+                "took {} out of {}: the client reaches {} through the gateway now",
+                names.join(", "),
+                file.display(),
+                if names.len() == 1 { "it" } else { "them" }
+            ),
+        }
+        // The client reads other files too, which `--replace` leaves alone.
+        let cwd = std::env::current_dir()?;
+        for (name, shown) in import::fronted_elsewhere(client, home.as_deref(), &cwd, &file, &cfg) {
+            println!(
+                "{} is in {shown} too, which this does not change: take it out there as well, \
+                 or the client sees its tools twice",
+                import::one_line(&name)
+            );
+        }
     }
     // What the entry cannot carry still has to be done: trusting the CA,
     // signing in.
@@ -1985,12 +2510,385 @@ fn cmd_audit(cmd: AuditCmd) -> Result<()> {
             })?;
             let records =
                 tail(&ledger, lines).with_context(|| format!("reading {}", ledger.display()))?;
-            for rec in &records {
-                println!("{}", rec.export(fmt));
+            for line in records.iter().filter_map(|rec| rec.export(fmt)) {
+                println!("{line}");
             }
             Ok(())
         }
     }
+}
+
+/// `mcpdef receipts`.
+fn cmd_receipts(cmd: ReceiptsCmd) -> Result<()> {
+    match cmd {
+        ReceiptsCmd::Key { out } => {
+            let jwk = SigningKey::generate()?;
+            let key = SigningKey::from_jwk(&jwk)?;
+            write_key(&out, &jwk)?;
+            eprintln!(
+                "wrote {path}: the key receipts are signed with, named {kid}. Keep it to yourself: \
+                 whoever holds it can sign receipts. Publish its public half, `mcpdef receipts \
+                 jwks --key {path}`, where whoever checks them can fetch it",
+                path = out.display(),
+                kid = key.kid(),
+            );
+            Ok(())
+        }
+        ReceiptsCmd::Jwks { key } => {
+            let key = receipt_key(&key)?;
+            println!("{}", serde_json::to_string_pretty(&key.jwks())?);
+            Ok(())
+        }
+        ReceiptsCmd::Export {
+            key,
+            path,
+            config,
+            head,
+            count,
+            out,
+            force,
+        } => {
+            let key = receipt_key(&key)?;
+            let ledger = resolve_audit_path(path, &config)?;
+            let seal = head.as_deref().zip(count);
+            let done = match &out {
+                Some(file) => export_to(file, force, |w| receipt::export(&ledger, &key, seal, w)),
+                None => spool_to_stdout(|w| receipt::export(&ledger, &key, seal, w)),
+            }
+            .with_context(|| format!("signing {}: no receipt was written", ledger.display()))?;
+            eprintln!(
+                "signed {} receipt(s), for the tool calls among {} record(s) · ledger head={}",
+                done.receipts, done.records, done.head
+            );
+            if let Some(last) = &done.last {
+                eprintln!(
+                    "record the last receipt's hash and the count somewhere else, so that a later \
+                     check finds any taken off the end: `mcpdef receipts verify <receipts> --jwks \
+                     <keys> --last {last} --count {}`",
+                    done.receipts
+                );
+            }
+            Ok(())
+        }
+        ReceiptsCmd::Verify {
+            receipts,
+            jwks,
+            last,
+            count,
+        } => {
+            let text = std::fs::read_to_string(&jwks)
+                .with_context(|| format!("reading {}", jwks.display()))?;
+            let keys = Keys::from_jwks(&text)
+                .with_context(|| format!("reading the keys in {}", jwks.display()))?;
+            let file = std::fs::File::open(&receipts)
+                .with_context(|| format!("reading {}", receipts.display()))?;
+            let checked = receipt::verify(std::io::BufReader::new(file), &keys)
+                .with_context(|| format!("reading {}", receipts.display()))?;
+            if let Some((line, why)) = &checked.broken {
+                eprintln!(
+                    "receipts BROKEN at line {line}: {why} · {} receipt(s) before it verified",
+                    checked.receipts
+                );
+                anyhow::bail!("{} failed verification", receipts.display());
+            }
+            let ends = checked.last.as_deref().unwrap_or("(none)");
+            if let (Some(last), Some(count)) = (&last, count) {
+                if !checked.matches(last, count) {
+                    eprintln!(
+                        "receipts do NOT match the seal: {} receipt(s) ending at {ends}, and the \
+                         seal says {count} ending at {last}",
+                        checked.receipts
+                    );
+                    anyhow::bail!("{} failed verification", receipts.display());
+                }
+            }
+            println!(
+                "receipts OK · {} receipt(s) · {} chain(s) · last={ends}",
+                checked.receipts, checked.chains
+            );
+            if checked.starts_mid_chain {
+                eprintln!(
+                    "the first receipt links to one before it that is not in {}: these start in \
+                     the middle of a chain, or its first receipts were taken off",
+                    receipts.display()
+                );
+            }
+            if last.is_none() {
+                eprintln!(
+                    "this finds a receipt changed, taken out or moved, not one taken off the end: \
+                     give --last and --count from a seal recorded somewhere else to check that too"
+                );
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The receipt key a private JWK file holds. A file others can read is
+/// named: whoever reads it can sign receipts.
+fn receipt_key(path: &Path) -> Result<SigningKey> {
+    signing_key(path, "receipts", "a receipt key")
+}
+
+/// The key a private JWK file holds, that signs `signs`. A file others can
+/// read is named: whoever reads it can sign them.
+fn signing_key(path: &Path, signs: &str, is: &str) -> Result<SigningKey> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o077 != 0) {
+            eprintln!(
+                "mcpdef: warning: others than its owner can read {}, and whoever reads it can sign \
+                 {signs} (chmod 600 it)",
+                path.display()
+            );
+        }
+    }
+    SigningKey::from_jwk(&text).with_context(|| format!("{} is not {is}", path.display()))
+}
+
+/// `mcpdef bundle`.
+fn cmd_bundle(cmd: BundleCmd) -> Result<()> {
+    match cmd {
+        BundleCmd::Key { out } => {
+            let jwk = SigningKey::generate_named(bundle::KID_PREFIX)?;
+            let key = SigningKey::from_jwk(&jwk)?;
+            write_key(&out, &jwk)?;
+            eprintln!(
+                "wrote {path}: the key bundles are signed with, named {kid}. Keep it off the \
+                 nodes: whoever holds it can sign their policy. Give each node its public half, \
+                 `mcpdef bundle jwks --key {path}`, to trust",
+                path = out.display(),
+                kid = key.kid(),
+            );
+            Ok(())
+        }
+        BundleCmd::Jwks { key } => {
+            let key = signing_key(&key, "bundles", "a bundle key")?;
+            println!("{}", serde_json::to_string_pretty(&key.jwks())?);
+            Ok(())
+        }
+        BundleCmd::Sign {
+            config,
+            key,
+            revision,
+            out,
+            force,
+        } => {
+            let text = std::fs::read_to_string(&config)
+                .with_context(|| format!("reading {}", config.display()))?;
+            let cfg = Config::parse(&text)
+                .with_context(|| format!("parsing TOML {}", config.display()))?;
+            let checked = cfg.check(false);
+            if !checked.errors.is_empty() {
+                for e in &checked.errors {
+                    eprintln!("  ✗ {e}");
+                }
+                anyhow::bail!(
+                    "{} validation error(s) in {}: a node would refuse it, so it is not signed",
+                    checked.errors.len(),
+                    config.display()
+                );
+            }
+            let key = signing_key(&key, "bundles", "a bundle key")?;
+            let signed = bundle::sign(&text, revision, &bundle::now(), &key)?;
+            write_new(&out, force, &signed)?;
+            println!(
+                "signed {} as revision {revision}, with {}: {} · config {}",
+                config.display(),
+                key.kid(),
+                out.display(),
+                bundle::sha256(text.as_bytes()),
+            );
+            Ok(())
+        }
+        BundleCmd::Verify {
+            bundle: path,
+            trust,
+            config_out,
+        } => {
+            let keys = trusted(&trust)?;
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            let opened = bundle::open(&text, &keys)
+                .with_context(|| format!("{} failed verification", path.display()))?;
+            if let Some(out) = &config_out {
+                write_new(out, false, &opened.config)?;
+            }
+            println!(
+                "bundle OK · revision {} · signed by {} · issued {} · config {}",
+                opened.revision,
+                opened.kid,
+                opened.issued_at,
+                opened.config_digest()
+            );
+            Ok(())
+        }
+        BundleCmd::Apply {
+            bundle: path,
+            trust,
+            config,
+        } => {
+            let keys = trusted(&trust)?;
+            match bundle::apply(&path, &keys, &config)? {
+                bundle::Applied::Applied { bundle, from } => {
+                    let over = match from {
+                        Some(from) if from == bundle.revision => {
+                            "again: what was in place was not this bundle's".to_string()
+                        }
+                        Some(from) => format!("over revision {from}"),
+                        None => "the first this node applied".to_string(),
+                    };
+                    println!(
+                        "applied revision {} ({over}), signed by {}, to {} · config {} · a \
+                         running gateway takes it at its next reload: `kill -HUP <pid>`, or \
+                         `[gateway] watch_config = true`",
+                        bundle.revision,
+                        bundle.kid,
+                        config.display(),
+                        bundle.config_digest()
+                    );
+                }
+                bundle::Applied::Already(bundle) => println!(
+                    "revision {} is the one this node applied last: {} is as it was",
+                    bundle.revision,
+                    config.display()
+                ),
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The keys a JWK Set file holds, to check a bundle with.
+fn trusted(path: &Path) -> Result<Keys> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    Keys::from_jwks(&text).with_context(|| format!("reading the keys in {}", path.display()))
+}
+
+/// Write `text` to `path` at once, and over a file that is there only with
+/// `force`.
+fn write_new(path: &Path, force: bool, text: &str) -> Result<()> {
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".mcpdef-bundle-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(std::fs::Permissions::from_mode(0o644));
+    }
+    let mut partial = builder
+        .tempfile_in(dir)
+        .with_context(|| format!("writing beside {}", path.display()))?;
+    partial
+        .write_all(text.as_bytes())
+        .and_then(|()| partial.as_file().sync_all())
+        .with_context(|| format!("writing beside {}", path.display()))?;
+    let placed = match force {
+        true => partial.persist(path),
+        false => partial.persist_noclobber(path),
+    };
+    placed.map_err(|e| e.error).with_context(|| match force {
+        true => format!("writing {}", path.display()),
+        false => format!(
+            "writing {} (give --force to replace a file that is there)",
+            path.display()
+        ),
+    })?;
+    Ok(())
+}
+
+/// Write a new receipt key, readable by its owner alone, and never over a
+/// file that is there: that may be the key earlier receipts were signed with.
+fn write_key(path: &Path, text: &str) -> Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).with_context(|| {
+        format!(
+            "writing {} (a file that is there is never replaced: give --out another name)",
+            path.display()
+        )
+    })?;
+    file.write_all(text.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))
+}
+
+/// What an export writes into: a file of its own, through a buffer.
+type Spool<'f> = std::io::BufWriter<&'f mut std::fs::File>;
+
+/// Run `write` into a new file beside `path`, under a name no one can guess,
+/// and move it into place only once `write` succeeds: no one reads half an
+/// export, nor one of a ledger that then failed. A file at `path` is replaced
+/// only with `force`, and not one that appears meanwhile.
+fn export_to<T>(
+    path: &Path,
+    force: bool,
+    write: impl FnOnce(&mut Spool<'_>) -> Result<T, receipt::ExportError>,
+) -> Result<T> {
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".mcpdef-receipts-");
+    // As `File::create` makes it: receipts are there to be passed on.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    let mut partial = builder
+        .tempfile_in(dir)
+        .with_context(|| format!("writing beside {}", path.display()))?;
+    let done = {
+        let mut out = std::io::BufWriter::new(partial.as_file_mut());
+        let done = write(&mut out)?;
+        out.flush()?;
+        done
+    };
+    partial.as_file().sync_all()?;
+    let placed = match force {
+        true => partial.persist(path),
+        false => partial.persist_noclobber(path),
+    };
+    placed.map_err(|e| e.error).with_context(|| match force {
+        true => format!("writing {}", path.display()),
+        false => format!(
+            "writing {} (give --force to replace a file that is there)",
+            path.display()
+        ),
+    })?;
+    Ok(done)
+}
+
+/// Run `write` into a file of its own, and copy it to standard output only
+/// once `write` succeeds: the receipts of a ledger that then fails reach no
+/// one.
+fn spool_to_stdout<T>(
+    write: impl FnOnce(&mut Spool<'_>) -> Result<T, receipt::ExportError>,
+) -> Result<T> {
+    use std::io::Seek as _;
+    let mut spool = tempfile::tempfile().context("making a file to hold the receipts")?;
+    let done = {
+        let mut out = std::io::BufWriter::new(&mut spool);
+        let done = write(&mut out)?;
+        out.flush()?;
+        done
+    };
+    spool.rewind()?;
+    std::io::copy(&mut spool, &mut std::io::stdout().lock())?;
+    Ok(done)
 }
 
 /// Resolve the ledger path: an explicit `--path` wins; otherwise take the audit
@@ -2029,12 +2927,74 @@ fn load_validated(path: &Path, profile_override: Option<String>) -> Result<Confi
 }
 
 /// [`load_validated`], and the [`Snapshot`] of what it read, which hot reload
-/// starts from.
-fn load_for_reload(path: &Path, profile_override: Option<String>) -> Result<(Config, Snapshot)> {
-    let (cfg, text) = Config::load_text(path)?;
+/// starts from. With `lock`, as [`load_held`] reads it.
+fn load_for_reload(
+    path: &Path,
+    profile_override: Option<String>,
+    lock: Option<&Keys>,
+) -> Result<(Config, Snapshot, Option<bundle::Bundle>)> {
+    let (cfg, text, held) = load_held(path, lock)?;
     // Taken before the gateway reads the files the config names.
     let snapshot = Snapshot::take(text.as_bytes(), &cfg);
-    Ok((validated(path, cfg, profile_override)?, snapshot))
+    Ok((validated(path, cfg, profile_override)?, snapshot, held))
+}
+
+/// The config at `path`, and its text. With `lock`, the keys `--bundle-trust`
+/// names, only a config the signed bundle beside it holds: that bundle is
+/// returned too, for the node's floor to be raised to once the config runs
+/// ([`raise_floor`]).
+fn load_held(path: &Path, lock: Option<&Keys>) -> Result<(Config, String, Option<bundle::Bundle>)> {
+    match lock {
+        None => {
+            let (cfg, text) = Config::load_text(path)?;
+            Ok((cfg, text, None))
+        }
+        Some(keys) => {
+            let admitted = bundle::admit(path, keys)?;
+            Ok((admitted.config, admitted.text, Some(admitted.bundle)))
+        }
+    }
+}
+
+/// Raise the node's floor to `held`, the bundle `cfg` came from, where it is
+/// lower. Call it once nothing is left that can stop the start: a start that
+/// failed leaves the floor where it was, as a reload refused does.
+fn raise_floor(path: &Path, cfg: &Config, held: &bundle::Bundle) -> Result<()> {
+    let state_dir = Path::new(&cfg.gateway.state_dir);
+    if bundle::holding(path, || bundle::raise(state_dir, held))? {
+        eprintln!(
+            "mcpdef: the bundle floor is now revision {}, in {}",
+            held.revision,
+            state_dir.join(bundle::FLOOR_FILE).display()
+        );
+    }
+    Ok(())
+}
+
+/// ` · bundle r<revision>`, for a ready line, under `--bundle-trust`.
+fn bundle_note(held: Option<&bundle::Bundle>) -> String {
+    held.map(|held| format!(" · bundle r{}", held.revision))
+        .unwrap_or_default()
+}
+
+/// The keys `--bundle-trust` names, for the config at `config`. Kept in the
+/// config's directory, they can be replaced by whoever can replace the
+/// config: said, not refused.
+fn bundle_keys(path: &Path, config: &Path) -> Result<Keys> {
+    let keys = trusted(path).context("--bundle-trust")?;
+    let dir = |file: &Path| match file.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.canonicalize().ok(),
+        _ => Path::new(".").canonicalize().ok(),
+    };
+    if dir(path).is_some_and(|d| Some(d) == dir(config)) {
+        eprintln!(
+            "mcpdef: warning — the keys --bundle-trust names, {}, are in the config's directory: \
+             whoever can replace the config there can replace them too. Keep them where only \
+             the service's own setup writes",
+            path.display()
+        );
+    }
+    Ok(keys)
 }
 
 fn validated(path: &Path, mut cfg: Config, profile_override: Option<String>) -> Result<Config> {
@@ -2054,6 +3014,265 @@ fn validated(path: &Path, mut cfg: Config, profile_override: Option<String>) -> 
         );
     }
     Ok(cfg)
+}
+
+/// `mcpdef hook`: one decision, for the hook `client` runs. The event comes on
+/// standard input. A call MCPdef allows, or that is not its to judge, gets
+/// no answer and exit status 0, and the client goes on as it would. A refusal
+/// exits with status 2, which blocks the call whatever else the client reads,
+/// with why on standard error and the client's answer on standard output.
+///
+/// Fail closed: an MCP tool call MCPdef cannot judge, its config unread say,
+/// is refused, and so is anything at all when the event, or the hook's own
+/// command line, does not read, or the hook panics. Any exit status other
+/// than 0 and 2 a client takes as the hook failing, and goes on with the call.
+/// With `bundle_trust`, a config the signed bundle beside it does not hold is
+/// one MCPdef cannot judge by: the call is refused, by the bundle's rule.
+fn cmd_hook(path: &Path, client: &str, bundle_trust: Option<&Path>) -> Result<()> {
+    use std::io::{Read as _, Write as _};
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic| {
+        report(panic);
+        std::process::exit(2);
+    }));
+    let Some(client) = mcpdef::hook::Client::parse(client) else {
+        refuse(&format!(
+            "MCPdef refused the call: its hook names an unknown --client {client:?}: {}",
+            mcpdef::hook::Client::NAMES
+        ));
+    };
+    let mut text = String::new();
+    let event = std::io::stdin()
+        .read_to_string(&mut text)
+        .map_err(anyhow::Error::from)
+        .and_then(|_| client.event(&text));
+    let event = match event {
+        Ok(event) => event,
+        Err(e) => refuse(&format!(
+            "MCPdef refused the call: its hook could not read it: {e:#}"
+        )),
+    };
+    let Some(call) = event.call() else {
+        return Ok(());
+    };
+    let verdict = match hook_config(path, bundle_trust) {
+        Ok(cfg) => {
+            let (verdict, recorded) = mcpdef::hook::decide(&cfg, client.name(), &call);
+            if let Some(Err(e)) = recorded {
+                eprintln!("mcpdef: the decision is not recorded: {e:#}");
+            }
+            verdict
+        }
+        // Not recorded: a ledger is a config's, and there is no config the
+        // hook may judge by.
+        Err(e) => match e.downcast_ref::<bundle::Refused>() {
+            Some(refused) => mcpdef::hook::Verdict::Denied {
+                rule: refused.rule().into(),
+                reason: format!(
+                    "--bundle-trust judges a call only by a config the signed bundle beside it \
+                     holds: {refused}"
+                ),
+            },
+            None => mcpdef::hook::Verdict::Denied {
+                rule: "config".into(),
+                reason: format!("{e:#}"),
+            },
+        },
+    };
+    let (Some(answer), Some(refusal)) = (client.answer(&event, &verdict), verdict.refusal()) else {
+        return Ok(());
+    };
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "{answer}").and_then(|()| out.flush());
+    refuse(&refusal)
+}
+
+/// End a hook with a refusal: `why` on standard error, as a client tells its
+/// agent, and exit status 2, which blocks the call.
+fn refuse(why: &str) -> ! {
+    eprintln!("{why}");
+    std::process::exit(2)
+}
+
+/// The config at `path`, checked as `mcpdef run` checks it, and its relative
+/// paths, the ledger's among them, read from its directory, as a gateway
+/// started there reads them: a hook runs in whatever directory its client
+/// does, and writes to the ledger the gateway would. With `bundle_trust`,
+/// only a config the signed bundle beside it holds, as `run` holds one: each
+/// call's hook reads the config afresh, as a gateway does as it starts, and
+/// raises the floor to that bundle where it is lower.
+fn hook_config(path: &Path, bundle_trust: Option<&Path>) -> Result<Config> {
+    // Named from where the hook runs, as the config is.
+    let keys = bundle_trust
+        .map(|keys| trusted(keys).context("its --bundle-trust keys do not read"))
+        .transpose()?;
+    let (path, cfg, held) = hook_read(path, keys.as_ref())
+        .with_context(|| format!("its config {} does not read", path.display()))?;
+    if let Some(held) = held {
+        let state_dir = Path::new(&cfg.gateway.state_dir);
+        bundle::holding(&path, || bundle::raise(state_dir, &held)).with_context(|| {
+            format!(
+                "the bundle floor is not raised to revision {}",
+                held.revision
+            )
+        })?;
+    }
+    Ok(cfg)
+}
+
+/// [`hook_config`]'s config, by its absolute path, read from its directory,
+/// and with `keys`, the bundle beside it that holds it.
+fn hook_read(
+    path: &Path,
+    keys: Option<&Keys>,
+) -> Result<(PathBuf, Config, Option<bundle::Bundle>)> {
+    let path = std::fs::canonicalize(path)
+        .with_context(|| format!("finding the config {}", path.display()))?;
+    if let Some(dir) = path.parent() {
+        std::env::set_current_dir(dir)
+            .with_context(|| format!("entering the config's directory {}", dir.display()))?;
+    }
+    let (cfg, _, held) = load_held(&path, keys)?;
+    let errors = cfg.check(false).errors;
+    if !errors.is_empty() {
+        anyhow::bail!("{}", errors.join("; "));
+    }
+    Ok((path, cfg, held))
+}
+
+/// `mcpdef hook install`: the hook `client` needs to ask MCPdef before each
+/// MCP tool call, printed, or merged into its settings with `--write`. With
+/// `bundle_trust`, a hook that judges only by a config the signed bundle
+/// beside it holds, as the bundle must now: a hook that would refuse every
+/// MCP call is not one to install.
+fn cmd_hook_install(
+    path: &Path,
+    client: &str,
+    timeout: u32,
+    write: bool,
+    file: Option<&Path>,
+    bundle_trust: Option<&Path>,
+) -> Result<()> {
+    let Some(client) = mcpdef::hook::Client::parse(client) else {
+        anyhow::bail!(
+            "unknown --client {client:?}: {}",
+            mcpdef::hook::Client::NAMES
+        );
+    };
+    let config = std::fs::canonicalize(path)
+        .with_context(|| format!("finding the config {}", path.display()))?;
+    let (cfg, lock) = match bundle_trust {
+        None => (load_validated(&config, None)?, None),
+        Some(keys) => {
+            let (keys, held, cfg) = hook_lock(keys, &config)?;
+            (validated(&config, cfg, None)?, Some((keys, held)))
+        }
+    };
+    let program = std::env::current_exe().context("finding this mcpdef")?;
+    let hook = client
+        .hook(
+            &program,
+            &config,
+            timeout,
+            lock.as_ref().map(|(keys, _)| keys.as_path()),
+        )
+        .map_err(|why| anyhow::anyhow!("no {} hook: {why}", client.title()))?;
+    if !write {
+        let held = lock.as_ref().map_or_else(String::new, |(_, held)| {
+            format!(
+                ", held to the signed bundle beside it, revision {}",
+                held.revision
+            )
+        });
+        println!("{}", serde_json::to_string_pretty(&hook)?);
+        eprintln!(
+            "the hook {} needs to ask MCPdef before each MCP tool call, for the {} server(s) in \
+             {}{held}. `--write` merges it into {}",
+            client.title(),
+            cfg.servers.len(),
+            config.display(),
+            file.map_or_else(
+                || client.settings().display().to_string(),
+                |f| f.display().to_string()
+            ),
+        );
+        return Ok(());
+    }
+    let target = file.map_or_else(|| client.settings(), Path::to_path_buf);
+    match mcpdef::hook::install(&hook, &target)? {
+        clients::Wrote::Unchanged => eprintln!("{} already asks MCPdef", target.display()),
+        clients::Wrote::Created => eprintln!("wrote {}", target.display()),
+        clients::Wrote::Updated { backup } => eprintln!(
+            "updated {}, the old one kept as {}",
+            target.display(),
+            backup.display()
+        ),
+    }
+    // The hook reads the config's relative paths from its directory.
+    let audit = Path::new(&cfg.gateway.audit);
+    let audit = audit.strip_prefix(".").unwrap_or(audit);
+    let ledger = config
+        .parent()
+        .map_or_else(|| audit.to_path_buf(), |dir| dir.join(audit));
+    eprintln!(
+        "{} now asks MCPdef before each MCP tool call: a server not in {} is refused. Its \
+         decisions go to {}",
+        client.title(),
+        config.display(),
+        ledger.display()
+    );
+    if let Some((_, held)) = &lock {
+        eprintln!(
+            "It judges by that config only while the signed bundle beside it holds it, revision \
+             {} now: a config changed by hand refuses every MCP call, until a bundle is applied. \
+             Whoever can edit {} can still take the hook out",
+            held.revision,
+            target.display()
+        );
+    }
+    if client == mcpdef::hook::Client::Codex {
+        // Without this, the hook looks installed and refuses nothing.
+        eprintln!(
+            "Codex runs a new or changed hook only once you trust it: open /hooks in Codex and \
+             trust this one. A project's .codex/hooks.json runs only in a trusted project. A \
+             hook that fails or times out does not stop the call in Codex"
+        );
+    }
+    Ok(())
+}
+
+/// What a hook of the config at `config`, held to its bundle, is installed
+/// with: the keys `--bundle-trust` names, by their absolute path, as it names
+/// the config, since it runs wherever its client does; the bundle beside the
+/// config, which must hold it now at a revision no lower than the floor, as
+/// the hook checks at each call; and the config that bundle holds.
+fn hook_lock(keys: &Path, config: &Path) -> Result<(PathBuf, bundle::Bundle, Config)> {
+    let keys = std::fs::canonicalize(keys)
+        .with_context(|| format!("finding the --bundle-trust keys {}", keys.display()))?;
+    let trusted = bundle_keys(&keys, config)?;
+    let refuses = |refused: bundle::Refused| {
+        anyhow::Error::new(refused).context(
+            "the hook would refuse every MCP call: --bundle-trust judges a call only by a \
+             config the signed bundle beside it holds",
+        )
+    };
+    let held = bundle::holding(config, || {
+        std::fs::read(config)
+            .with_context(|| format!("reading config {}", config.display()))
+            .map(|text| bundle::held(config, &text, &trusted).verdict)
+    })?
+    .map_err(refuses)?;
+    let cfg = Config::parse(&held.config)
+        .with_context(|| format!("parsing TOML {}", config.display()))?;
+    // The floor, from the config's directory, as the hook reads it.
+    let state_dir = Path::new(&cfg.gateway.state_dir);
+    let state_dir = config.parent().map_or_else(
+        || state_dir.to_path_buf(),
+        |dir| dir.join(state_dir.strip_prefix(".").unwrap_or(state_dir)),
+    );
+    let floor = bundle::highest_floor(&[state_dir])?;
+    bundle::admits(floor.as_ref(), &held).map_err(refuses)?;
+    Ok((keys, held, cfg))
 }
 
 /// `mcpdef call <tool>` — invoke one governed tool through the gateway and print
@@ -2142,8 +3361,16 @@ fn tool_result_text(resp: &Message) -> String {
     String::new()
 }
 
-async fn cmd_run(path: &Path, profile_override: Option<String>, http: bool) -> Result<()> {
-    let (cfg, snapshot) = load_for_reload(path, profile_override.clone())?;
+async fn cmd_run(
+    path: &Path,
+    profile_override: Option<String>,
+    http: bool,
+    bundle_trust: Option<&Path>,
+) -> Result<()> {
+    let keys = bundle_trust
+        .map(|keys| bundle_keys(keys, path))
+        .transpose()?;
+    let (cfg, snapshot, held) = load_for_reload(path, profile_override.clone(), keys.as_ref())?;
     // The listeners' TLS before anything starts: a certificate that does not
     // read fails the start, as it would a reload, and a local CA that
     // self-signed mode wants is made now, if there is none.
@@ -2221,6 +3448,24 @@ async fn cmd_run(path: &Path, profile_override: Option<String>, http: bool) -> R
     };
     // How the gateway's own fetches go out; a reload replaces it.
     let fetching = Arc::new(ArcSwap::from_pointee(Fetching::of(&cfg)));
+    // The spans of the records appended from here on, sent where
+    // `[gateway.otel]` says.
+    let otel_note = match &cfg.gateway.otel {
+        Some(otel) => {
+            let exporter = mcpdef::otel::Exporter::new(
+                otel,
+                PathBuf::from(&cfg.gateway.audit),
+                Arc::clone(&fetching),
+            );
+            let note = format!(" · spans to {}", exporter.shown());
+            let (written, _) = gw.audit_written();
+            exporter
+                .start(written.checked_sub(1), gw.audit_appends())
+                .with_context(|| format!("following the ledger {}", cfg.gateway.audit))?;
+            note
+        }
+        None => String::new(),
+    };
     // Build the OAuth 2.1 verifier (HTTP listener only). Done before printing the
     // ready line so a bad JWKS / blocked jwks_uri fails fast.
     let auth = if http {
@@ -2296,17 +3541,24 @@ async fn cmd_run(path: &Path, profile_override: Option<String>, http: bool) -> R
         })
     });
 
+    // Nothing is left that can stop the start.
+    if let Some(held) = &held {
+        raise_floor(path, &cfg, held)?;
+    }
     let strict_note = if cfg.gateway.strict { " · strict" } else { "" };
+    let bundle_note = bundle_note(held.as_ref());
     let ready = format!(
-        "mcpdef {} ready · {} upstream(s){} · audit {}{}{}{}{} · listening {}",
+        "mcpdef {} ready · {} upstream(s){} · audit {}{}{}{}{}{}{} · listening {}",
         env!("CARGO_PKG_VERSION"),
         gw.upstream_count(),
         down_note,
         cfg.gateway.audit,
+        otel_note,
         profile_note,
         drift_note,
         auth_note,
         strict_note,
+        bundle_note,
         transport_note
     );
     let http_cfg = HttpConfig {
@@ -2331,6 +3583,10 @@ async fn cmd_run(path: &Path, profile_override: Option<String>, http: bool) -> R
             },
         );
         let reloader = reloader.with_requests(reload_requests);
+        let reloader = match (keys, held) {
+            (Some(keys), Some(held)) => reloader.with_bundle_lock(keys, held),
+            _ => reloader,
+        };
         match &listener_tls {
             Some(listener_tls) => reloader.with_listener_tls(listener_tls.clone()),
             None => reloader,
@@ -2375,6 +3631,78 @@ async fn cmd_run(path: &Path, profile_override: Option<String>, http: bool) -> R
         // It never ends: it runs until dropped.
         () = reloads => Ok(()),
     }
+}
+
+/// `mcpdef filter`: answer the checks of a proxy that routes MCP requests
+/// itself, on `[gateway.filter] listen`, judging each request by the config
+/// and recording each decision in its ledger, as the gateway in the path
+/// would. No upstream is opened: the proxy reaches them. With
+/// `bundle_trust`, only a config the signed bundle beside it holds: the
+/// filter reads its config once, as it starts, and that is where it is held.
+async fn cmd_filter(path: &Path, bundle_trust: Option<&Path>) -> Result<()> {
+    let keys = bundle_trust
+        .map(|keys| bundle_keys(keys, path))
+        .transpose()?;
+    let (cfg, _, held) = load_held(path, keys.as_ref())?;
+    let cfg = validated(path, cfg, None)?;
+    let routes = mcpdef::filter::Routes::of(&cfg);
+    if routes.is_empty() {
+        anyhow::bail!(
+            "no [[server]] in {} has a filter_path: filter mode judges a request by the server \
+             its path names, so give each server the path the proxy routes to it",
+            path.display()
+        );
+    }
+    if cfg.gateway.auth.enabled && cfg.gateway.auth.takes(AuthMethod::Mtls) {
+        anyhow::bail!(
+            "[gateway.auth] takes client certificates, which filter mode never sees: the proxy \
+             holds the client's connection. Take bearer tokens or client keys in filter mode"
+        );
+    }
+    let gw = mcpdef::connect::build_filter(&cfg)?;
+    // How the gateway's own fetches go out, a JWKS's among them.
+    let fetching = Arc::new(ArcSwap::from_pointee(Fetching::of(&cfg)));
+    let otel_note = match &cfg.gateway.otel {
+        Some(otel) => {
+            let exporter = mcpdef::otel::Exporter::new(
+                otel,
+                PathBuf::from(&cfg.gateway.audit),
+                Arc::clone(&fetching),
+            );
+            let note = format!(" · spans to {}", exporter.shown());
+            let (written, _) = gw.audit_written();
+            exporter
+                .start(written.checked_sub(1), gw.audit_appends())
+                .with_context(|| format!("following the ledger {}", cfg.gateway.audit))?;
+            note
+        }
+        None => String::new(),
+    };
+    let auth = build_verifier(&cfg, &fetching).await?;
+    let auth_note = match &auth {
+        Some(_) => format!(" · {}", auth_methods(&cfg.gateway.auth)),
+        None => String::new(),
+    };
+    let listen = &cfg.gateway.filter.listen;
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("binding the filter listener on {listen}"))?;
+    let addr = listener.local_addr()?;
+    // Nothing is left that can stop the start.
+    if let Some(held) = &held {
+        raise_floor(path, &cfg, held)?;
+    }
+    let bundle_note = bundle_note(held.as_ref());
+    eprintln!(
+        "mcpdef {} filter ready · {} server(s) routed · audit {}{otel_note}{auth_note}{bundle_note} · listening {addr}",
+        env!("CARGO_PKG_VERSION"),
+        routes.len(),
+        cfg.gateway.audit,
+    );
+    let filter = mcpdef::filter::Filter::new(gw, &cfg, auth);
+    mcpdef::filter::serve_filter_on(listener, filter)
+        .await
+        .context("serving the filter")
 }
 
 /// What the ready line says `[gateway.auth]` takes: `oauth` for a bearer

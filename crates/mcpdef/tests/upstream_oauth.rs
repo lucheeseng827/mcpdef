@@ -184,11 +184,14 @@ async fn fifty_calls_at_once_fetch_one_token_and_one_more_once_it_expires() {
     // Sent for half its life: a second.
     idp.issues(json!({ "token_type": "Bearer", "expires_in": 2 }));
     let (url, token_url) = serve(&idp).await;
-    let fetched = Instant::now();
+    let started = Instant::now();
     let gw = start(&config(dir.path(), &url, &token_url, "\"s3cret\"")).await;
     fifty(&gw).await;
+    // The token was asked for by now, at the latest: as the gateway opened
+    // the upstream, or for the first call.
+    let fetched = Instant::now();
     assert!(
-        fetched.elapsed() < Duration::from_secs(1),
+        started.elapsed() < Duration::from_secs(1),
         "too slow to tell"
     );
     let asked = std::mem::take(&mut *idp.asked.lock().unwrap());
@@ -205,7 +208,10 @@ async fn fifty_calls_at_once_fetch_one_token_and_one_more_once_it_expires() {
     assert_eq!(field("resource"), Some(url.clone()));
     assert!(idp.seen().iter().all(|t| t == "tok-1"));
 
-    // Expired: fifty more fetch one more, and all send it.
+    // Expired: fifty more fetch one more, and all send it. Its half life
+    // counts from when it was asked for, so the wait counts from `fetched`,
+    // not `started`: from there, a start slower than the 100 ms to spare
+    // left it fresh.
     tokio::time::sleep(Duration::from_millis(1100).saturating_sub(fetched.elapsed())).await;
     fifty(&gw).await;
     assert_eq!(idp.asked(), 1);
@@ -248,10 +254,15 @@ async fn with_no_token_a_call_fails_closed_and_is_audited_as_credentials_unavail
     assert_eq!(denied[0].decision, "deny");
     assert_eq!(denied[0].tool.as_deref(), Some("echo"));
 
-    // Back: the next call fetches, and is answered.
+    // Back: the next call fetches once, and is answered with what it
+    // fetched, whichever token that is: one more may have been fetched
+    // before the outage, had the first token's half second gone by then.
     idp.issues(json!({ "token_type": "Bearer", "expires_in": 3600 }));
+    idp.asked();
     assert_eq!(echo(gw.clone()).await, ("echo:{}".to_string(), false));
-    assert_eq!(idp.seen(), ["tok-2"]);
+    assert_eq!(idp.asked(), 1);
+    let last = idp.issued.lock().unwrap().last().cloned();
+    assert_eq!(idp.seen(), [last.unwrap()]);
 }
 
 #[tokio::test]

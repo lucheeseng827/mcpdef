@@ -119,9 +119,12 @@ impl ArgEdit {
                 let Some(object) = holder(args, on_the_way, true)? else {
                     return Ok(false);
                 };
-                if object.get(*last).is_none_or(Value::is_null) {
+                let held = object.get(*last);
+                if held.is_none_or(Value::is_null) {
+                    // A null default over a null changes nothing.
+                    let changed = held != Some(value);
                     object.insert((*last).to_string(), value.clone());
-                    Ok(true)
+                    Ok(changed)
                 } else {
                     Ok(false)
                 }
@@ -305,6 +308,14 @@ mod tests {
             let args = json!({ "limit": held });
             assert_eq!(after(&default, args.clone()), (args, false));
         }
+        // A null default fills in a missing value, and over a null changes
+        // nothing: the property test's case `{"c": null}`.
+        let null = edit("c", EditOp::Default(Value::Null));
+        assert_eq!(after(&null, json!({})), (json!({ "c": null }), true));
+        assert_eq!(
+            after(&null, json!({ "c": null })),
+            (json!({ "c": null }), false)
+        );
     }
 
     #[test]

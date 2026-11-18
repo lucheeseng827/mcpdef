@@ -296,6 +296,7 @@ impl Setup {
                 rate_limit: None,
                 inspect: None,
                 pins,
+                pin_accept: cfg.gateway.pin_accept.severity(),
                 tool_prefixes: cfg.tool_prefixes(),
                 upstreams,
             })

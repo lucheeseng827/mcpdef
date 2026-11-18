@@ -6,10 +6,12 @@
 //! numbers honest — its own Tokio runtime, its own allocator, its own startup —
 //! and means the harness needs nothing from the engine crates to build.
 
+use crate::bearer;
 use anyhow::{anyhow, bail, Context, Result};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::process::{Child, Command};
 
@@ -31,6 +33,22 @@ pub enum Upstream {
         allow: Vec<String>,
     },
 }
+
+/// What the generated config turns on besides its upstreams. Everything else
+/// stays at its default.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Features {
+    /// The admin listener, serving the console.
+    pub console: bool,
+    /// `[gateway.auth]`, taking the bench's bearer tokens (see [`bearer`]).
+    pub bearer: bool,
+    /// `[gateway] audit_fsync`: each ledger record on disk before its reply.
+    pub fsync: bool,
+}
+
+/// How long the token a gateway with `bearer` is called with stays good: longer
+/// than any run.
+const TOKEN_LIFETIME: Duration = Duration::from_secs(4 * 3600);
 
 /// Resident memory of a process, in KiB.
 #[derive(Clone, Copy, Debug)]
@@ -57,29 +75,42 @@ pub struct Gateway {
     /// console on.
     pub admin: Option<String>,
     pub pid: u32,
+    /// The token to call it with, when it was started with [`Features::bearer`].
+    pub token: Option<Arc<str>>,
     log: PathBuf,
 }
 
 impl Gateway {
     /// Write a config for `upstreams` into `dir`, start `mcpdef` on it, and wait
-    /// until it answers a `ping`. With `console`, its admin listener is on too,
-    /// serving the console.
+    /// until it answers a `ping`. `features` says what else the config turns on.
     pub async fn start(
         mcpdef: &Path,
         dir: &Path,
         upstreams: &[Upstream],
-        console: bool,
+        features: Features,
         client: &reqwest::Client,
     ) -> Result<Gateway> {
+        let token: Option<Arc<str>> = if features.bearer {
+            Some(bearer::token(TOKEN_LIFETIME)?.into())
+        } else {
+            None
+        };
         // The free port is found by binding and releasing it, so something else can
         // take it before mcpdef binds. Rare, and a retry on a new port settles it.
         let mut last_err = None;
         for attempt in 0..3 {
             let port = free_port()?;
-            let admin = if console { Some(free_port()?) } else { None };
+            let admin = if features.console {
+                Some(free_port()?)
+            } else {
+                None
+            };
             let config = dir.join("mcpdef.toml");
-            std::fs::write(&config, render_config(dir, port, admin, upstreams))
-                .with_context(|| format!("writing {}", config.display()))?;
+            std::fs::write(
+                &config,
+                render_config(dir, port, admin, features, upstreams),
+            )
+            .with_context(|| format!("writing {}", config.display()))?;
             let log = dir.join(format!("mcpdef-{attempt}.log"));
             let child = Command::new(mcpdef)
                 .arg("run")
@@ -98,6 +129,7 @@ impl Gateway {
                 url: format!("http://127.0.0.1:{port}/mcp"),
                 admin: admin.map(|port| format!("http://127.0.0.1:{port}")),
                 pid,
+                token: token.clone(),
                 log,
             };
             match gateway.wait_ready(client).await {
@@ -120,9 +152,13 @@ impl Gateway {
                     self.log_tail()
                 );
             }
-            let ping = client
+            let mut ping = client
                 .post(&self.url)
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(reqwest::header::CONTENT_TYPE, "application/json");
+            if let Some(token) = &self.token {
+                ping = ping.bearer_auth(token);
+            }
+            let ping = ping
                 .body(r#"{"jsonrpc":"2.0","id":0,"method":"ping"}"#)
                 .send()
                 .await;
@@ -173,15 +209,25 @@ fn free_port() -> Result<u16> {
 }
 
 /// The `mcpdef.toml` for one run: a loopback listener, a ledger in the scratch
-/// directory, the admin listener on `admin` when there is one, and one
-/// `[[server]]` per upstream with its allowlist. Everything else stays at its
-/// default, so what is measured is the default gateway.
-pub fn render_config(dir: &Path, port: u16, admin: Option<u16>, upstreams: &[Upstream]) -> String {
+/// directory, the admin listener on `admin` when there is one, `[gateway.auth]`
+/// taking the bench's tokens with `bearer`, and one `[[server]]` per upstream
+/// with its allowlist. Everything else stays at its default, so what is measured
+/// is the default gateway.
+pub fn render_config(
+    dir: &Path,
+    port: u16,
+    admin: Option<u16>,
+    features: Features,
+    upstreams: &[Upstream],
+) -> String {
     let audit = dir.join("audit").join("audit.log");
     let mut s = String::new();
     let _ = writeln!(s, "[gateway]");
     let _ = writeln!(s, "listen = {}", toml_str(&format!("127.0.0.1:{port}")));
     let _ = writeln!(s, "audit = {}", toml_str(&audit.to_string_lossy()));
+    if features.fsync {
+        let _ = writeln!(s, "audit_fsync = true");
+    }
     if let Some(admin) = admin {
         let _ = writeln!(
             s,
@@ -190,6 +236,13 @@ pub fn render_config(dir: &Path, port: u16, admin: Option<u16>, upstreams: &[Ups
         );
         let _ = writeln!(s, "\n[gateway.admin]\nenabled = true");
         let _ = writeln!(s, "listen = {}", toml_str(&format!("127.0.0.1:{admin}")));
+    }
+    if features.bearer {
+        // The JWKS pinned inline: a value starting with `{` is the document itself.
+        let _ = writeln!(s, "\n[gateway.auth]\nenabled = true");
+        let _ = writeln!(s, "issuer = {}", toml_str(bearer::ISSUER));
+        let _ = writeln!(s, "resource = {}", toml_str(bearer::RESOURCE));
+        let _ = writeln!(s, "jwks = {}", toml_str(bearer::JWKS.trim()));
     }
     for upstream in upstreams {
         let _ = writeln!(s, "\n[[server]]");
@@ -284,6 +337,7 @@ mod tests {
             dir,
             7000,
             None,
+            Features::default(),
             &[
                 Upstream::Http {
                     id: "h".into(),
@@ -304,9 +358,46 @@ mod tests {
         assert!(cfg.contains("tools = [\"t1\", \"t2\"]"));
         assert_eq!(cfg.matches("[[server]]").count(), 2);
         assert!(!cfg.contains("[gateway.admin]"));
-        let with_console = render_config(Path::new("/tmp/run"), 7000, Some(7001), &[]);
+        assert!(!cfg.contains("[gateway.auth]"));
+        assert!(!cfg.contains("audit_fsync"));
+        let with_console = render_config(
+            Path::new("/tmp/run"),
+            7000,
+            Some(7001),
+            Features::default(),
+            &[],
+        );
         assert!(
             with_console.contains("[gateway.admin]\nenabled = true\nlisten = \"127.0.0.1:7001\"")
+        );
+    }
+
+    #[test]
+    fn with_fsync_each_ledger_record_is_synced() {
+        let fsync = Features {
+            fsync: true,
+            ..Features::default()
+        };
+        let cfg = render_config(Path::new("/tmp/run"), 7000, None, fsync, &[]);
+        // Under [gateway], before any table starts.
+        let gateway = cfg.split("\n[").next().unwrap();
+        assert!(gateway.contains("\naudit_fsync = true\n"), "{cfg}");
+    }
+
+    #[test]
+    fn with_bearer_the_config_takes_the_benchs_tokens() {
+        let bearer = Features {
+            bearer: true,
+            ..Features::default()
+        };
+        let cfg = render_config(Path::new("/tmp/run"), 7000, None, bearer, &[]);
+        assert!(cfg.contains("\n[gateway.auth]\nenabled = true\n"), "{cfg}");
+        assert!(cfg.contains(&format!("issuer = \"{}\"", bearer::ISSUER)));
+        assert!(cfg.contains(&format!("resource = \"{}\"", bearer::RESOURCE)));
+        // The JWKS document itself, inline and escaped as a TOML string.
+        assert!(
+            cfg.contains(r#"jwks = "{\"keys\":[{\"kty\":\"RSA\""#),
+            "{cfg}"
         );
     }
 

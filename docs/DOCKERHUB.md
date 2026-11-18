@@ -32,7 +32,7 @@ agent and a model provider.
  └──────────────┘        └───────┬───────┘        deny → MCP tool-execution error (audited)
                                  │
                                  └──▶ every tools/call appended to a tamper-evident, hash-linked
-                                      ledger (SIEM-exportable: OCSF / CEF / syslog)
+                                      ledger (SIEM-exportable: OCSF / CEF / syslog / OTLP)
 ```
 
 - **Upstream** — the agents and MCP clients that call tools: a coding agent/IDE

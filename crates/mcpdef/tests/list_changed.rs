@@ -1023,6 +1023,7 @@ async fn an_upstream_a_reload_adds_is_heard() {
             rate_limit: None,
             inspect: None,
             pins: None,
+            pin_accept: mcpdef_pin::Severity::Info,
             tool_prefixes: None,
             upstreams: vec![
                 Planned {
@@ -1182,6 +1183,7 @@ async fn a_connection_replaced_by_a_reload_is_no_longer_heard() {
             rate_limit: None,
             inspect: None,
             pins: None,
+            pin_accept: mcpdef_pin::Severity::Info,
             tool_prefixes: None,
             upstreams: vec![Planned {
                 server: supervised("a", &a),
@@ -1248,6 +1250,7 @@ async fn a_stdio_client_is_told_once_it_is_initialized() {
         rate_limit: None,
         inspect: None,
         pins: None,
+        pin_accept: mcpdef_pin::Severity::Info,
         tool_prefixes: None,
         upstreams: vec![Planned {
             server: supervised("a", &a),

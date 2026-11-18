@@ -130,7 +130,7 @@ impl super::Gateway {
                 let slot = &g.upstreams[route.index];
                 let tool = route.tool.as_str();
                 let hidden = !g.offers(slot, tool)
-                    || slot.drifted.contains(tool)
+                    || slot.drifted.contains_key(tool)
                     || slot.poisoned.contains(tool);
                 let up = slot.conn.as_ref().filter(|_| !hidden)?;
                 up.mirroring.headers.get(tool).cloned()

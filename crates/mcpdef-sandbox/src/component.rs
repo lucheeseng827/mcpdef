@@ -96,37 +96,21 @@ impl WasiView for CompState {
     }
 }
 
-/// An MCP upstream that is a `wasm32-wasip2` **component** run under Wasmtime with
-/// capability-scoped WASI, fuel/memory/epoch caps, and an egress allowlist.
-/// Implements [`Transport`] with the same request/response model as
-/// [`WasmUpstream`](crate::WasmUpstream): each [`send`](Transport::send) runs the
-/// component's `handle` and queues the response for [`recv`](Transport::recv).
-pub struct WasmComponentUpstream {
-    store: Store<CompState>,
-    bindings: Server,
+/// A `wasm32-wasip2` component compiled, and linked against capability-scoped
+/// WASI, once: the slow half of [`WasmComponentUpstream::from_bytes`]. Each
+/// [`instantiate`](Self::instantiate) makes a fresh instance of it, with a store,
+/// a memory and a WASI context of its own, so that no state passes between them.
+pub struct ComponentTemplate {
+    pre: ServerPre<CompState>,
     limits: SandboxLimits,
-    inbox: VecDeque<Message>,
-    _ticker: Option<EpochTicker>,
+    /// One ticker for the engine every instance shares: two would advance its
+    /// epoch twice as fast, and a deadline would fire early.
+    ticker: Option<Arc<EpochTicker>>,
 }
 
-impl WasmComponentUpstream {
-    /// Load and instantiate a component from `path` with the given limits and
-    /// egress allowlist.
-    pub async fn from_file(
-        path: impl AsRef<Path>,
-        limits: SandboxLimits,
-        egress: EgressAllow,
-    ) -> Result<Self, TransportError> {
-        let bytes = std::fs::read(path.as_ref()).map_err(TransportError::Io)?;
-        Self::from_bytes(&bytes, limits, egress).await
-    }
-
-    /// Instantiate a component from its component **binary** bytes.
-    pub async fn from_bytes(
-        wasm: &[u8],
-        limits: SandboxLimits,
-        egress: EgressAllow,
-    ) -> Result<Self, TransportError> {
+impl ComponentTemplate {
+    /// Compile `wasm` for an engine set up for `limits`, and link it.
+    pub fn compile(wasm: &[u8], limits: SandboxLimits) -> Result<Self, TransportError> {
         let mut config = Config::new();
         config.async_support(true);
         config.consume_fuel(true);
@@ -142,7 +126,27 @@ impl WasmComponentUpstream {
 
         let mut linker: Linker<CompState> = Linker::new(&engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker).map_err(sandbox_err)?;
+        let pre = linker
+            .instantiate_pre(&component)
+            .and_then(ServerPre::new)
+            .map_err(|e| {
+                TransportError::Sandbox(format!("linking `mcpdef:server` component: {e}"))
+            })?;
+        let ticker = limits
+            .deadline
+            .map(|_| Arc::new(EpochTicker::spawn(&engine)));
+        Ok(ComponentTemplate {
+            pre,
+            limits,
+            ticker,
+        })
+    }
 
+    /// A fresh instance, whose outbound sockets `egress` gates.
+    pub async fn instantiate(
+        &self,
+        egress: EgressAllow,
+    ) -> Result<WasmComponentUpstream, TransportError> {
         // Capability-scoped WASI: no preopened dirs (no filesystem), no inherited
         // stdio. Outbound TCP is allowed at the API level but every connection is
         // gated by the egress allowlist; UDP and DNS name lookup stay off (the
@@ -159,10 +163,10 @@ impl WasmComponentUpstream {
         let wasi = builder.build();
 
         let store_limits = StoreLimitsBuilder::new()
-            .memory_size(limits.max_memory_bytes)
+            .memory_size(self.limits.max_memory_bytes)
             .build();
         let mut store = Store::new(
-            &engine,
+            self.pre.engine(),
             CompState {
                 table: ResourceTable::new(),
                 wasi,
@@ -170,27 +174,64 @@ impl WasmComponentUpstream {
             },
         );
         store.limiter(|s| &mut s.limits);
-        store.set_fuel(limits.fuel_per_call).map_err(sandbox_err)?;
-        if limits.deadline.is_some() {
+        store
+            .set_fuel(self.limits.fuel_per_call)
+            .map_err(sandbox_err)?;
+        if self.limits.deadline.is_some() {
             // A finite deadline for the (rare) instantiation work; re-armed per call.
             store.set_epoch_deadline(u64::MAX);
         }
 
-        let bindings = Server::instantiate_async(&mut store, &component, &linker)
-            .await
-            .map_err(|e| {
-                TransportError::Sandbox(format!("instantiating `mcpdef:server` component: {e}"))
-            })?;
-
-        let ticker = limits.deadline.map(|_| EpochTicker::spawn(&engine));
+        let bindings = self.pre.instantiate_async(&mut store).await.map_err(|e| {
+            TransportError::Sandbox(format!("instantiating `mcpdef:server` component: {e}"))
+        })?;
 
         Ok(WasmComponentUpstream {
             store,
             bindings,
-            limits,
+            limits: self.limits,
             inbox: VecDeque::new(),
-            _ticker: ticker,
+            _ticker: self.ticker.clone(),
         })
+    }
+}
+
+/// An MCP upstream that is a `wasm32-wasip2` **component** run under Wasmtime with
+/// capability-scoped WASI, fuel/memory/epoch caps, and an egress allowlist.
+/// Implements [`Transport`] with the same request/response model as
+/// [`WasmUpstream`](crate::WasmUpstream): each [`send`](Transport::send) runs the
+/// component's `handle` and queues the response for [`recv`](Transport::recv).
+pub struct WasmComponentUpstream {
+    store: Store<CompState>,
+    bindings: Server,
+    limits: SandboxLimits,
+    inbox: VecDeque<Message>,
+    /// Its template's ticker, held so that it ticks while this instance lives.
+    _ticker: Option<Arc<EpochTicker>>,
+}
+
+impl WasmComponentUpstream {
+    /// Load and instantiate a component from `path` with the given limits and
+    /// egress allowlist.
+    pub async fn from_file(
+        path: impl AsRef<Path>,
+        limits: SandboxLimits,
+        egress: EgressAllow,
+    ) -> Result<Self, TransportError> {
+        let bytes = std::fs::read(path.as_ref()).map_err(TransportError::Io)?;
+        Self::from_bytes(&bytes, limits, egress).await
+    }
+
+    /// Instantiate a component from its component **binary** bytes: a
+    /// [`ComponentTemplate`] compiled and instantiated once.
+    pub async fn from_bytes(
+        wasm: &[u8],
+        limits: SandboxLimits,
+        egress: EgressAllow,
+    ) -> Result<Self, TransportError> {
+        ComponentTemplate::compile(wasm, limits)?
+            .instantiate(egress)
+            .await
     }
 
     /// Run the component's `handle` over one request line, returning the response
@@ -319,6 +360,28 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string()
+    }
+
+    /// One compile, many instances: each answers on its own, and one with a
+    /// deadline still runs its calls to completion, ticked by the template's
+    /// one ticker.
+    #[tokio::test]
+    async fn a_template_makes_working_instances() {
+        for limits in [
+            SandboxLimits::default(),
+            SandboxLimits {
+                deadline: Some(std::time::Duration::from_secs(5)),
+                ..SandboxLimits::default()
+            },
+        ] {
+            let template = ComponentTemplate::compile(&fixture(), limits).unwrap();
+            for id in 0..3 {
+                let mut up = template.instantiate(EgressAllow::deny_all()).await.unwrap();
+                let init = roundtrip(&mut up, req(id, method::INITIALIZE, None)).await;
+                assert_eq!(init.id, Some(Id::Num(id)));
+                assert_eq!(init.result.unwrap()["serverInfo"]["name"], "echo-component");
+            }
+        }
     }
 
     #[tokio::test]

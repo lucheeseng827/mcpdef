@@ -1,0 +1,342 @@
+{
+  "schema": 1,
+  "generated_at_unix": 1792303946,
+  "mcpdef_version": "mcpdef 0.4.0  ·  MCP gateway & governance plane",
+  "commit": "e75eaff81c64e0cd6ea6e10c78a1a7d6b42bd410",
+  "note": "4-vCPU cloud VM (Intel Xeon @ 2.10GHz), 15 GB; glibc build; opt-level s, Wasmtime's largest crates z",
+  "machine": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpus": 4,
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "mem_total_kb": 16479424
+  },
+  "params": {
+    "quick": false,
+    "warmup": 300,
+    "requests": 3000,
+    "concurrency": [
+      1,
+      16
+    ],
+    "slow_ms": 5000,
+    "neighbour_upstreams": 20,
+    "neighbour_concurrency": 8,
+    "neighbour_alone_ms": 5000,
+    "neighbour_beside_ms": 15000,
+    "idle_upstreams": 10,
+    "idle_load_requests": 1000
+  },
+  "scenarios": {
+    "allowed": [
+      {
+        "concurrency": 1,
+        "direct": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 34,
+          "p50_us": 74,
+          "p90_us": 105,
+          "p99_us": 201,
+          "max_us": 451,
+          "mean_us": 83,
+          "rps": 11860.960554118139
+        },
+        "gateway": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 142,
+          "p50_us": 187,
+          "p90_us": 257,
+          "p99_us": 447,
+          "max_us": 3740,
+          "mean_us": 203,
+          "rps": 4894.849623562569
+        },
+        "added_p50_us": 113,
+        "added_p99_us": 246,
+        "ratio_p50": 2.527027027027027,
+        "ratio_p99": 2.2238805970149254
+      },
+      {
+        "concurrency": 16,
+        "direct": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 52,
+          "p50_us": 267,
+          "p90_us": 369,
+          "p99_us": 524,
+          "max_us": 2988,
+          "mean_us": 277,
+          "rps": 57324.31863837164
+        },
+        "gateway": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 198,
+          "p50_us": 903,
+          "p90_us": 1496,
+          "p99_us": 2347,
+          "max_us": 4673,
+          "mean_us": 980,
+          "rps": 16226.516896853242
+        },
+        "added_p50_us": 636,
+        "added_p99_us": 1823,
+        "ratio_p50": 3.3820224719101124,
+        "ratio_p99": 4.479007633587786
+      }
+    ],
+    "allowed_bearer": [
+      {
+        "concurrency": 1,
+        "direct": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 33,
+          "p50_us": 71,
+          "p90_us": 95,
+          "p99_us": 165,
+          "max_us": 980,
+          "mean_us": 79,
+          "rps": 12545.177798832303
+        },
+        "gateway": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 182,
+          "p50_us": 255,
+          "p90_us": 405,
+          "p99_us": 650,
+          "max_us": 5221,
+          "mean_us": 288,
+          "rps": 3464.449973303699
+        },
+        "added_p50_us": 184,
+        "added_p99_us": 485,
+        "ratio_p50": 3.591549295774648,
+        "ratio_p99": 3.9393939393939394
+      },
+      {
+        "concurrency": 16,
+        "direct": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 57,
+          "p50_us": 288,
+          "p90_us": 402,
+          "p99_us": 519,
+          "max_us": 12400,
+          "mean_us": 304,
+          "rps": 52264.995933609105
+        },
+        "gateway": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 293,
+          "p50_us": 1149,
+          "p90_us": 1833,
+          "p99_us": 2558,
+          "max_us": 8071,
+          "mean_us": 1223,
+          "rps": 13045.141913489593
+        },
+        "added_p50_us": 861,
+        "added_p99_us": 2039,
+        "ratio_p50": 3.9895833333333335,
+        "ratio_p99": 4.928709055876686
+      }
+    ],
+    "allowed_bearer_fsync": [
+      {
+        "concurrency": 1,
+        "direct": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 40,
+          "p50_us": 75,
+          "p90_us": 96,
+          "p99_us": 143,
+          "max_us": 541,
+          "mean_us": 79,
+          "rps": 12502.65493877625
+        },
+        "gateway": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 359,
+          "p50_us": 612,
+          "p90_us": 848,
+          "p99_us": 1676,
+          "max_us": 4942,
+          "mean_us": 654,
+          "rps": 1527.378168130563
+        },
+        "added_p50_us": 537,
+        "added_p99_us": 1533,
+        "ratio_p50": 8.16,
+        "ratio_p99": 11.72027972027972
+      },
+      {
+        "concurrency": 16,
+        "direct": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 70,
+          "p50_us": 260,
+          "p90_us": 360,
+          "p99_us": 482,
+          "max_us": 872,
+          "mean_us": 267,
+          "rps": 59427.89478822117
+        },
+        "gateway": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 399,
+          "p50_us": 1995,
+          "p90_us": 2999,
+          "p99_us": 4340,
+          "max_us": 7622,
+          "mean_us": 2109,
+          "rps": 7564.95518272167
+        },
+        "added_p50_us": 1735,
+        "added_p99_us": 3858,
+        "ratio_p50": 7.673076923076923,
+        "ratio_p99": 9.004149377593361
+      }
+    ],
+    "denied": [
+      {
+        "concurrency": 1,
+        "gateway": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 69,
+          "p50_us": 89,
+          "p90_us": 107,
+          "p99_us": 178,
+          "max_us": 418,
+          "mean_us": 91,
+          "rps": 10806.827355832169
+        },
+        "ratio_p50_vs_direct": 1.2027027027027026,
+        "added_p50_us": 15,
+        "added_p99_us": -23
+      },
+      {
+        "concurrency": 16,
+        "gateway": {
+          "n": 3000,
+          "errors": 0,
+          "min_us": 56,
+          "p50_us": 503,
+          "p90_us": 860,
+          "p99_us": 1465,
+          "max_us": 4763,
+          "mean_us": 570,
+          "rps": 27908.847026362586
+        },
+        "ratio_p50_vs_direct": 1.8838951310861423,
+        "added_p50_us": 236,
+        "added_p99_us": 941
+      }
+    ],
+    "slow_neighbour": [
+      {
+        "transport": "http",
+        "upstreams": 20,
+        "slow_ms": 5000,
+        "concurrency": 8,
+        "alone": {
+          "n": 69663,
+          "errors": 0,
+          "min_us": 119,
+          "p50_us": 532,
+          "p90_us": 845,
+          "p99_us": 1429,
+          "max_us": 12600,
+          "mean_us": 573,
+          "rps": 13929.237518279106
+        },
+        "beside_slow": {
+          "n": 206760,
+          "errors": 0,
+          "min_us": 104,
+          "p50_us": 540,
+          "p90_us": 853,
+          "p99_us": 1404,
+          "max_us": 26419,
+          "mean_us": 579,
+          "rps": 13782.230032727908
+        },
+        "slow_calls_completed": 4,
+        "ratio_p50": 1.0150375939849625,
+        "ratio_p99": 0.9825052484254724
+      },
+      {
+        "transport": "stdio",
+        "upstreams": 20,
+        "slow_ms": 5000,
+        "concurrency": 8,
+        "alone": {
+          "n": 95311,
+          "errors": 0,
+          "min_us": 82,
+          "p50_us": 378,
+          "p90_us": 620,
+          "p99_us": 1351,
+          "max_us": 7090,
+          "mean_us": 418,
+          "rps": 19059.657948616557
+        },
+        "beside_slow": {
+          "n": 272337,
+          "errors": 0,
+          "min_us": 84,
+          "p50_us": 392,
+          "p90_us": 657,
+          "p99_us": 1392,
+          "max_us": 23103,
+          "mean_us": 439,
+          "rps": 18154.474314294235
+        },
+        "slow_calls_completed": 4,
+        "ratio_p50": 1.037037037037037,
+        "ratio_p99": 1.0303478904515173
+      }
+    ],
+    "idle_rss": {
+      "upstreams": 10,
+      "console": true,
+      "idle_rss_kb": 10412,
+      "idle_hwm_kb": 10412,
+      "idle_anon_kb": 1496,
+      "idle_file_kb": 8916,
+      "after_load_rss_kb": 11320,
+      "after_load_hwm_kb": 11320,
+      "after_load_anon_kb": 2300,
+      "after_load_file_kb": 9020,
+      "load_requests": 1000
+    },
+    "wasm_instantiate": {
+      "component": "echo_component.wasm",
+      "component_bytes": 206125,
+      "compile_us": 474588,
+      "first_us": 156,
+      "instantiate": {
+        "n": 3000,
+        "errors": 0,
+        "min_us": 19,
+        "p50_us": 20,
+        "p90_us": 25,
+        "p99_us": 45,
+        "max_us": 376,
+        "mean_us": 21,
+        "rps": 30964.97993918292
+      }
+    }
+  }
+}

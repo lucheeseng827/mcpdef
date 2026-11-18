@@ -6,6 +6,7 @@
 // meanwhile (an error, a CSP violation). A serious or critical axe finding,
 // an error or a violation fails it.
 //
+//   (cd .. && cargo build -p mcpdef --bins --features mock)
 //   MCPDEF_BIN=../target/debug/mcpdef MOCK=../target/debug/mock_mcp_server npm run check
 //
 // It starts the gateway itself, on a config of its own in a temporary

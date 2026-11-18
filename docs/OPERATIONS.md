@@ -25,7 +25,7 @@ MCPdef is one binary + one TOML file. No database, no sidecars.
   certificate in files or one a local CA of MCPdef's own issues: see
   [Serving HTTPS](#serving-https).
 - **Readiness signal:** one stderr line —
-  `mcpdef 0.1.0 ready · 1 upstream(s) · audit ./mcpdef-audit/audit.log · listening streamable-http 127.0.0.1:7878`
+  `mcpdef 0.5.0 ready · 1 upstream(s) · audit ./mcpdef-audit/audit.log · listening streamable-http 127.0.0.1:7878`
   (plus `· ⚠ N down, retrying: '<id>', …`, `· profile <p>`,
   `· ⚠ N rug-pulled tool(s) denied`, `· oauth on · N role(s)` when applicable;
   `mtls on`, `keys on`, or the methods joined by `or` or `and`
@@ -38,15 +38,31 @@ MCPdef is one binary + one TOML file. No database, no sidecars.
   [Upstream supervision](#upstream-supervision).
 - **Upgrade / rollback:** stateless swap — stop, replace the binary, start.
   The audit ledger re-opens and resumes its hash chain; the pin store is
-  re-read. There is no on-disk migration in 0.1.x.
+  re-read. There is no on-disk migration.
+  - **One ledger, upgraded together:** from 0.5.0, each process that writes a
+    ledger takes a lock on its file (`flock`) while it appends. A writer
+    before 0.5.0 takes none, so a 0.4.0 writer beside a 0.5.0 one forks the
+    chain: upgrade the gateway, its hooks, a filter and any `mcpdef call`
+    script that write one ledger together. A ledger on a file system that
+    refuses the lock, as a network share without locking can, stops the
+    start: keep it on a local disk. 0.4.0 still verifies a ledger 0.5.0
+    wrote.
+  - **The pin store goes one way:** from 0.5.0, each pin it writes keeps the
+    definition beside its hash, as a table, and a release before 0.5.0 reads a
+    hash alone, so it does not load the store. To go back to one, put back
+    the store as it was before the upgrade: it is in version control, as
+    [State](#state-what-to-back-up) says it should be. `mcpdef pin` with the
+    older release pins what the servers offer then, unchecked.
 
 ## State: what to back up
 
 | File | Config key | Format | Loss impact |
 |---|---|---|---|
 | Audit ledger | `[gateway] audit` (default `./mcpdef-audit/audit.log`) | JSONL hash chain (append-only) | Your tamper-evident record of every governed call. Back up continuously (it is the compliance artifact). Snapshot-friendly: append-only, safe to copy live. |
-| Pin store | `[gateway] pins` (optional) | TOML, `server → tool → sha256` | Your approved tool-definition baseline. Losing it means every tool re-pins on next start (trust-on-first-use) — a rug-pull window. Keep it in version control; it is deterministic and diff-clean by design. |
+| Pin store | `[gateway] pins` (optional) | TOML, `server → tool →` the sha256 and the definition approved | Your approved tool-definition baseline. Losing it means every tool re-pins on next start (trust-on-first-use) — a rug-pull window. Keep it in version control; it is deterministic and diff-clean by design. |
 | Config + JWKS | `mcpdef.toml`, `[gateway.auth] jwks` file | TOML / JSON | The policy itself. Version-control both. |
+| Bundle floor | `<state_dir>/bundle.json`, with `mcpdef bundle apply` | JSON: the last revision applied | Lost, the node takes a signed bundle of any revision again, an older one among them. Back it up with the rest of the state. |
+| Bundle beside the config | `<config>.bundle`, as `mcpdef.toml.bundle`, with `mcpdef bundle apply` | JSON: the bundle applied, byte for byte | With `--bundle-trust`, the gateway runs the config only as it holds it. Lost, the gateway refuses a reload, and does not start, until the bundle is applied again. Keep it with the config. |
 | Local CA | `[gateway] state_dir` (default `./mcpdef-state`), `tls/` | PEM: `ca.crt`, `ca.key`, `tls.crt`, `tls.key` | With `[gateway.tls] mode = "self-signed"`: the CA every client was told to trust. Lost, the gateway makes a new one at its next start, and every client has to trust that instead. Back up `ca.crt` and `ca.key` as you would any key: `ca.key` can issue certificates for the listener's names. `tls.crt` and `tls.key` are issued again at will. |
 | Session key | `[gateway] state_dir`, `session.key`, unless `[gateway.admin.session] key` is set | 32 bytes, `0600` | Seals the console's sessions. Lost, the gateway makes a new one, and everyone signed in signs in again; nothing else is lost. Replicas behind one `public_url` need the same key: set `[gateway.admin.session] key` for them, rather than each making its own. |
 
@@ -57,9 +73,12 @@ string, and found to be a secret, is warned about at startup. A config that
 still holds one: protect it like a secret store (file permissions, encrypted at
 rest, no world reads).
 
-Durability note (honest guarantee): the ledger append is `write` + userspace
-`flush`, **not** `fsync` — a host crash can lose the last unsynced record(s).
-The hash chain proves *integrity*, not *durability*.
+Durability note (honest guarantee): by default each ledger record is written to
+the operating system before its call is answered, **not** `fsync`ed. A crash of
+MCPdef loses no record, but a host crash can lose the last ones. With
+`[gateway] audit_fsync = true`, each record is on disk before its call is
+answered, at the cost [PERFORMANCE.md](./PERFORMANCE.md) gives. Either way, the
+hash chain proves *integrity*, not *durability*.
 
 ## Audit-ledger verification
 
@@ -67,7 +86,7 @@ Routine (proves internal consistency — any edit/delete of an interior record):
 
 ```sh
 $ mcpdef audit verify --config mcpdef.toml
-chain OK · 2 record(s) · head=f4bb388a0ba59cef9af31b5732c5f03c4dfb27d24e68fc078abafbe1a40fa17a
+chain OK · 2 record(s) · head=25efafd3189176952f679b50ea5aee711188aaf04b4b9aa345d9068c8ff88e59
 ```
 
 Exit is non-zero on a break, printing `chain BROKEN at seq=<n>`.
@@ -90,6 +109,478 @@ SIEM streaming from the free binary:
 ```sh
 mcpdef audit tail --format ocsf -n 500 | your-siem-forwarder   # also: json | cef | syslog
 ```
+
+## Signed receipts
+
+A receipt is one decision the gateway made, signed, so that anyone with the
+public key can check it offline, without your ledger or your gateway. MCPdef
+writes the format of the IETF Internet-Draft
+[`draft-farley-acta-signed-receipts-03`](https://datatracker.ietf.org/doc/draft-farley-acta-signed-receipts/).
+Each tool call in the ledger becomes an Access Decision Receipt
+(`"type": "protectmcp:decision"`) in the draft's envelope shape. Its signature
+is Ed25519 over the payload's RFC 8785 (JCS) form. Other records, such as admin
+actions, reloads, upstream changes and resource reads, have no receipt type in
+the draft, and get no receipt.
+
+```sh
+$ mcpdef receipts key                                  # once: the signing key
+wrote mcpdef-receipts.jwk: the key receipts are signed with, named sb:issuer:BnHVtAv9v3Wc. …
+$ mcpdef receipts jwks --key mcpdef-receipts.jwk > keys.json        # its public half
+$ mcpdef receipts export --key mcpdef-receipts.jwk --out receipts.jsonl
+signed 3 receipt(s), for the tool calls among 3 record(s) · ledger head=3decfb9b…
+record the last receipt's hash and the count somewhere else, … --last sha256:46445d3e… --count 3`
+$ mcpdef receipts verify receipts.jsonl --jwks keys.json
+receipts OK · 3 receipt(s) · 1 chain(s) · last=sha256:46445d3e…
+```
+
+One receipt, laid out:
+
+```json
+{
+  "payload": {
+    "decision": "allow",
+    "issued_at": "2026-10-15T09:03:54.039Z",
+    "issuer_id": "sb:issuer:BnHVtAv9v3Wc",
+    "mcpdef": { "seq": 0, "server": "mock" },
+    "tool_name": "echo",
+    "type": "protectmcp:decision"
+  },
+  "signature": { "alg": "EdDSA", "kid": "sb:issuer:BnHVtAv9v3Wc", "sig": "13824a60…" }
+}
+```
+
+- **The key.** `receipts key` writes a private JWK (RFC 8037) that only its
+  owner can read, and never over a file that is there. Whoever holds the key
+  can sign receipts. The export runs wherever the ledger file can be read, so
+  the key need not be on the gateway's host at all.
+- **Publishing the public half.** `receipts jwks` prints it as a JWK Set.
+  Publish it where whoever checks the receipts can fetch it; the draft
+  suggests `https://<your domain>/.well-known/acta-keys.json`. A verifier must
+  get the key from there, or from you, and never from a receipt.
+- **What the export signs.** One receipt per tool call, in order. It reads
+  the ledger once and checks its chain as it reads, and with `--head` and
+  `--count` the seal too.
+  - **What it refuses:** a ledger that fails, and a record with U+001F in a
+    field, which an older gateway let in: that record's hash cannot tell one
+    reading of its fields from another.
+  - **Nothing is kept from a ledger it refuses.** The receipts reach standard
+    output, or the `--out` file, only once the whole ledger has checked.
+  - **The chain:** each receipt after the first links to the one before by
+    `previousReceiptHash`.
+  - **The same bytes every time:** the same ledger and key always give the
+    same receipts, because Ed25519 signs deterministically. A new export can
+    be compared with an earlier one.
+  - **`--out`** never replaces a file without `--force`.
+- **What a receipt holds:**
+  - `tool_name`: the tool as its server names it.
+  - `decision`: `allow`, `deny`, or `rate_limit` for a call over the rate
+    limit.
+  - `reason`: the rule the record names, such as the one that refused the
+    call.
+  - `issued_at`: when the gateway decided, as its record says. The draft
+    defines `issued_at` as when the receipt was made. MCPdef signs a receipt
+    when it exports it, and gives it the decision's time instead, so that the
+    same ledger always gives the same receipts.
+  - `issuer_id`: the key's name.
+  - `mcpdef`: the server, and the `seq` of the record, which ties the receipt
+    to its record in the ledger.
+
+  It holds no caller identity, address, arguments or result.
+- **What a receipt does not show.** A receipt shows a decision. It does not
+  show that the tool then ran, nor what it returned. The chain shows that no
+  receipt between two others was changed, taken out or moved. It cannot show
+  that none were taken off the end. The export prints the last receipt's hash
+  and the count: record them somewhere else, and check against them later with
+  `receipts verify --last <hash> --count <n>`. `receipts verify` also says when
+  the first receipt links to one that is not in the file.
+- **Checking them elsewhere.** `receipts verify` checks the envelope shape,
+  signed with Ed25519 or P-256 (`ES256`) keys. A receipt that names a member
+  twice fails, as RFC 8785 requires: a reader that keeps the first one would
+  read what was never signed. Any verifier that implements the draft's §5.2
+  can check the receipts as well: the signing input is the payload's JCS form,
+  and the key comes from the JWK Set.
+
+## Hook mode: no proxy in the path
+
+Claude Code and Codex can ask MCPdef before each MCP tool call, and MCPdef
+answers by the same config a gateway runs on. There is no gateway to run and
+no client config to change: the call goes to its server as it would, once
+MCPdef lets it.
+
+```text
+$ mcpdef import --out mcpdef.toml        # or a config of your own
+$ mcpdef hook install --config mcpdef.toml --write
+updated .claude/settings.local.json, the old one kept as .claude/settings.local.json.bak
+Claude Code now asks MCPdef before each MCP tool call: a server not in /home/me/proj/mcpdef.toml is refused. Its decisions go to /home/me/proj/mcpdef-audit/audit.log
+```
+
+For Codex, name it:
+
+```text
+$ mcpdef hook install --client codex --config mcpdef.toml --write
+wrote .codex/hooks.json
+Codex now asks MCPdef before each MCP tool call: ...
+Codex runs a new or changed hook only once you trust it: open /hooks in Codex and trust this one. ...
+```
+
+A call the config refuses comes back to the model with why, as Claude Code
+puts it:
+
+```text
+PreToolUse:mcp__github__delete_repo hook error: MCPdef denied (not-on-allowlist): tool 'delete_repo' is not on the allowlist for 'github'
+```
+
+- **What it judges:** what a gateway would, of what a hook sees:
+  - the server's allowlist and deny list, and the active profile;
+  - the policy rules, over the arguments the client is about to send.
+
+  A transform rule that would change the arguments refuses the call: a hook
+  can let a call through or stop it, not change what it sends.
+- **What it cannot judge** is what only the path sees:
+  - the definitions a server lists (pins, the injection scan);
+  - what a call returns (result transforms, the result scan);
+  - who the caller is by its token (RBAC);
+  - how often calls come (rate limits, which would need state across the
+    hook's processes).
+
+  For those, put the gateway in the path, with the same config.
+- **What it answers:** a refusal, with why, and exit status `2`, which
+  blocks the call whatever else Claude Code reads: why goes to standard
+  error and, as a `deny` answer, to standard output. An allowed call gets no
+  answer and exits `0`, so Claude Code goes on as it would, asking the user
+  where its own permissions say to: MCPdef never answers that a call is
+  allowed, which would pass over them. A tool that is no MCP tool, such as
+  `Bash`, is not MCPdef's: no answer and no record.
+- **Fail closed:** a call to a server the config does not name is refused,
+  as the gateway refuses one, and so is any MCP call when the config does
+  not read. An event or a command line that does not read, and a panic,
+  exit `2` too, which refuses whatever the call was.
+- **A hook that fails before MCPdef can answer**, its program gone, killed or
+  out of time, is up to the client:
+  - **Claude Code** goes on with the call unless the hook says otherwise.
+    The hook `install` writes says `"onFailure": "block"`, so the call is
+    refused. Claude Code reads that setting from 2.1.295; an earlier one
+    ignores it and goes on with the call.
+  - **Codex** has no such setting and goes on with the call. Only a refusal
+    MCPdef gets to make stops one there.
+- **A timeout of seconds, not minutes:** the hook `install` writes gives up
+  after `--timeout` seconds, 10 unless told. Both clients wait 600 seconds
+  for a hook that names none, so a hook that hung would hold each MCP call
+  for ten minutes.
+- **Held to its bundle:** with `--bundle-trust <keys>`, the hook judges by
+  the config only while the signed bundle beside it holds it, as a gateway
+  held to its bundle runs it
+  ([DEPLOY.md § Holding the gateway to its bundle](./DEPLOY.md#holding-the-gateway-to-its-bundle)).
+  `install` writes the keys into the hook:
+
+  ```text
+  $ mcpdef hook install --config mcpdef.toml --bundle-trust /etc/mcpdef/bundle-keys.json --write
+  ...
+  It judges by that config only while the signed bundle beside it holds it, revision 3 now: a config changed by hand refuses every MCP call, until a bundle is applied. Whoever can edit .claude/settings.local.json can still take the hook out
+  ```
+
+  An agent that rewrites `mcpdef.toml` to let itself a tool then has every
+  MCP call refused, as Claude Code puts it:
+
+  ```text
+  PreToolUse:mcp__github__delete_repo hook error: MCPdef denied (bundle-unverified): --bundle-trust judges a call only by a config the signed bundle beside it holds: /home/me/proj/mcpdef.toml is not the config that /home/me/proj/mcpdef.toml.bundle, revision 3, holds: put a signed one in place with `mcpdef bundle apply`
+  ```
+
+  Each call's hook checks what a gateway checks as it starts: the
+  signature, the config byte for byte, and the floor. A refusal has no
+  record, since the ledger is named by a config the hook may not judge by.
+  `install` writes no hook that would refuse every call. Keep the keys, and
+  the `state_dir` that keeps the floor, where the user cannot write; then
+  `mcpdef bundle apply` is run by whoever can. A bundle carried in raises
+  the floor at the first call it judges; where the hook cannot raise it,
+  the call is refused.
+- **A guardrail, not a lock:** in the user's own settings, the user can take
+  the hook out or turn hooks off. In Claude Code's managed settings, only
+  managed settings can: `install --write --file` puts it in
+  `/etc/claude-code/managed-settings.json` on Linux,
+  `/Library/Application Support/ClaudeCode/managed-settings.json` on macOS, or
+  `C:\Program Files\ClaudeCode\managed-settings.json` on Windows, run by
+  whoever may write there. Either way it keeps an agent to the config; it
+  does not keep its user from going around it, with another client say. For
+  that, put the gateway in the path, holding the servers' credentials
+  itself.
+- **The record:** each decision the config makes goes to its ledger, as a
+  gateway's do, with `hook = "claude-code"` or `hook = "codex"`. A write that fails is logged on
+  standard error and leaves the decision as it was, as at the gateway. A call
+  refused because the config does not read, or under `--bundle-trust` because
+  no bundle holds it, has no ledger to go to, and no record. The call went to
+  its server without
+  MCPdef in between, so the record says what MCPdef decided, not that the
+  call ran. `mcpdef receipts export` signs them as it signs the gateway's,
+  `mcpdef audit tail` shows them, and a gateway sending spans on the same
+  ledger (`[gateway.otel]`) sends theirs too. A
+  config's relative paths are read from its own directory, as a gateway
+  started there reads them, so the hook and a gateway write the same ledger.
+- **Many at once:** each call's hook runs in a process of its own. Writers
+  take turns on the ledger's lock, so hooks running at once, a gateway and
+  `mcpdef call` keep one chain in one ledger.
+- **Install:** `mcpdef hook install` prints the hook; `--write` merges it
+  into the project's `.claude/settings.local.json`, the user's own settings
+  for the project, which the repository does not share. It keeps a `.bak`,
+  and every other hook there, in place of an earlier `mcpdef hook`
+  (`mcpdef.exe` on Windows).
+  `--file ~/.claude/settings.json` installs it for every project.
+- **Install for Codex:** `--client codex` merges the hook into the project's
+  `.codex/hooks.json`, in the same way. Three things differ from Claude Code:
+  - The file is the repository's, not the user's own; Codex has no
+    project file of the user's alone. It holds this machine's paths, so
+    commit it or ignore it accordingly. `--file ~/.codex/hooks.json`
+    installs the hook for every project instead.
+  - Codex runs a project's hooks only in a trusted project.
+  - Codex runs a new or changed hook only once the user trusts it in
+    `/hooks`. Until then the hook refuses nothing, and `install` says so.
+  - On Windows Codex runs a hook through `%COMSPEC% /C`, and reads
+    `commandWindows` there in place of `command`. So the hook carries both:
+    the POSIX line, and the line `cmd.exe` reads, each path in double quotes
+    and a `\\?\` path given as the plain one. CI runs what `install` writes
+    through `cmd.exe` on Windows, as Codex runs it
+    (`.github/workflows/mcpdef-windows-hook.yml`).
+  - A path holding `%`, `!` or a line break cannot be handed to `cmd.exe`
+    safely: it expands those even in quotes. On Windows `install --client
+    codex` then refuses, since Codex would go on with every call whose hook
+    did not run; move the file, or put the gateway in the path. Elsewhere the
+    hook is written without the Windows line.
+
+## Filter mode: behind a proxy that routes
+
+An estate that already routes its MCP traffic through Envoy, or through
+anything that asks an authorization service as Envoy's `ext_authz` filter
+does, keeps its routing: the proxy asks MCPdef about each request before it
+sends it on, and MCPdef answers by the same config a gateway runs on, and
+records the decision in its ledger. No upstream is opened by MCPdef; the
+proxy reaches them.
+
+```toml
+[gateway]
+audit = "/var/lib/mcpdef/audit.log"
+
+[gateway.filter]
+listen = "127.0.0.1:7880"   # where the proxy sends its checks
+path_prefix = "/authz"      # Envoy's http_service.path_prefix, if it sets one
+
+[[server]]
+id = "github"
+transport = "streamable-http"
+url = "http://github-mcp:8080/mcp"   # where the proxy sends its calls
+filter_path = "/github"              # the path the proxy routes to it
+tools = ["list_*", "get_*"]
+```
+
+```text
+$ mcpdef filter --config mcpdef.toml
+mcpdef 0.5.0 filter ready · 1 server(s) routed · audit /var/lib/mcpdef/audit.log · listening 127.0.0.1:7880
+```
+
+The filter reads its config once, as it starts: a new config takes a
+restart. With `--bundle-trust <keys>`, it starts only from a config the signed
+bundle beside it holds, as a gateway does
+([DEPLOY.md § Holding the gateway to its bundle](./DEPLOY.md#holding-the-gateway-to-its-bundle)),
+and its ready line names the revision, `· bundle r8`.
+
+In Envoy, the `ext_authz` filter goes before the router, with the body sent
+along, since the body is what MCPdef judges:
+
+```yaml
+http_filters:
+- name: envoy.filters.http.ext_authz
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+    transport_api_version: V3
+    with_request_body: { max_request_bytes: 2097152, allow_partial_message: false }
+    allowed_headers:
+      patterns: [{ exact: origin }, { exact: traceparent }]
+    failure_mode_allow: false
+    http_service:
+      server_uri: { uri: "http://127.0.0.1:7880", cluster: mcpdef, timeout: 1s }
+      path_prefix: "/authz"
+      authorization_response:
+        allowed_upstream_headers:
+          patterns: [{ exact: x-mcpdef-record }]
+- name: envoy.filters.http.router
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+```
+
+`mcpdef` is a cluster that points at `[gateway.filter] listen`. A call the
+config refuses comes back to the client from Envoy as MCPdef answered it,
+a `403` with a JSON-RPC error:
+
+```text
+$ curl -s localhost:10000/github/mcp -H 'content-type: application/json' \
+    -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"delete_repo","arguments":{}}}'
+{"error":{"code":-32001,"data":{"rule":"not-on-allowlist"},"message":"MCPdef denied (not-on-allowlist): tool 'delete_repo' is not on the allowlist for 'github'"},"id":2,"jsonrpc":"2.0"}
+```
+
+- **Which server:** the path the proxy routed, less `path_prefix`, names it:
+  the `[[server]]` whose `filter_path` the path is at or below, by whole
+  segments, the longest winning. `/` takes any path. Set each one to what the
+  proxy routes to that server: MCPdef judges a request by the server its path
+  names, and cannot see where the proxy actually sends it.
+  - A path under no `filter_path` is refused (`unknown-route`), and a call
+    there is recorded under the server `(unrouted)`.
+  - A path that a proxy could read as another, with a `.` or `..` segment,
+    a `//`, a `\` or an escaped `/`, `\` or `.`, is refused
+    (`path-refused`), whatever the proxy would make of it.
+- **What it judges:** what a gateway would, of what a request alone shows,
+  in the gateway's order:
+  - a `tools/call`: the server's allowlist and deny list, the active
+    profile, the argument transforms, the policy rules, RBAC and the rate
+    limit;
+  - a `resources/read`, and a `resources/subscribe` as a read: the resource
+    allowlist, the rules, RBAC and the rate limit;
+  - a `prompts/get` and a `completion/complete`: the prompt and template
+    allowlists, the rules, RBAC and the rate limit.
+
+  A transform rule that would change a call's arguments refuses it, and so
+  does a URI that is not in normal form: MCPdef cannot change what the proxy
+  sends, so the server would get other arguments, or read another URI, than
+  the ones judged.
+- **What passes unjudged:** a list, `initialize`, a ping, a notification, a
+  response, and requests other than `POST`, such as the `GET` that opens a
+  server's stream. Nothing of them is recorded.
+- **What it cannot judge** is what only the path sees, as in hook mode:
+  - the definitions a server lists (pins, the injection scan), so a client
+    sees every tool a server lists, and a call to one off the allowlist is
+    refused;
+  - what a call returns (result transforms, the result scan).
+
+  For those, put the gateway in the path, with the same config.
+- **The caller:** with `[gateway.auth]`, a bearer token or a client key the
+  gateway issued is checked as the listener checks it, and a request without
+  one gets its `401` and challenge, which the proxy hands the client. Set
+  `resource` to the URL clients reach the server at, through the proxy: its
+  origin is where the challenge sends them for the resource's metadata,
+  `/.well-known/oauth-protected-resource`, to find where they get a token.
+  `mcpdef filter` answers a `GET` of it for anyone, as a check and as a
+  request, so route that path to it:
+
+  ```yaml
+  routes:
+  - match: { path: "/.well-known/oauth-protected-resource" }
+    route: { cluster: mcpdef }
+  - match: { path_separated_prefix: "/github" }
+    route: { cluster: github }
+  ```
+
+  A client certificate never reaches MCPdef, so filter mode refuses to start
+  on a config that takes one. A request's `Origin`, when the proxy sends it,
+  is checked as the listener checks it.
+- **Fail closed:** a `POST` whose body does not reach MCPdef, or is not one
+  JSON-RPC message, is refused (`invalid-request`): set `with_request_body`.
+  Leave `failure_mode_allow` off, so that a check that fails stops the
+  request rather than passing it.
+- **The record:** each decision goes to the config's ledger, as a gateway's
+  do, with `hook = "ext_authz"`, and the `x-mcpdef-record` header of the
+  answer names its `seq`, for a proxy that hands it to the upstream. The
+  record says what MCPdef decided, not that the call ran: the proxy sent it.
+  `mcpdef receipts export` signs them as it signs the gateway's, and
+  `[gateway.otel]` sends their spans. The record's peer is left out, since
+  the check's peer is the proxy.
+- **Not yet:** Envoy's gRPC `ext_authz`, agentgateway's MCP guardrails
+  (ExtMCP, over gRPC), and a reload: restart `mcpdef filter` to take a
+  changed config. CI runs this section's Envoy configuration against `mcpdef
+  filter` on every change, with Envoy 1.35.
+
+## Traces: each call as an OpenTelemetry span
+
+With [`[gateway.otel]`](./CONFIG.md#gatewayotel--spans-to-an-opentelemetry-endpoint),
+the gateway sends each governed request it records to an OTLP/HTTP endpoint,
+as an OpenTelemetry span: evald's, an OpenTelemetry Collector's, or any
+tracing backend's. The span is the gateway's part of the agent's trace. In it,
+a tool call sits beside the agent's own spans, such as those of its model
+calls and what they cost.
+
+```toml
+[gateway.otel]
+endpoint = "http://127.0.0.1:4318"   # evald, where it listens by default
+token = { env = "EVALD_TOKEN" }      # when evald is started with --auth-token
+```
+
+A real run: evald, an agent's model call in trace `4bf92f35…` as its span
+`00f067aa…`, and two tool calls the agent makes in it through the gateway,
+one of which the allowlist refuses:
+
+```text
+$ curl -s http://127.0.0.1:7878/mcp -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,
+    "method":"tools/call","params":{"name":"echo","arguments":{"text":"hi"},
+    "_meta":{"traceparent":"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"}}}'
+$ curl -s http://127.0.0.1:4318/v1/traces/4bf92f3577b34da6a3ce929d0e0e4736 \
+    -H "Authorization: Bearer $EVALD_TOKEN"     # a few members of each span:
+service        name                    parent            oi_kind  status
+triage-agent   chat claude-sonnet-4-5  -                 LLM      -
+mcpdef         tools/call echo         00f067aa0ba902b7  TOOL     -
+mcpdef         tools/call delete_repo  00f067aa0ba902b7  TOOL     2 not-on-allowlist
+```
+
+So one query to evald answers what a run cost and what it did:
+
+```text
+$ cat run.sql
+SELECT trace_id,
+       SUM(CASE WHEN oi_kind = 'LLM' THEN 1 ELSE 0 END) AS model_calls,
+       SUM(cost_usd) AS cost_usd,
+       SUM(CASE WHEN oi_kind = 'TOOL' THEN 1 ELSE 0 END) AS tool_calls,
+       SUM(CASE WHEN oi_kind = 'TOOL' AND status_code = 2 THEN 1 ELSE 0 END) AS refused
+FROM spans GROUP BY trace_id
+$ jq -Rs '{sql: .}' run.sql | curl -s http://127.0.0.1:4318/v1/sql -H "Authorization: Bearer $EVALD_TOKEN" -d @-
+{"columns":["trace_id","model_calls","cost_usd","tool_calls","refused"],"rows":[{"cost_usd":0.0081,
+"model_calls":1,"refused":1,"tool_calls":2,"trace_id":"4bf92f3577b34da6a3ce929d0e0e4736"}],…}
+```
+
+- **Joining the agent's trace.** A span is in the trace the request's W3C
+  `traceparent` names, under the caller's span. It is read from:
+  - `params._meta.traceparent`, where the OpenTelemetry conventions for MCP
+    put it (SEP-414), over stdio and HTTP alike;
+  - else the request's `traceparent` HTTP header, which an instrumented HTTP
+    client sends.
+
+  A request with neither, or with one that does not read, is a trace of its
+  own. evald, like most backends, puts spans together by trace: that is how a
+  tool call meets the model calls of the same run. The ledger keeps the trace
+  too, as each record's `trace_id` and `parent_id`.
+- **What a span holds:**
+
+  | | |
+  |---|---|
+  | Name | `tools/call <tool>`, `prompts/get <prompt>`, or the method alone. The name in a call to a tool no server lists is the caller's to choose, so it is kept out of the span's name, and left to `gen_ai.tool.name` |
+  | Kind | `SERVER` |
+  | Status | `ERROR` for a request refused, with the rule as its message; unset for one allowed |
+  | `mcp.method.name` | the method |
+  | `gen_ai.operation.name` | `execute_tool` on a tool call. It is what makes it a tool's span to evald, and to the OpenTelemetry GenAI conventions |
+  | `gen_ai.tool.name`, `gen_ai.prompt.name`, `mcp.resource.uri` | what the request named |
+  | `error.type` | the rule that refused it |
+  | `client.address`, `client.port` | where it came from, on the HTTP listener |
+  | `mcpdef.agent`, `mcpdef.server`, `mcpdef.decision`, `mcpdef.rule` | the record's caller, server, `allow` or `deny`, and rule |
+  | `mcpdef.seq` | the record's number in the ledger |
+  | `mcpdef.tool_digest` | with a pin store, the pinned digest of the tool's definition: which definition the call ran against |
+  | `mcpdef.actor`, `mcpdef.transforms` | when the record has them |
+
+  The resource is `service.name`, `mcpdef` unless `service_name` says
+  otherwise, and `service.version`. A span holds no arguments, no result and
+  no credential, as the ledger holds none. The records the gateway writes of
+  itself (`agent = "mcpdef"`), such as admin actions, reloads, upstream events
+  and findings at an upstream's connection, are no agent's request, and become
+  no span.
+- **The same span every time.** A span is made from its record alone, and
+  its id from the record's hash. So `mcpdef audit tail --format otlp`, run on
+  the ledger later, gives the spans the gateway sent, ids and all. evald's
+  trace views show a span sent twice once; its `/v1/sql` view counts each
+  copy. So send again only what was not sent.
+- **Delivery.** No call waits for the exporter: it reads the ledger's file, a
+  second after a record is written, and sends what it finds. An endpoint that
+  is down, or busy, holds back only the exporter. What is written meanwhile
+  waits in the ledger, and is sent once the endpoint takes spans again. One
+  that refuses spans for good has them dropped, with a log line. A restart
+  starts from the ledger's end, so spans not sent before it are not sent
+  after it. To send them, post the lines `mcpdef audit tail --format otlp`
+  prints for those records to the endpoint's `/v1/traces`, each with
+  `Content-Type: application/json`.
 
 ## Upstream supervision
 
@@ -114,8 +605,8 @@ startup takes about as long as the slowest.
   **5 calls in a row** to an HTTP upstream (`streamable-http`, `sse`) failed or
   timed out. A restart spawns the process again (or opens a new HTTP session),
   runs the handshake, lists the tools, checks them against the pins (a changed
-  definition is denied as a `rug-pull`, a new tool is pinned on first use) and
-  routes calls to them.
+  definition is graded, and held as a `rug-pull` unless `[gateway] pin_accept`
+  takes it; a new tool is pinned on first use) and routes calls to them.
 - **Backoff:** the first attempt comes 0.5 s after it went down, then 1 s, 2 s,
   4 s, 8 s, and every 10 s after that, each with up to a quarter more at random.
   An upstream that had stayed up for 30 s starts again from 0.5 s.
@@ -170,8 +661,10 @@ not on a stream of the server's own ([WIRE.md](./WIRE.md#status)).
   failed: <why>; it keeps the tools it had`. The next word tries again.
 - **Each new or changed tool is judged as at connect:**
   - with `[gateway] pins`, a new one is pinned on first use, and one that no
-    longer matches its pin is hidden and refused as a `rug-pull` until
-    `mcpdef pin` approves it and a reload reads the pins;
+    longer matches its pin is graded: pinned again if `[gateway] pin_accept`
+    takes its grade, and otherwise hidden and refused as a `rug-pull` until
+    `mcpdef pin` approves it and a reload reads the pins
+    ([When a tool drifts from its pin](#when-a-tool-drifts-from-its-pin));
   - with `[gateway.inspect]`, it is scanned, and a finding is recorded with
     `method = "tools-changed"`;
   - a tool that did not change keeps its verdict and is not scanned again.
@@ -199,6 +692,52 @@ not on a stream of the server's own ([WIRE.md](./WIRE.md#status)).
 - An upstream that changes its tools without saying so, or says so only where
   MCPdef does not hear it, is listed again when it next opens: restart it, or
   let a reload that changes its settings reconnect it.
+
+## When a tool drifts from its pin
+
+With `[gateway] pins`, each tool's definition is pinned the first time the
+gateway sees it: its hash, and from 0.5.0 the definition itself. A definition
+that no longer matches its pin, when an upstream opens or lists its tools
+again, is graded against the one pinned, change by change, by what each could
+do to an agent that calls the tool:
+
+| Grade | What changed | For example |
+|---|---|---|
+| `info` | Nothing it says or does | `required`, `enum` or a list of types reordered; whitespace in a text; `1.0` for `1` |
+| `risky` | It takes less, or returns less | a property required now, or gone from an object that takes no other (`additionalProperties: false`); an enum value gone; `integer` for `number`; a bound added or tightened; a `pattern`, `format`, `const` or `multipleOf` added; `additionalProperties` closed |
+| `breaking` | Anything else | the description or any other text the model reads; a tool that takes or returns more, as when a property is gone from an object that takes others, which then takes any value there; a schema in a `oneOf` narrowed, which can let through a value two of them took; any annotation; a keyword MCPdef does not read, such as `$ref` |
+
+The drift's grade is its worst change's. `[gateway] pin_accept` says which
+grades the gateway takes in its stride: `info` (the default), or `risky` as
+well. There is no `breaking`.
+
+- **A drift within `pin_accept`** is pinned again, and the tool is served. The
+  log says `mcpdef: upstream '<s>': '<t>' changed since it was pinned, graded
+  info: <first change>, within [gateway] pin_accept: pinned again`, and the
+  ledger records it: `kind = "upstream"`, `agent = "mcpdef"`, `method = "pin"`,
+  the tool, `decision = "allow"`, `rule = "drift-accepted"`, and `drift`, the
+  grade and each change.
+- **Any other drift is held:** the tool is hidden from `tools/list`, and a
+  call to it is refused with `MCPdef denied: tool '<t>' on '<s>' changed since
+  it was pinned (possible rug-pull, graded breaking: description: changed (32
+  → 88 characters))` and how to approve it. The call's record has
+  `rule = "rug-pull"` and the same `drift`, and `GET
+  /api/v1/servers/<id>/tools` gives it too. Approve it with `mcpdef pin` and a
+  reload, or `POST /api/v1/servers/<id>/pins`.
+- **`mcpdef diff-tools`** prints each changed tool with its grade and its
+  changes, and exits non-zero only if one is held, so a cron job or CI step
+  fails on what the gateway would refuse and not on what it re-pins.
+- **A pin from before 0.5.0** holds the hash alone, so its drift cannot be
+  graded: it is held as `ungraded`. Approving it keeps the definition, and the
+  next change is graded.
+
+A description is graded as any text: only a change of whitespace in it is
+`info`. A server that rewords a description after it was approved changes what
+the model reads, which is how a tool is turned against the agent that trusted
+it, so a reworded description is `breaking`. For the same reason the grades
+are about what reaches the agent, not about whether a caller written against
+the old definition still works: a property newly required breaks such a
+caller, and is `risky`, because the tool can do no more than it could.
 
 ## What the tools cost each agent
 
@@ -258,8 +797,8 @@ A file watcher would miss that.
   pin store does not load, is refused as `invalid-config`, and so is one with
   anything to warn about when it sets `[gateway] strict = true`. One that
   changes a setting only a restart can apply is refused as `restart-required`:
-  the `[gateway]` keys `listen`, `allowed_origins`, `max_inflight`, `wire` and
-  `audit`, `[gateway.admin]`'s `enabled` and `listen`, the `[gateway.auth]`
+  the `[gateway]` keys `listen`, `allowed_origins`, `max_inflight`, `wire`,
+  `audit` and `audit_fsync`, `[gateway.admin]`'s `enabled` and `listen`, the `[gateway.auth]`
   table, a `jwks` file's content included, and TLS turned on or off on either
   listener. A listener certificate that does not read, or a name the local CA
   does not vouch for, is refused as `invalid-config`. A refused config changes
@@ -298,6 +837,13 @@ A file watcher would miss that.
   are checked against it as it now stands. After `mcpdef pin` re-approves a
   tool, `kill -HUP` lets it back in.
 - A `--profile` given at launch applies again on every reload.
+- **Under `--bundle-trust`**, a reload runs only a config the signed bundle
+  beside it, `<config>.bundle`, holds, as at the start: one it does not hold
+  is refused as `bundle-unverified`, and one older than the floor or than the
+  revision running as `bundle-older`, whatever else is wrong with it. A floor
+  that does not read refuses it as `invalid-config`. A change to the bundle
+  alone is a change to the watch. A config taken above the floor raises it
+  ([DEPLOY.md § Holding the gateway to its bundle](./DEPLOY.md#holding-the-gateway-to-its-bundle)).
 - **The ledger** records every reload, applied or refused: `kind = "reload"`,
   `agent = "mcpdef"`, `server = "(config)"`, `method = "reload"`, `actor` =
   `sighup`, `watch`, or for one asked through the admin API, its caller
@@ -308,7 +854,9 @@ A file watcher would miss that.
   `rule = "console-role"`, and the caller as `actor`.
   `config_from` and `config_to` hold the digests of the config that ran and
   the one read. `decision` is `allow`, or `deny` with `rule` =
-  `invalid-config` or `restart-required`. A digest is `sha256:<hex>` over the
+  `invalid-config` or `restart-required`, or under `--bundle-trust`,
+  `bundle-unverified` or `bundle-older`, and then `bundle` names the bundle
+  beside the config. A digest is `sha256:<hex>` over the
   config's bytes and the content of each file it names, so it changes when a
   wasm module does.
 - **The log** says what changed, or why nothing did:
@@ -316,8 +864,10 @@ A file watcher would miss that.
   `mcpdef: config reloaded (admin API, local): …`
   or
   `mcpdef: config reload refused (watch), restart-required: [gateway] listen (127.0.0.1:7878 → 0.0.0.0:7878) changed; still serving sha256:41d0c3a9b8e7`.
-  A digest in the log is cut to its first 12 hex digits. After a reload it
-  applies, the gateway prints the new config's warnings, as a start does.
+  A digest in the log is cut to its first 12 hex digits, and under
+  `--bundle-trust` each line ends with the revision running, `· bundle r8`.
+  After a reload it applies, the gateway prints the new config's warnings, as
+  a start does.
 - `/api/v1/servers`, `/api/v1/status` and `mcpdef_upstreams` show the reloaded
   config. A client sees new tools on its next `tools/list`.
 - A `jwks_uri` refresh goes out with the reloaded `[gateway.egress]` and
@@ -538,7 +1088,13 @@ says how Prometheus authenticates. What to watch:
 - **Deny spikes:** `mcpdef audit tail --format json` → `decision:"deny"` grouped
   by `rule`. A burst of `rate-limited` = an agent loop or an undersized bucket;
   `rug-pull` = a server changed a pinned tool; `not-on-allowlist`/`rbac` = an
-  agent probing beyond its grants.
+  agent probing beyond its grants; `bundle-older` = a signed policy bundle
+  older than the one applied, replayed; `bundle-unverified` = a bundle no
+  trusted key signed as it is, or, on a gateway's reload under
+  `--bundle-trust`, a config its bundle does not hold: one written by hand.
+  An allowed record with
+  `rule = "drift-accepted"` is a change `[gateway] pin_accept` took, with its
+  grade.
 - **Latency:** each record carries `latency_ms`; `upstream-timeout` records
   mean a wedged upstream.
 - **Upstream health:** `mcpdef_upstream_up == 0` for more than a restart or
@@ -571,7 +1127,7 @@ says how Prometheus authenticates. What to watch:
 - **Refused reloads:** `kind = "reload"` records with `decision:"deny"`: a
   config change that did not apply, so what runs is not what is on disk.
 - **Drift at startup:** the ready line's `⚠ N rug-pulled tool(s) denied`, or
-  `mcpdef diff-tools` in cron/CI (exits non-zero on drift).
+  `mcpdef diff-tools` in cron/CI (exits non-zero on a drift the gateway holds).
 - **Chain integrity:** scheduled `mcpdef audit verify` (+ sealed `--head/--count`).
 - **Process:** it is one foreground process; supervise it with systemd or a
   container restart policy. MCPdef supervises its upstreams, not itself. HTTP `503` responses (shed load) are visible to clients, not
@@ -601,12 +1157,12 @@ every upstream in one report, and names many of the causes below.
 | `MCPdef denied: transform rule '<r>' could not apply to '<t>' on '<server>': <why>` | A `transform` rule's edit met arguments of another shape: a `clamp` of something that is not a number, or a path through something that is not an object | Fix what the caller sends, or narrow the rule's `tools` / `args`. `on_error = "skip"` on the rule lets such a call go on without it. |
 | `MCPdef denied: no governed server exposes tool '<t>'` | No running upstream lists that tool, and no upstream that has not started names it in its `tools` | Check the upstream actually exposes it. Tools are listed when an upstream opens, and again when it sends `notifications/tools/list_changed` where MCPdef hears it ([When an upstream's tools change](#when-an-upstreams-tools-change)). An upstream that adds tools without saying so is listed again only when it opens again: restart that upstream, and MCPdef lists its tools when it starts it again, or restart MCPdef. |
 | stderr: `mcpdef: upstream '<s>' said its tools changed, but listing them again failed: <why>; it keeps the tools it had` | The upstream announced a change, then refused or did not answer `tools/list` in time | Check the upstream. Its next `notifications/tools/list_changed` lists them again, as does its next opening. |
-| A tool vanished from `tools/list` while its server stayed up, and a call to it is `MCPdef denied: … changed since it was pinned (possible rug-pull)` | The server changed the tool's definition and said so. The re-list found it no longer matches its pin. The ledger has a `tools-changed` record with `rule = "rug-pull"` | Review with `mcpdef diff-tools`; if legitimate, re-approve with `mcpdef pin`, then reload (`kill -HUP`), or approve it from the admin API (`POST /api/v1/servers/<id>/pins`), which saves the pin and serves the tool at once. |
+| A tool vanished from `tools/list` while its server stayed up, and a call to it is `MCPdef denied: … changed since it was pinned (possible rug-pull, graded …)` | The server changed the tool's definition and said so. The re-list found it no longer matches its pin. The ledger has a `tools-changed` record with `rule = "rug-pull"` | Review with `mcpdef diff-tools`; if legitimate, re-approve with `mcpdef pin`, then reload (`kill -HUP`), or approve it from the admin API (`POST /api/v1/servers/<id>/pins`), which saves the pin and serves the tool at once. |
 | warning: `tool '<t>' is offered by '<a>' and '<b>': it is listed once, from '<a>', and a call to it goes there` (`strict: …`, and no start, under strict mode) | Two servers' allowlists both take a tool of that name. A client sees one tool, and every call to it goes to `<a>` | Take the name off one server's allowlist (`deny`), or set `[gateway] tool_namespace = "prefix"` to list each as `<prefix>__<t>`. The admin servers view lists it under `tool_collisions`. |
 | `MCPdef denied: no governed server exposes tool '<t>'`, with `tool_namespace = "prefix"` | Each tool is called by its listed name, `<prefix>__<name>`: a name without a prefix, or with one no server has, is no tool's | Call the name `tools/list` gives. A server's prefix is its `prefix`, or else its `id`. |
 | `MCPdef denied: server '<s>' is not governed by MCPdef` | Tool routed to a server with no policy entry (fail-closed) | Add a `[[server]]` entry for it. |
 | `MCPdef denied: no role grants '<t>' on '<s>'` | RBAC: the caller's roles hold no matching `[[role]]` grant: a token's scopes/roles, or, for a client certificate without a token, the roles `[[identity.cert_map]]` gives its identity | Grant `"<server-glob>:<tool-glob>"` to a role the caller holds, or fix the IdP scopes. For a certificate, map its identity to a role in `[[identity.cert_map]]`: one no entry matches holds none. |
-| `MCPdef denied: tool '<t>' on '<s>' changed since it was pinned (possible rug-pull)` | Pinned definition drifted (description/schema/annotations changed) | Review with `mcpdef diff-tools`; if legitimate, re-approve with `mcpdef pin`, then reload (`kill -HUP`), or from the admin API (`POST /api/v1/servers/<id>/pins`). The tool is also hidden from `tools/list` until re-pinned. |
+| `MCPdef denied: tool '<t>' on '<s>' changed since it was pinned (possible rug-pull, graded <grade>: <change>)` | Pinned definition drifted (description/schema/annotations changed), graded worse than `[gateway] pin_accept` takes, or `ungraded` for a pin from before 0.5.0 ([When a tool drifts from its pin](#when-a-tool-drifts-from-its-pin)) | Review with `mcpdef diff-tools`; if legitimate, re-approve with `mcpdef pin`, then reload (`kill -HUP`), or from the admin API (`POST /api/v1/servers/<id>/pins`). The tool is also hidden from `tools/list` until re-pinned. |
 | `MCPdef denied: global/tool rate limit exceeded … — retry shortly` | Token bucket empty (`[gateway.rate_limit]`) | Retry with backoff; raise `*_per_sec`/`*_burst` if the budget is undersized. |
 | `MCPdef denied: tool '<t>' on '<s>' asked for input, which MCPdef passes on only to a 2026-07-28 client` | A 2026-07-28 server asked the client for something first (an elicitation, a sampling, its roots), in an `InputRequiredResult`, and the client speaks 2025-11-25, which cannot read one. Audited under `input-required`. A read or a prompt get says the same, as JSON-RPC error `-32000` | Use a 2026-07-28 client, or a way to call the tool that needs no input. See [WIRE.md](./WIRE.md#status). |
 | `MCPdef denied: tool '<t>' on '<s>' asked for input the client cannot give: <why>` | The server asked for something the client did not declare it can answer (a sampling from a client that declared only `elicitation`, an elicitation in URL mode from one that did not declare `elicitation.url`), or its interim result breaks the revision's rules. Audited under `input-required` | Declare the capability in the client, if it can answer that. A server that asks for what was not declared, or sends a malformed result, is at fault: report it to its maintainers. |
@@ -659,6 +1215,11 @@ every upstream in one report, and names many of the causes below.
 | `client_key (literal): a string is the key itself, and this one holds no PEM` | A path was written as a plain string, which is the key itself | Write `client_key = { file = "<path>" }`. |
 | warning: `client_key: <path> can be read by its group and every user (mode 644)` | Users other than the key's owner can read it | Give it to MCPdef's user and `chmod 600` it. Or let root own it and MCPdef's group alone read it: `chown root:<group>` and `chmod 640`. For a Kubernetes Secret volume, set `defaultMode: 0400`: the kubelet makes its files root's, readable by the pod's `fsGroup` too, which MCPdef accepts. |
 | `mcpdef pin` fails: `` `mcpdef pin` needs a pin store `` | `[gateway] pins` unset | Set `pins = "./mcpdef-pins.toml"`. |
+| `mcpdef bundle apply`: `… is not applied: revision <n> is older than revision <m>, which this node applied` | A signed bundle older than the last one this node applied: replayed, or signed at a revision already used. The ledger has a `bundle-older` record | Sign the config again at a revision above `<m>`. To go back to an earlier config, sign that one again at a revision above `<m>`. |
+| `mcpdef bundle apply`: `… is not applied: no key it trusts is named <kid>`, or `its signature does not verify` | Signed by a key this node was not given, or changed after it was signed. The ledger has a `bundle-unverified` record | Check that `--trust` holds the signer's public half (`mcpdef bundle jwks --key …`), and carry the bundle in again from where it was signed. |
+| `mcpdef up --bundle-trust` (or `filter`): `not running mcpdef.toml: …`, or a reload refused as `bundle-unverified: mcpdef.toml is not the config that mcpdef.toml.bundle, revision <n>, holds`; or a hook held to its bundle refusing every MCP call as `MCPdef denied (bundle-unverified): …` | The config was written without a bundle, by hand or by a tool, or `apply` stopped part way | Put a signed config in place with `mcpdef bundle apply`. A change that has to be made is signed as a new revision where the policy is made. |
+| `mcpdef up --bundle-trust` (or `filter`, or `hook`): `there is no mcpdef.toml.bundle` | The config was never applied from a bundle, or applied by a release before the one that keeps the bundle beside it | Apply the last bundle again: it puts `mcpdef.toml.bundle` in place. |
+| A hook held to its bundle: `MCPdef denied (config): the bundle floor is not raised to revision <n>: …` | A bundle carried in above the floor, where the hook's user cannot write the `state_dir` that keeps it | Apply the bundle with `mcpdef bundle apply`, run by whoever can write there: it raises the floor. |
 | `mcpdef audit verify` fails: `audit ledger … does not exist` | Fresh install — the ledger is written on first governed call | Expected before first run. |
 | A client says `unable to verify the first certificate`, `self signed certificate in certificate chain` or `UnknownIssuer` connecting to the gateway | `[gateway.tls] mode = "self-signed"`, and the client does not trust the local CA | Trust it as `mcpdef tls init` prints: `NODE_EXTRA_CA_CERTS` for Claude Code, `CODEX_CA_CERTIFICATE` for Codex, the system store for the rest. `mcpdef tls export-ca` prints the certificate. |
 | A client says the certificate is not valid for the name it connected to | It connects by a name the certificate does not carry | Add the name to `hostnames`. If the CA was made without it, `mcpdef tls init --new-ca`, and have every client trust the new CA. |

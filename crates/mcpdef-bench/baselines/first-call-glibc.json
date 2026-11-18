@@ -1,0 +1,137 @@
+{
+  "schema": 1,
+  "generated_at_unix": 1792656142,
+  "mcpdef_version": "mcpdef 0.4.0  ·  MCP gateway & governance plane",
+  "commit": "61aeac6e0537f484213a1f9c0509b158e30d377b",
+  "note": "The gateway after 0.4.0, the glibc release build, on a 4-vCPU cloud VM (Intel Xeon @ 2.80 GHz)",
+  "machine": {
+    "os": "linux",
+    "arch": "x86_64",
+    "cpus": 4,
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "mem_total_kb": 16477352
+  },
+  "max_ms": 60000,
+  "runs": [
+    {
+      "gateway": {
+        "up_us": 6291,
+        "connect_us": 3899,
+        "call_us": 1882
+      },
+      "hook": {
+        "import_us": 3622,
+        "install_us": 3851,
+        "hook_us": 5258
+      }
+    },
+    {
+      "gateway": {
+        "up_us": 5441,
+        "connect_us": 3656,
+        "call_us": 1806
+      },
+      "hook": {
+        "import_us": 4569,
+        "install_us": 4442,
+        "hook_us": 6337
+      }
+    },
+    {
+      "gateway": {
+        "up_us": 6236,
+        "connect_us": 4632,
+        "call_us": 1883
+      },
+      "hook": {
+        "import_us": 4602,
+        "install_us": 4608,
+        "hook_us": 5469
+      }
+    },
+    {
+      "gateway": {
+        "up_us": 6045,
+        "connect_us": 5731,
+        "call_us": 2475
+      },
+      "hook": {
+        "import_us": 5082,
+        "install_us": 5086,
+        "hook_us": 7460
+      }
+    },
+    {
+      "gateway": {
+        "up_us": 5754,
+        "connect_us": 3733,
+        "call_us": 1954
+      },
+      "hook": {
+        "import_us": 4260,
+        "install_us": 3388,
+        "hook_us": 5702
+      }
+    },
+    {
+      "gateway": {
+        "up_us": 5572,
+        "connect_us": 3646,
+        "call_us": 1804
+      },
+      "hook": {
+        "import_us": 3523,
+        "install_us": 3344,
+        "hook_us": 4828
+      }
+    },
+    {
+      "gateway": {
+        "up_us": 5831,
+        "connect_us": 3839,
+        "call_us": 1927
+      },
+      "hook": {
+        "import_us": 3563,
+        "install_us": 4585,
+        "hook_us": 5402
+      }
+    },
+    {
+      "gateway": {
+        "up_us": 5054,
+        "connect_us": 3574,
+        "call_us": 1733
+      },
+      "hook": {
+        "import_us": 3322,
+        "install_us": 3475,
+        "hook_us": 4981
+      }
+    },
+    {
+      "gateway": {
+        "up_us": 5270,
+        "connect_us": 3654,
+        "call_us": 1988
+      },
+      "hook": {
+        "import_us": 3393,
+        "install_us": 3459,
+        "hook_us": 5691
+      }
+    },
+    {
+      "gateway": {
+        "up_us": 4999,
+        "connect_us": 4486,
+        "call_us": 1781
+      },
+      "hook": {
+        "import_us": 3373,
+        "install_us": 3411,
+        "hook_us": 5888
+      }
+    }
+  ]
+}

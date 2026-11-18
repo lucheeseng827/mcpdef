@@ -41,13 +41,15 @@ fn its_records_serialize_back_byte_for_byte() {
     let text = std::fs::read_to_string(fixture("ledger-0.2.1.jsonl")).unwrap();
     for line in text.lines() {
         let rec: Record = serde_json::from_str(line).unwrap();
-        assert_eq!(rec.export(ExportFormat::Json), line);
+        assert_eq!(rec.export(ExportFormat::Json).unwrap(), line);
     }
 }
 
 /// `fixtures/ledger-0.2.1.{ocsf,cef,syslog}` are what the 0.2.1 build's
 /// `mcpdef audit tail` printed for the fixture, with its product version
 /// replaced by `{version}`. A SIEM parser written against them keeps working.
+/// `fixtures/ledger-0.2.1.otlp` is the first OTLP export of it, from 0.5.0: a
+/// span's ids are a function of its record, and stay so.
 #[test]
 fn its_records_export_exactly_as_0_2_1_did() {
     let records = read_all(fixture("ledger-0.2.1.jsonl")).unwrap();
@@ -55,12 +57,16 @@ fn its_records_export_exactly_as_0_2_1_did() {
         (ExportFormat::Ocsf, "ocsf"),
         (ExportFormat::Cef, "cef"),
         (ExportFormat::Syslog, "syslog"),
+        (ExportFormat::Otlp, "otlp"),
     ];
     for (format, name) in formats {
         let golden = std::fs::read_to_string(fixture(&format!("ledger-0.2.1.{name}")))
             .unwrap()
             .replace("{version}", env!("CARGO_PKG_VERSION"));
-        let rendered: String = records.iter().map(|r| r.export(format) + "\n").collect();
+        let rendered: String = records
+            .iter()
+            .map(|r| r.export(format).unwrap() + "\n")
+            .collect();
         assert_eq!(rendered, golden, "{name} export changed");
     }
 }

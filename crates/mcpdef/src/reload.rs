@@ -16,17 +16,27 @@
 //! from the next connection on: a certificate renewed in its files, with
 //! `watch_config` or a `SIGHUP`. And at each tick of the watch, whether it
 //! watches or not, a self-signed certificate that is due is issued again.
+//!
+//! A gateway started with `--bundle-trust` runs only a config the signed
+//! bundle beside it holds ([`crate::bundle`]). One that the bundle does not
+//! hold is refused as `bundle-unverified`, and one older than the node's
+//! floor or than the bundle running as `bundle-older`, whatever else is wrong
+//! with it. The watch sees a change to the bundle as it does to the config.
 
+use crate::bundle::{self, Bundle};
 use crate::config::{Config, GatewayConfig};
 use crate::connect::supervised;
 use crate::gateway::{Gateway, Planned, Reconfig, Reconfigured};
 use crate::redact::redact_urls;
 use crate::tls::{Built, ListenerTls};
+use mcpdef_audit::receipt::Keys;
+use mcpdef_audit::BundleRef;
 use mcpdef_pin::PinStore;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{mpsc, oneshot};
 
@@ -118,7 +128,8 @@ pub enum Outcome {
     /// The gateway runs the configuration it read.
     Applied(Reconfigured),
     /// The gateway keeps the configuration it had. `rule` says why, as the
-    /// ledger records it: `invalid-config` or `restart-required`.
+    /// ledger records it: `invalid-config` or `restart-required`, or under
+    /// `--bundle-trust`, `bundle-unverified` or `bundle-older`.
     Refused {
         rule: &'static str,
         reasons: Vec<String>,
@@ -132,14 +143,25 @@ pub struct Reloader {
     profile: Option<String>,
     gateway: Gateway,
     applied: Applied,
-    /// The digest the watch last acted on, applied or refused, so that a
-    /// config refused once is not refused again every 30 s.
-    seen: String,
+    /// The digest the watch last acted on, applied or refused, and that of
+    /// the bundle beside the config, so that a config refused once is not
+    /// refused again every 30 s.
+    seen: (String, Option<String>),
     on_applied: Option<OnApplied>,
     /// The TLS the listeners serve, which a reload builds again.
     tls: Option<ListenerTls>,
     /// Reloads the admin API asks for, which [`Reloader::run`] takes too.
     requests: Option<Requests>,
+    /// With `--bundle-trust`, what the config is held to.
+    lock: Option<Lock>,
+}
+
+/// What a gateway started with `--bundle-trust` holds its config to.
+#[derive(Clone)]
+struct Lock {
+    keys: Arc<Keys>,
+    /// The bundle the configuration in effect came from.
+    running: Bundle,
 }
 
 /// Called with each configuration applied.
@@ -155,6 +177,49 @@ struct Applied {
 struct Read {
     config: Result<Config, Vec<String>>,
     snapshot: Snapshot,
+    /// Under `--bundle-trust`, what the bundle beside it made of it: `None`
+    /// when the config did not read.
+    bundle: Option<Locked>,
+}
+
+impl Read {
+    /// What the watch compares with what it last acted on.
+    fn seen(&self) -> (String, Option<String>) {
+        let bundle = self.bundle.as_ref().and_then(|b| b.named.as_ref());
+        (
+            self.snapshot.digest.clone(),
+            bundle.map(|b| b.sha256.clone()),
+        )
+    }
+}
+
+/// What the bundle beside a config made of it.
+struct Locked {
+    /// The ledger's `bundle` member.
+    named: Option<BundleRef>,
+    /// The bundle to run, or the rule to refuse it under, and why.
+    verdict: Result<Bundle, (&'static str, String)>,
+}
+
+impl Lock {
+    /// Whether the config `text`, read from `path`, may take the place of the
+    /// configuration in effect, which keeps its floor in `state_dir`.
+    fn check(&self, path: &Path, text: &[u8], state_dir: &Path) -> Locked {
+        let held = bundle::held(path, text, &self.keys);
+        let refused = |r: bundle::Refused| (r.rule(), r.to_string());
+        let verdict = held.verdict.map_err(refused).and_then(|bundle| {
+            match bundle::succeeds(&bundle, &self.running, state_dir) {
+                Ok(Ok(())) => Ok(bundle),
+                Ok(Err(refusal)) => Err(refused(refusal)),
+                // As a certificate that does not read is.
+                Err(e) => Err(("invalid-config", format!("{e:#}"))),
+            }
+        });
+        Locked {
+            named: held.named,
+            verdict,
+        }
+    }
 }
 
 /// What a config was read from: its text, and the files it names, each as it
@@ -223,7 +288,7 @@ impl Reloader {
             path: path.into(),
             profile,
             gateway,
-            seen: snapshot.digest.clone(),
+            seen: (snapshot.digest.clone(), None),
             applied: Applied {
                 config: applied,
                 snapshot,
@@ -231,7 +296,22 @@ impl Reloader {
             on_applied: None,
             tls: None,
             requests: None,
+            lock: None,
         }
+    }
+
+    /// Run only a config the bundle beside it holds, signed by a key in
+    /// `keys`, at a revision no lower than the node's floor nor than
+    /// `running`'s, the bundle the configuration in effect came from. A
+    /// config that is not is refused, under the bundle's rule. Each one run
+    /// above the floor raises it.
+    pub fn with_bundle_lock(mut self, keys: Keys, running: Bundle) -> Self {
+        self.seen.1 = Some(running.file.clone());
+        self.lock = Some(Lock {
+            keys: Arc::new(keys),
+            running,
+        });
+        self
     }
 
     /// Call `f` with each configuration applied.
@@ -300,7 +380,7 @@ impl Reloader {
                             continue;
                         }
                         let read = self.read().await;
-                        if read.snapshot.digest != self.seen {
+                        if read.seen() != self.seen {
                             Box::pin(self.apply(read, Trigger::Watch)).await;
                         }
                     }
@@ -313,64 +393,34 @@ impl Reloader {
     /// wasm modules included.
     async fn read(&self) -> Read {
         let (path, profile) = (self.path.clone(), self.profile.clone());
-        match tokio::task::spawn_blocking(move || read(&path, profile.as_deref())).await {
-            Ok(read) => read,
-            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-            // The runtime is shutting down.
-            Err(_) => std::future::pending().await,
-        }
+        let lock = self.lock.clone();
+        let state_dir = PathBuf::from(&self.applied.config.gateway.state_dir);
+        blocking(move || {
+            let lock = lock.as_ref().map(|lock| (lock, state_dir.as_path()));
+            read(&path, profile.as_deref(), lock)
+        })
+        .await
     }
 
     async fn apply(&mut self, read: Read, trigger: Trigger) -> Outcome {
         let started = Instant::now();
-        let Read { config, snapshot } = read;
-        self.seen = snapshot.digest.clone();
+        self.seen = read.seen();
         let from = self.applied.snapshot.digest.clone();
-        let to = snapshot.digest.clone();
-        let outcome = match config {
-            Err(reasons) => Outcome::Refused {
-                rule: "invalid-config",
-                reasons,
-            },
-            Ok(config) => match restart_required(&self.applied, &config, &snapshot) {
-                reasons if !reasons.is_empty() => Outcome::Refused {
-                    rule: "restart-required",
-                    reasons,
-                },
-                _ => match plan(&self.applied, &config, &snapshot) {
-                    Err(reason) => Outcome::Refused {
-                        rule: "invalid-config",
-                        reasons: vec![reason],
-                    },
-                    Ok(reconfig) => match self.build_tls(&config, SystemTime::now()).await {
-                        Err(reason) => Outcome::Refused {
-                            rule: "invalid-config",
-                            reasons: vec![reason],
-                        },
-                        Ok(built) => {
-                            let report = self.gateway.reconfigure(reconfig).await;
-                            // The client keys too: one removed opens nothing
-                            // from now on.
-                            self.gateway.set_keys(config.issued_keys());
-                            self.install_tls(built);
-                            if let Some(f) = &self.on_applied {
-                                f(&config);
-                            }
-                            self.applied = Applied { config, snapshot };
-                            Outcome::Applied(report)
-                        }
-                    },
-                },
-            },
+        let to = read.snapshot.digest.clone();
+        let named = read.bundle.as_ref().and_then(|b| b.named.clone());
+        let outcome = match self.take(read).await {
+            Ok(report) => Outcome::Applied(report),
+            Err((rule, reasons)) => Outcome::Refused { rule, reasons },
         };
         let latency = started.elapsed();
         let said = trigger.said();
         match &outcome {
             Outcome::Applied(report) => {
                 eprintln!(
-                    "mcpdef: config reloaded ({said}): {}; now {}",
+                    "mcpdef: config reloaded ({said}): {}; now {}{}",
                     summary(report),
-                    short(&to)
+                    short(&to),
+                    self.running_note()
                 );
                 // What it does that it should not have to, as at startup.
                 crate::connect::warn(&self.applied.config);
@@ -379,9 +429,10 @@ impl Reloader {
                 }
             }
             Outcome::Refused { rule, reasons } => eprintln!(
-                "mcpdef: config reload refused ({said}), {rule}: {}; still serving {}",
+                "mcpdef: config reload refused ({said}), {rule}: {}; still serving {}{}",
                 reasons.join("; "),
-                short(&from)
+                short(&from),
+                self.running_note()
             ),
         }
         let refused = match &outcome {
@@ -389,9 +440,91 @@ impl Reloader {
             Outcome::Refused { rule, .. } => Some(*rule),
         };
         self.gateway
-            .audit_reload(trigger.actor(), trigger.peer(), refused, from, to, latency)
+            .audit_reload(
+                trigger.actor(),
+                trigger.peer(),
+                refused,
+                from,
+                to,
+                named,
+                latency,
+            )
             .await;
         outcome
+    }
+
+    /// Apply what `read` holds, or say why not: under which rule, and why.
+    async fn take(&mut self, read: Read) -> Result<Reconfigured, (&'static str, Vec<String>)> {
+        let invalid = |reason: String| ("invalid-config", vec![reason]);
+        let Read {
+            config,
+            snapshot,
+            bundle,
+        } = read;
+        let bundle = match bundle.map(|b| b.verdict) {
+            Some(Err((rule, reason))) => return Err((rule, vec![reason])),
+            Some(Ok(bundle)) => Some(bundle),
+            None => None,
+        };
+        let config = config.map_err(|reasons| ("invalid-config", reasons))?;
+        let reasons = restart_required(&self.applied, &config, &snapshot);
+        if !reasons.is_empty() {
+            return Err(("restart-required", reasons));
+        }
+        let reconfig = plan(&self.applied, &config, &snapshot).map_err(invalid)?;
+        let built = self
+            .build_tls(&config, SystemTime::now())
+            .await
+            .map_err(invalid)?;
+        if let Some(bundle) = &bundle {
+            self.raise(&config, bundle).await.map_err(invalid)?;
+        }
+        let report = self.gateway.reconfigure(reconfig).await;
+        // The client keys too: one removed opens nothing from now on.
+        self.gateway.set_keys(config.issued_keys());
+        self.install_tls(built);
+        if let Some(f) = &self.on_applied {
+            f(&config);
+        }
+        self.applied = Applied { config, snapshot };
+        if let (Some(lock), Some(bundle)) = (&mut self.lock, bundle) {
+            lock.running = bundle;
+        }
+        Ok(report)
+    }
+
+    /// Raise the node's floor to `bundle`, which `config` holds, where it is
+    /// lower: the gateway is about to run it.
+    async fn raise(&self, config: &Config, bundle: &Bundle) -> Result<(), String> {
+        let path = self.path.clone();
+        let state_dir = PathBuf::from(&config.gateway.state_dir);
+        let to = bundle.clone();
+        let raised = blocking(move || bundle::holding(&path, || bundle::raise(&state_dir, &to)));
+        match raised.await {
+            Ok(false) => Ok(()),
+            Ok(true) => {
+                eprintln!(
+                    "mcpdef: the bundle floor is now revision {}, in {}",
+                    bundle.revision,
+                    Path::new(&config.gateway.state_dir)
+                        .join(bundle::FLOOR_FILE)
+                        .display()
+                );
+                Ok(())
+            }
+            Err(e) => Err(format!(
+                "the bundle floor is not raised to revision {}: {e:#}",
+                bundle.revision
+            )),
+        }
+    }
+
+    /// ` · bundle r<revision>` of the bundle running, under `--bundle-trust`.
+    fn running_note(&self) -> String {
+        match &self.lock {
+            Some(lock) => format!(" · bundle r{}", lock.running.revision),
+            None => String::new(),
+        }
     }
 
     /// What the listeners that serve TLS would serve under `config`, at
@@ -402,12 +535,7 @@ impl Reloader {
             return Ok(None);
         };
         let config = config.clone();
-        match tokio::task::spawn_blocking(move || tls.prepare(&config, now)).await {
-            Ok(built) => built.map(Some),
-            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
-            // The runtime is shutting down.
-            Err(_) => std::future::pending().await,
-        }
+        blocking(move || tls.prepare(&config, now)).await.map(Some)
     }
 
     /// Serve what `built` holds from the next connection on.
@@ -436,11 +564,40 @@ impl Reloader {
     }
 }
 
+/// `f`, run off the async workers.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(done) => done,
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        // The runtime is shutting down.
+        Err(_) => std::future::pending().await,
+    }
+}
+
 /// Read the config at `path` as the gateway would run it: parsed, with
-/// `profile` on top, and checked as its `[gateway] strict` says.
-fn read(path: &Path, profile: Option<&str>) -> Read {
-    let text = std::fs::read(path);
-    let parsed = match &text {
+/// `profile` on top, and checked as its `[gateway] strict` says. Under
+/// `lock`, with the configuration in effect keeping its floor in the
+/// `state_dir` it names, what the bundle beside it makes of it too, all read
+/// holding the lock an apply holds.
+fn read(path: &Path, profile: Option<&str>, lock: Option<(&Lock, &Path)>) -> Read {
+    let Some((lock, state_dir)) = lock else {
+        return parse(path, &std::fs::read(path), profile);
+    };
+    bundle::holding(path, || {
+        // The config first: an apply writes it last.
+        let text = std::fs::read(path);
+        let mut read = parse(path, &text, profile);
+        if let Ok(text) = &text {
+            read.bundle = Some(lock.check(path, text, state_dir));
+        }
+        read
+    })
+}
+
+/// The config at `path`, read as `text`, parsed with `profile` on top and
+/// checked.
+fn parse(path: &Path, text: &std::io::Result<Vec<u8>>, profile: Option<&str>) -> Read {
+    let parsed = match text {
         Err(e) => Err(format!("reading {}: {e}", path.display())),
         Ok(bytes) => std::str::from_utf8(bytes)
             .map_err(|e| e.to_string())
@@ -465,7 +622,11 @@ fn read(path: &Path, profile: Option<&str>) -> Read {
             errs => Err(errs),
         },
     };
-    Read { config, snapshot }
+    Read {
+        config,
+        snapshot,
+        bundle: None,
+    }
 }
 
 fn part(h: &mut Sha256, bytes: Option<&[u8]>) {
@@ -504,6 +665,16 @@ fn restart_required(old: &Applied, new: &Config, snapshot: &Snapshot) -> Vec<Str
     }
     if a.audit != b.audit {
         why.push(format!("[gateway] audit ({} → {})", a.audit, b.audit));
+    }
+    if a.audit_fsync != b.audit_fsync {
+        why.push(format!(
+            "[gateway] audit_fsync ({} → {})",
+            a.audit_fsync, b.audit_fsync
+        ));
+    }
+    // The exporter is started once, with the gateway.
+    if a.otel != b.otel {
+        why.push("[gateway.otel]".to_string());
     }
     // Its certificate is swapped at a reload; its address is not.
     if a.admin.enabled != b.admin.enabled || a.admin.listen != b.admin.listen {
@@ -608,6 +779,7 @@ fn plan(old: &Applied, new: &Config, snapshot: &Snapshot) -> Result<Reconfig, St
         rate_limit: (a.rate_limit != b.rate_limit).then(|| b.rate_limit_settings()),
         inspect: (a.inspect != b.inspect).then(|| b.inspect_scanner()),
         pins,
+        pin_accept: b.pin_accept.severity(),
         tool_prefixes: new.tool_prefixes(),
         upstreams,
     })
@@ -805,6 +977,31 @@ tools = ["x"]
         assert_eq!(reasons.len(), 2, "{reasons:?}");
         assert!(reasons[0].starts_with("[gateway] audit"));
         assert_eq!(reasons[1], "[gateway.auth] changed");
+    }
+
+    #[test]
+    fn sending_spans_elsewhere_needs_a_restart() {
+        // The exporter is started once, with the gateway.
+        let old = applied(BASE);
+        let text = BASE.replace(
+            "[[server]]",
+            "[gateway.otel]\nendpoint = \"http://127.0.0.1:4318\"\n\n[[server]]",
+        );
+        assert_eq!(
+            restart_required(&old, &config(&text), &old.snapshot),
+            ["[gateway.otel] changed"]
+        );
+    }
+
+    #[test]
+    fn turning_the_audit_fsync_on_or_off_needs_a_restart() {
+        // The ledger is opened once, with its durability, at the start.
+        let old = applied(BASE);
+        let text = BASE.replace("[[server]]", "audit_fsync = true\n\n[[server]]");
+        assert_eq!(
+            restart_required(&old, &config(&text), &old.snapshot),
+            ["[gateway] audit_fsync (false → true) changed"]
+        );
     }
 
     #[test]
@@ -1019,13 +1216,16 @@ tools = ["x"]
         let path = dir.path().join("mcpdef.toml");
         let literal = format!("{BASE}[server.env]\nGITHUB_TOKEN = \"t\"\n");
         std::fs::write(&path, &literal).unwrap();
-        assert!(read(&path, None).config.is_ok(), "a warning, not an error");
+        assert!(
+            read(&path, None, None).config.is_ok(),
+            "a warning, not an error"
+        );
         std::fs::write(
             &path,
             literal.replace("[gateway]\n", "[gateway]\nstrict = true\n"),
         )
         .unwrap();
-        let reasons = read(&path, None).config.unwrap_err();
+        let reasons = read(&path, None, None).config.unwrap_err();
         assert_eq!(reasons.len(), 1, "{reasons:?}");
         assert!(
             reasons[0].starts_with("strict: server 'a': [server.env] GITHUB_TOKEN is a secret"),
@@ -1043,7 +1243,7 @@ tools = ["x"]
              url = \"https://mcpdef:s3cret@mcp.test/mcp?api_key=s3cret-key\" oops\n",
         )
         .unwrap();
-        let reasons = read(&path, None).config.unwrap_err();
+        let reasons = read(&path, None, None).config.unwrap_err();
         assert_eq!(reasons.len(), 1, "{reasons:?}");
         assert!(
             reasons[0].contains("https://***:***@mcp.test/mcp?api_key=***"),

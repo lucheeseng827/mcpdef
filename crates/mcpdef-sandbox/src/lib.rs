@@ -57,7 +57,7 @@ use wasmtime::{
 };
 
 mod component;
-pub use component::{EgressAllow, WasmComponentUpstream};
+pub use component::{ComponentTemplate, EgressAllow, WasmComponentUpstream};
 
 /// How often the background ticker advances the engine epoch. The wall-clock
 /// deadline is rounded up to a whole number of these ticks, so it also sets the

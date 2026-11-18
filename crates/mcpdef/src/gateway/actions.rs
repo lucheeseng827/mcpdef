@@ -100,7 +100,7 @@ impl Gateway {
         }
         let steady: Vec<&str> = tools
             .keys()
-            .filter(|name| !slot.drifted.contains(*name))
+            .filter(|name| !slot.drifted.contains_key(*name))
             .map(String::as_str)
             .collect();
         if !steady.is_empty() {
@@ -124,8 +124,16 @@ impl Gateway {
             )));
         }
         if let Some(pins) = write(&self.inner.pins).as_mut() {
-            for (name, hash) in tools {
-                pins.store.record(id, name, hash.clone());
+            for name in tools.keys() {
+                // The definition offered now, whose hash is the one looked at:
+                // pinned whole, so that its next change is graded against it.
+                let offered = up
+                    .tools
+                    .iter()
+                    .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(name.as_str()));
+                if let Some(tool) = offered {
+                    pins.store.record_tool(id, tool);
+                }
             }
             pins.dirty = true;
         }
@@ -138,17 +146,21 @@ impl Gateway {
         self.govern(|g| {
             for slot in g.upstreams.iter_mut().filter(|slot| slot.id == id) {
                 let offers = slot.conn.as_ref().map(|up| up.tools.clone());
-                let left = slot.drifted.iter().filter(|name| match tools.get(*name) {
-                    None => true,
-                    Some(hash) => {
-                        offers
-                            .as_ref()
-                            .and_then(|offers| offered(offers, name))
-                            .as_ref()
-                            != Some(hash)
-                    }
-                });
-                slot.drifted = Arc::new(left.cloned().collect());
+                let left = slot
+                    .drifted
+                    .iter()
+                    .filter(|(name, _)| match tools.get(*name) {
+                        None => true,
+                        Some(hash) => {
+                            offers
+                                .as_ref()
+                                .and_then(|offers| offered(offers, name))
+                                .as_ref()
+                                != Some(hash)
+                        }
+                    });
+                let left = left.map(|(name, grading)| (name.clone(), grading.clone()));
+                slot.drifted = Arc::new(left.collect());
             }
         });
         Ok(tools.keys().cloned().collect())
